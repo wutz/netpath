@@ -118,6 +118,12 @@ export const tracks: Track[] = [
     },
     groups: [
       {
+        id: 'l0-start',
+        title: '从这里开始',
+        hint: '还没有实际排障经验就从这节起。一次 curl 串起全过程，把后面要用的名词一次性认全。',
+        lessons: ['first-look'],
+      },
+      {
         id: 'l0-foundation',
         title: '打地基',
         hint: '先统一口径、再看清二三层怎么转发。这两节后面每一课都要用到，跳过去会处处别扭。',
@@ -137,6 +143,28 @@ export const tracks: Track[] = [
       },
     ],
     lessons: [
+      {
+        id: 'first-look',
+        title: '从一次 curl 说起：网络到底是什么',
+        summary: '不谈调优、不谈参数。用一条命令把 DNS、TCP、TLS、HTTP 串起来，顺手把后面要用的名词认全。',
+        kind: 'concept',
+        status: 'ready',
+        minutes: 25,
+        objectives: [
+          '说出一次 curl 背后依次发生的五件事，以及各自可能在哪一步失败',
+          '认识 MAC / IP / 端口 / 网关 / DNS / MTU / RTT 这几个后面天天出现的名词',
+          '知道自己该按哪条路线学下去，以及哪些内容现在可以先跳过',
+        ],
+        outline: [
+          '一条命令的全过程：DNS → TCP 握手 → TLS → HTTP → 关闭',
+          '每一步失败时的典型报错长什么样',
+          '四个地址的分工：MAC、IP、端口、URL',
+          '新人术语速查表：全站高频词一次认全',
+          '亲手看一遍：curl -v 的每一行在说什么',
+          '路线图：接下来学什么、什么可以先跳过',
+        ],
+        refs: [REF_SYSPERF],
+      },
       {
         id: 'packet-journey',
         title: '一个包的旅程：从 send() 到网线',
@@ -184,7 +212,7 @@ export const tracks: Track[] = [
         title: '二层与三层：ARP、VLAN、子网与转发',
         summary: '交换机怎么决定往哪个口发，路由器怎么决定下一跳，以及同网段与跨网段的区别。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '解释 ARP 的作用，并说出 ARP 表异常会造成什么现象',
@@ -304,9 +332,9 @@ export const tracks: Track[] = [
     groups: [
       {
         id: 'l1-model',
-        title: '从 netns 到网络模型',
-        hint: '先用 ip 命令手搓一个容器网络，再理解 K8s 定下的四条约束和各家 CNI 的取舍。',
-        lessons: ['netns-veth', 'k8s-model', 'cni'],
+        title: '网络模型与数据平面',
+        hint: '先看清 K8s 定下的四条约束，再用 ip 命令手搓一个满足它的最小网络，最后看各家 CNI 的取舍。',
+        lessons: ['k8s-model', 'netns-veth', 'cni'],
       },
       {
         id: 'l1-service',
@@ -1555,7 +1583,9 @@ export const tracks: Track[] = [
  * 只记「跳过会看不懂」的强依赖，同组相邻的自然顺序不重复登记。
  */
 export const PREREQ: Record<string, string[]> = {
-  // L0：路径 → 行为与调优 → 排障
+  // L0：地图 → 地基 → 路径 → 行为与调优 → 排障
+  'l0-basics/metrics-units': ['l0-basics/first-look'],
+  'l0-basics/switching-routing': ['l0-basics/first-look'],
   'l0-basics/packet-journey': ['l0-basics/switching-routing'],
   'l0-basics/tcp-behavior': ['l0-basics/packet-journey', 'l0-basics/metrics-units'],
   'l0-basics/kernel-stack': ['l0-basics/packet-journey'],
@@ -1606,6 +1636,81 @@ export const PREREQ: Record<string, string[]> = {
   'l5-tunnel/transparent-gateway': ['l5-tunnel/clash-rules'],
   'l5-tunnel/quest-proxy-broken': ['l5-tunnel/gost-toolbox', 'l5-tunnel/clash-rules'],
 }
+
+/* ---------- 难度标记 ---------- */
+
+export type LessonDepth = 'intro' | 'core' | 'deep'
+
+/**
+ * 只标注两端：`intro` 是零经验也能读，`deep` 是可以先跳过、遇到具体问题再回来。
+ * 没登记的默认 `core`，界面上不显示徽章，避免每节课都挂标签。
+ */
+export const DEPTH: Record<string, LessonDepth> = {
+  'l0-basics/first-look': 'intro',
+  'l0-basics/metrics-units': 'intro',
+  'l0-basics/switching-routing': 'intro',
+  'l0-basics/kernel-stack': 'deep',
+  'l1-k8s/k8s-model': 'intro',
+  'l1-k8s/kube-proxy-ebpf': 'deep',
+  'l2-hpc/pcie-topology': 'deep',
+  'l2-hpc/nvlink': 'deep',
+  'l2-hpc/infiniband': 'deep',
+  'l2-hpc/roce': 'deep',
+  'l2-hpc/topology-rail': 'deep',
+  'l2-hpc/nccl': 'deep',
+  'l3-planning/requirements': 'intro',
+  'l4-advanced/ebpf-xdp': 'deep',
+  'l4-advanced/dpdk': 'deep',
+  'l4-advanced/gpudirect': 'deep',
+  'l4-advanced/nvme-of': 'deep',
+  'l4-advanced/mpi': 'deep',
+  'l4-advanced/dpu': 'deep',
+  'l4-advanced/oncall': 'intro',
+  'l5-tunnel/proxy-basics': 'intro',
+  'l5-tunnel/ssh-tunnels': 'intro',
+  'l5-tunnel/traffic-shaping': 'deep',
+}
+
+export const DEPTH_LABEL: Record<LessonDepth, string> = {
+  intro: '入门',
+  core: '',
+  deep: '深入',
+}
+
+export const DEPTH_STYLE: Record<LessonDepth, string> = {
+  intro: 'bg-sky-100 text-sky-700',
+  core: '',
+  deep: 'bg-slate-200 text-slate-600',
+}
+
+export function getDepth(trackId: string, lessonId: string): LessonDepth {
+  return DEPTH[`${trackId}/${lessonId}`] ?? 'core'
+}
+
+/* ---------- 新手路线 ---------- */
+
+/**
+ * 给零经验的人的一条主线：跨阶段挑出必学的、且都已有正文的课程。
+ *
+ * 排在第 8、9 位的 SSH 与代理是刻意的 —— 入职第一周就会用到，
+ * 而且看得见摸得着，比继续堆概念更容易撑住学习动力。
+ */
+export const BEGINNER_PATH: string[] = [
+  'l0-basics/first-look',
+  'l0-basics/metrics-units',
+  'l0-basics/switching-routing',
+  'l0-basics/packet-journey',
+  'l0-basics/tcp-behavior',
+  'l0-basics/toolbox',
+  'l0-basics/quest-slow-host',
+  'l5-tunnel/proxy-basics',
+  'l5-tunnel/ssh-tunnels',
+  'l1-k8s/k8s-model',
+  'l1-k8s/cni',
+  'l1-k8s/service',
+  'l2-hpc/why-rdma',
+  'l3-planning/ethernet-plan',
+]
 
 /* ---------- 派生查询 ---------- */
 
@@ -1659,6 +1764,21 @@ export function getLesson(trackId: string, lessonId: string) {
     prev: ordered[index - 1],
     next: ordered[index + 1],
   }
+}
+
+/** 解析新手路线，附带累计时长 */
+export function getBeginnerPath() {
+  let minutes = 0
+  return BEGINNER_PATH.map((key) => {
+    const [t, l] = key.split('/')
+    const found = getLesson(t, l)
+    if (!found) return undefined
+    minutes += found.lesson.minutes
+    return { track: found.track, lesson: found.lesson, key, cumulativeMinutes: minutes }
+  }).filter(
+    (x): x is { track: Track; lesson: Lesson; key: string; cumulativeMinutes: number } =>
+      Boolean(x),
+  )
 }
 
 /** 解析出「建议先学」的课程列表 */

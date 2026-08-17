@@ -1,5 +1,14 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
-import { KIND_LABEL, KIND_STYLE, getTrack, groupedLessons, lessonKey } from '#/lib/curriculum'
+import {
+  DEPTH_LABEL,
+  DEPTH_STYLE,
+  KIND_LABEL,
+  KIND_STYLE,
+  getDepth,
+  getTrack,
+  groupedLessons,
+  lessonKey,
+} from '#/lib/curriculum'
 import { useProgress } from '#/lib/progress'
 
 export const Route = createFileRoute('/tracks/$trackId')({
@@ -124,6 +133,13 @@ function TrackPage() {
                         >
                           {KIND_LABEL[lesson.kind]}
                         </span>
+                        {getDepth(track.id, lesson.id) !== 'core' && (
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[11px] ${DEPTH_STYLE[getDepth(track.id, lesson.id)]}`}
+                          >
+                            {DEPTH_LABEL[getDepth(track.id, lesson.id)]}
+                          </span>
+                        )}
                         <span className="text-xs text-gray-400">{lesson.minutes} 分钟</span>
                         {lesson.status === 'planned' && (
                           <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[11px] text-gray-400">

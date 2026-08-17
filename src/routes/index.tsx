@@ -1,5 +1,15 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
-import { allLessons, groupedLessons, lessonKey, stats, tracks } from '#/lib/curriculum'
+import {
+  DEPTH_LABEL,
+  DEPTH_STYLE,
+  allLessons,
+  getBeginnerPath,
+  getDepth,
+  groupedLessons,
+  lessonKey,
+  stats,
+  tracks,
+} from '#/lib/curriculum'
 import { useProgress } from '#/lib/progress'
 
 export const Route = createFileRoute('/')({
@@ -39,6 +49,75 @@ const ENTRIES = [
     lessonId: 'proxy-basics',
   },
 ]
+
+/**
+ * 新手路线：给零经验的人的一条主线。
+ * 53 节课容易让人不知道从哪下手，这里把它压成 14 节的清单。
+ */
+function BeginnerPath({ doneSet }: { doneSet: Set<string> }) {
+  const path = getBeginnerPath()
+  const total = path.at(-1)?.cumulativeMinutes ?? 0
+  const done = path.filter((item) => doneSet.has(item.key)).length
+
+  return (
+    <section className="rounded-2xl border border-brand-200 bg-brand-50/60 px-5 py-5 sm:px-6">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <h2 className="text-xl font-bold">新手路线</h2>
+        <span className="text-xs text-gray-500">
+          {path.length} 节 · 约 {Math.round(total / 60)} 小时 · 已完成 {done}/{path.length}
+        </span>
+      </div>
+      <p className="mt-1.5 text-sm leading-relaxed text-gray-600">
+        零经验、不知道从哪下手就照这条走。全部选的是已有正文的课，按依赖排好顺序，
+        中间刻意插了 SSH 与代理两节 —— 入职第一周大概率就要用上，比继续堆概念更容易撑住。
+      </p>
+
+      <ol className="mt-4 space-y-1">
+        {path.map((item, index) => {
+          const isDone = doneSet.has(item.key)
+          const depth = getDepth(item.track.id, item.lesson.id)
+          return (
+            <li key={item.key}>
+              <Link
+                to="/learn/$trackId/$lessonId"
+                params={{ trackId: item.track.id, lessonId: item.lesson.id }}
+                className="flex items-center gap-2.5 rounded-lg bg-white/70 px-3 py-2 transition hover:bg-white"
+              >
+                <span
+                  className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-medium ${
+                    isDone ? 'bg-emerald-500 text-white' : 'bg-gray-200 text-gray-600'
+                  }`}
+                >
+                  {isDone ? '✓' : index + 1}
+                </span>
+                <span
+                  className={`shrink-0 rounded px-1 py-0.5 text-[10px] ${item.track.accent.bg} ${item.track.accent.text}`}
+                >
+                  {item.track.level}
+                </span>
+                <span className="min-w-0 flex-1 truncate text-sm text-gray-800">
+                  {item.lesson.title}
+                </span>
+                {depth === 'intro' && (
+                  <span
+                    className={`hidden shrink-0 rounded px-1.5 py-0.5 text-[10px] sm:inline ${DEPTH_STYLE[depth]}`}
+                  >
+                    {DEPTH_LABEL[depth]}
+                  </span>
+                )}
+                <span className="shrink-0 text-[11px] text-gray-400">{item.lesson.minutes} 分</span>
+              </Link>
+            </li>
+          )
+        })}
+      </ol>
+
+      <p className="mt-3 text-xs text-gray-500">
+        走完这条线再按下面的方向深入。标「深入」的课可以先跳过，遇到具体问题再回来。
+      </p>
+    </section>
+  )
+}
 
 function Home() {
   const progress = useProgress()
@@ -109,6 +188,8 @@ function Home() {
           </div>
         </div>
       </section>
+
+      <BeginnerPath doneSet={doneSet} />
 
       <section>
         <h2 className="text-xl font-bold">按目标选起点</h2>
