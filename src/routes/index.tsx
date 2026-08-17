@@ -25,6 +25,12 @@ const ENTRIES = [
     lessonId: 'metrics-units',
   },
   {
+    label: '解决隧道与代理',
+    desc: 'SSH 转发、WireGuard、分流规则 —— 门槛最低，最快用上',
+    trackId: 'l5-tunnel',
+    lessonId: 'proxy-basics',
+  },
+  {
     label: '做 K8s 平台',
     desc: 'Pod 怎么通、Service 的 VIP 谁在翻译',
     trackId: 'l1-k8s',
@@ -41,12 +47,6 @@ const ENTRIES = [
     desc: '算端口数、交换机台数与线缆数',
     trackId: 'l3-planning',
     lessonId: 'ethernet-plan',
-  },
-  {
-    label: '解决隧道与代理',
-    desc: 'SSH 转发、WireGuard、分流规则',
-    trackId: 'l5-tunnel',
-    lessonId: 'proxy-basics',
   },
 ]
 
@@ -68,8 +68,8 @@ function BeginnerPath({ doneSet }: { doneSet: Set<string> }) {
         </span>
       </div>
       <p className="mt-1.5 text-sm leading-relaxed text-gray-600">
-        零经验、不知道从哪下手就照这条走。全部选的是已有正文的课，按依赖排好顺序，
-        中间刻意插了 SSH 与代理两节 —— 入职第一周大概率就要用上，比继续堆概念更容易撑住。
+        零经验、不知道从哪下手就照这条走。全部选的是已有正文的课，顺序与下面的目录一致：
+        L0 打完基础，紧接着是代理与 SSH 这类入职第一周就用得上的工具，再进容器网络。
       </p>
 
       <ol className="mt-4 space-y-1">
@@ -144,9 +144,10 @@ function Home() {
           从一个包走过的每一跳，到一整套 GPU 集群的布线账
         </h1>
         <p className="mt-4 max-w-3xl leading-relaxed text-gray-600">
-          六个阶段，每个阶段再拆成几个小组，按依赖顺序往前走：先把 Linux 协议栈上的收发路径走通，
-          再拆开 K8s 容器网络那些看似魔法的机制，接着进入 PCIe / NVLink 与 InfiniBand / RoCE
-          的高性能战场，然后学会把业务需求翻译成端口数与线缆数。代理与隧道那一阶段可以随时独立来学。
+          先把 Linux 协议栈上的收发路径走通，紧接着拿下代理与隧道这套立刻能用的工具箱，
+          再拆开 K8s 容器网络那些看似魔法的机制，然后进入 PCIe / NVLink 与 InfiniBand / RoCE
+          的高性能战场，最后学会把业务需求翻译成端口数与线缆数。每个阶段再拆成几个小组，
+          组内按依赖顺序排列。
         </p>
 
         {/* 手机上排成 2×2，避免最后一格单独掉一行 */}

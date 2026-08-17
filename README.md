@@ -10,11 +10,11 @@
 | 阶段 | 主题 | 说明 |
 | --- | --- | --- |
 | **L0** | 网络基础 | 一次 curl 的全过程与术语表、带宽/PPS/延迟三指标、二三层转发、报文收发路径、TCP 行为、内核栈调优、观测工具箱 |
+| **T** | 代理与隧道 | HTTP/SOCKS5 代理、SSH 端口转发、gost、WireGuard、Tailscale、Pritunl、受限网络诊断、流量特征、Mihomo 分流规则、透明网关 |
 | **L1** | 容器网络 | K8s 网络模型、netns/veth、CNI 数据平面、Service、kube-proxy 与 eBPF、**MetalLB**、Ingress、DNS/策略、次级 CNI |
 | **L2** | 高性能网络 | PCIe 拓扑与带宽账、NVLink/NVSwitch、RDMA 原理、InfiniBand、RoCEv2 与无损以太网、Fat-Tree/Rail 拓扑、perftest、K8s RDMA、NCCL |
 | **L3** | 网络规划 | 需求拆解、以太网 Spine-Leaf 端口账、地址与 VLAN 规划、计算网 Rail 布线账、IB/RoCE 选型 |
 | **L4** | 进阶专题 | SR-IOV/MacVLAN、eBPF/XDP、DPDK、GPUDirect RDMA、NVMe-oF、MPI、DPU、可观测性、值班手册 |
-| **L5** | 代理与隧道 | HTTP/SOCKS5 代理、SSH 端口转发、gost、WireGuard、Tailscale、Pritunl、受限网络诊断、流量特征、Mihomo 分流规则、透明网关 |
 
 共 6 个阶段、**21 个小组**、**54 节课**（约 29 小时），其中 **25 节已有正文**，
 其余为定稿大纲（课程页会渲染大纲占位）。动手环节 15 个：9 个实验 + 4 个命令行闯关 + 2 个规划计算器。
@@ -27,8 +27,9 @@
 跨阶段挑出 14 节必学且已有正文的课，约 7 小时，按依赖排好顺序。
 课程还按 `DEPTH` 标了「入门 / 深入」两端，标「深入」的可以先跳过。
 
-> L5 可以脱离前面的顺序独立学 —— 它是日常工具箱（把内网服务安全暴露给自己、把流量按规则送出去、
-> 把散落各处的机器组成一张网），不依赖 L1/L2 的知识。
+> **T 不是"第五阶段"，是一条旁路。** 它只依赖 L0，不依赖 L1/L2/L3，而且门槛最低、
+> 入职第一周就用得上（把内网服务安全暴露给自己、把流量按规则送出去、把散落各处的机器组成一张网），
+> 所以排在 L0 之后而不是压到最末。全站线性顺序是 **L0 → T → L1 → L2 → L3 → L4**。
 
 线上地址：<https://netpath.wutz.dev>
 
@@ -104,8 +105,8 @@ netpath/
 │   │   ├── l1-k8s/             # 10 节（3 节有正文）
 │   │   ├── l2-hpc/             # 10 节（5 节有正文）
 │   │   ├── l3-planning/        # 5 节（2 节有正文）
-│   │   ├── l4-advanced/        # 9 节（1 节有正文）
-│   │   └── l5-tunnel/          # 12 节（7 节有正文）
+│   │   ├── l5-tunnel/          # 12 节（7 节有正文）· 目录里紧跟 l0
+│   │   └── l4-advanced/        # 9 节（1 节有正文）
 │   ├── routes/
 │   │   ├── __root.tsx
 │   │   ├── index.tsx                    # 首页：路径总览 + 进度
@@ -202,7 +203,7 @@ MTU 必须端到端一致，任何一跳不一致都会导致大包被丢弃。
 
 ## 后续可做
 
-- 补齐剩余 29 节正文（优先 L1 的 MetalLB 与 netns/veth 实验 —— MetalLB 现在夹在 Service 与 Ingress 之间，是核心路径上的缺口）
+- 补齐剩余 29 节正文（优先 T 的 SSH 进阶、L1 的 MetalLB 与 netns/veth 实验 —— MetalLB 现在夹在 Service 与 Ingress 之间，是核心路径上的缺口）
 - 再加三个闯关：Pod 之间不通、MTU 黑洞、隧道断点定位
 - 拓扑图交互组件：拖动节点数看 leaf/spine 布线图变化
 - 深色模式（Shiki 已按双主题编译，接一个切换即可）
