@@ -1,0 +1,256 @@
+## 什么时候需要第二张网卡
+
+默认 CNI 给的那张 `eth0` 走软件转发路径，对业务足够。但有两类场景绕不过去：
+
+| 场景 | 为什么默认 CNI 不行 |
+| --- | --- |
+| **AI 训练 / 高性能存储** | 要用网卡的 RDMA 能力，软件转发路径帮不上忙（L2 详解） |
+| **虚拟机（KubeVirt）** | 虚机需要二层语义：自己的 MAC、能收发任意帧、能跑 DHCP |
+
+做法都是**给 Pod 插第二张网卡**：业务流量走 `eth0`（默认 CNI），
+高性能或二层流量走 `net1`（次级 CNI）。
+
+## Multus：多网卡的调度者
+
+Multus 本身不实现网络，它是个 **meta-plugin**：kubelet 调它，它再按 Pod 注解去调真正的插件。
+
+```
+kubelet → Multus → ① 默认 CNI（Cilium）→ eth0
+                 → ② 按注解调 MacVLAN/SR-IOV → net1
+```
+
+配置载体是 `NetworkAttachmentDefinition`（NAD），Pod 用注解引用它：
+
+```yaml
+metadata:
+  annotations:
+    k8s.v1.cni.cncf.io/networks: network-operator/hca
+```
+
+```bash
+kubectl get network-attachment-definitions -A
+# 验证生效：Pod 里应该能看到两张网卡
+kubectl exec -it mypod -- ip -brief addr
+```
+
+```
+lo     UNKNOWN  127.0.0.1/8
+eth0   UP       10.244.1.7/32          ← 默认 CNI
+net1   UP       192.168.0.9/20         ← 次级网卡
+```
+
+Pod 的 `status` 里也会记录：
+
+```bash
+kubectl get pod mypod -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}' | jq
+```
+
+## 实验：MacVLAN + nv-ipam 给 Pod 一张直连网卡
+
+这是 RoCE 场景最常用的组合。前提是节点已装好 network-operator
+（[L2 的 K8s RDMA 那节](/learn/l2-hpc/k8s-rdma) 讲部署）。
+
+### 第一步：定义网络与 IP 池
+
+```yaml
+apiVersion: mellanox.com/v1alpha1
+kind: MacvlanNetwork
+metadata:
+  name: hca
+  namespace: network-operator
+spec:
+  networkNamespace: "default"      # 允许哪个命名空间的 Pod 用
+  master: "bond0"                  # 从哪张物理卡派生
+  mode: "bridge"
+  mtu: 1500
+  ipam: |
+    {
+      "type": "nv-ipam",
+      "poolName": "hca"
+    }
+---
+apiVersion: nv-ipam.nvidia.com/v1alpha1
+kind: IPPool
+metadata:
+  name: hca
+  namespace: network-operator
+spec:
+  subnet: 192.168.0.0/20
+  perNodeBlockSize: 8              # 每节点先领 8 个地址
+  gateway: 192.168.0.1
+```
+
+```bash
+kubectl apply -f macvlan-hca.yaml
+kubectl get ippool -n network-operator
+kubectl get macvlannetwork -n network-operator
+```
+
+### 第二步：起一个带次级网卡的 Pod
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rdma-test
+  annotations:
+    k8s.v1.cni.cncf.io/networks: network-operator/hca
+spec:
+  containers:
+    - name: app
+      image: mellanox/rping-test
+      command: ["sleep", "infinity"]
+      resources:
+        limits:
+          rdma/hca: 1                       # 申请 RDMA 设备
+      securityContext:
+        capabilities:
+          add: ["IPC_LOCK"]                 # 注册内存要锁内存
+```
+
+### 第三步：验证
+
+```bash
+# 两张网卡都在
+kubectl exec -it rdma-test -- ip -brief addr
+
+# RDMA 设备可见
+kubectl exec -it rdma-test -- ibv_devinfo | grep -E 'hca_id|state'
+kubectl exec -it rdma-test -- ibdev2netdev
+
+# GID 表里有 RoCEv2 条目（L2 会讲怎么用它）
+kubectl exec -it rdma-test -- show_gids | grep v2
+```
+
+<Callout type="trap" title="perNodeBlockSize 决定了单节点能跑几个这种 Pod">
+每个节点从池子里领**一整块**地址（例子里 8 个）。含义是：
+
+- 单节点上用这张网的 Pod **最多 8 个**，第 9 个分不到 IP，卡在 `ContainerCreating`
+- 整个池子容量 ÷ 块大小 = 能有多少个节点
+
+和 Pod CIDR 一样，这是**一次性决定、事后难改**的参数
+（[K8s 网络模型](/learn/l1-k8s/k8s-model) 那节讲过同类问题）。
+按未来的并发任务数算，别按当前用量算。
+
+排查线索：`kubectl describe pod` 的 Events 里会写 IPAM 分配失败。
+</Callout>
+
+## 三种接入方式怎么选
+
+[L4 的 SR-IOV / MacVLAN / IPvlan](/learn/l4-advanced/sriov-macvlan) 那节讲了机制差异，
+这里只给选择结论：
+
+| 方式 | 选它的理由 | 别选它的理由 |
+| --- | --- | --- |
+| **MacVLAN** | 配置最简单，性能够用 | 交换机限制 MAC 数量时不行 |
+| **IPvlan** | 交换机开了端口安全、只允许一个 MAC | 失去独立二层身份 |
+| **SR-IOV** | 要极致性能、要硬件隔离 | VF 数量硬件写死、调整要重置网卡 |
+
+## hostNetwork 还是次级网卡
+
+RDMA 场景下这是个真实的取舍，不是理论问题：
+
+| | `hostNetwork: true` | MacVLAN 次级网卡 |
+| --- | --- | --- |
+| 额外组件 | **不需要** | 需要 Multus/Spiderpool + IP 池 |
+| Pod IP | 就是宿主机 IP | 独立 IP |
+| 同节点跑第二个任务 | ❌ **端口冲突** | ✅ 可以 |
+| 配置复杂度 | 低 | 中 |
+| 适合 | 单任务独占整机 | 共享集群、多任务并行 |
+
+<Callout type="warn" title="hostNetwork 下同节点起不了第二个任务">
+`hostNetwork: true` 让 Pod 直接用宿主机端口空间。NCCL、MPI 的 sshd 都要监听固定端口，
+同节点起第二个任务时**端口直接撞车**，症状是第二个 Pod 一直 CrashLoopBackOff。
+
+这就是共享 GPU 集群要上 MacVLAN 的实际理由：**给每个任务一套独立的 IP 与端口空间**。
+独占整机跑单个大任务时，hostNetwork 更省事。
+</Callout>
+
+## 虚拟机场景：Kube-OVN 作次级 CNI
+
+KubeVirt 里的虚机需要的不是高性能，是**二层语义**：自己的 MAC、能跑 DHCP、
+能做 VLAN、最好还能保留 IP 迁移。Kube-OVN 基于 OVN/OVS，天生提供这些。
+
+典型用法是**默认 CNI 保持 Cilium（给容器），Kube-OVN 作为次级 CNI（给虚机）**：
+
+```bash
+kubectl get subnets.kubeovn.io
+kubectl get vlans.kubeovn.io
+kubectl get ips.kubeovn.io | head        # 固定 IP 记录
+```
+
+要点是**职责分离**：容器网络的性能与策略交给 eBPF 数据平面，虚机的二层需求交给 OVN，
+不要试图用一个 CNI 满足两类完全不同的语义。
+
+## 排障清单
+
+```bash
+# 1. NAD 存在且命名空间对得上
+kubectl get net-attach-def -A
+
+# 2. Pod 注解写对了（namespace/name 格式）
+kubectl get pod mypod -o jsonpath='{.metadata.annotations}' | jq
+
+# 3. 网卡真的插上了
+kubectl exec -it mypod -- ip -brief addr
+
+# 4. IPAM 有没有分到地址（Events 里最直接）
+kubectl describe pod mypod | tail -20
+
+# 5. 节点上的 Multus 与设备插件是否健康
+kubectl get pods -n network-operator -o wide
+kubectl describe node <node> | grep -A5 'Allocatable'      # 看 rdma/hca 数量
+```
+
+第 5 步里 `Allocatable` 没有 `rdma/hca` 这项，说明设备插件没生效——
+那是 L2 那节要解决的问题，不是 Multus 的问题。
+
+## 检查点
+
+<Quiz
+  id="sc-1"
+  question="Pod 加了次级网卡注解，但一直 ContainerCreating。describe 显示 IPAM 分配失败。最可能的原因？"
+  options={[
+    { text: '该节点的 perNodeBlockSize 地址块已用满，或整个 IP 池耗尽', correct: true },
+    { text: '没申请 rdma/hca 资源', feedback: '缺资源会是调度失败或容器内看不到设备，不是 IPAM 报错。' },
+    { text: 'Multus 没装', feedback: '没装 Multus 会直接忽略注解，不会报 IPAM 错误。' },
+    { text: 'MTU 配置不对', feedback: 'MTU 不影响地址分配。' },
+  ]}
+  explain={<>每节点领一块地址（如 8 个），单节点上用这张网的 Pod 数不能超过块大小。这与 Pod CIDR 是同一类「一次性决定」的容量参数，要按未来并发任务数规划。</>}
+/>
+
+<Quiz
+  id="sc-2"
+  question="共享 GPU 集群，要在同一节点上同时跑两个 RDMA 训练任务。网络该怎么配？"
+  options={[
+    { text: '用 MacVLAN 次级网卡给每个 Pod 独立 IP，避免端口空间冲突', correct: true },
+    { text: '两个任务都用 hostNetwork: true', feedback: 'hostNetwork 共享宿主机端口空间，NCCL 与 sshd 会端口撞车。' },
+    { text: '关掉 RDMA 走 TCP', feedback: '放弃了性能，不是解决办法。' },
+    { text: '给两个任务分配不同 GPU 即可', feedback: 'GPU 隔离了，网络端口空间仍然共享。' },
+  ]}
+  explain={<>这是 hostNetwork 与 MacVLAN 取舍的核心：独占整机用 hostNetwork（省事），共享集群用 MacVLAN（换独立端口空间，代价是要维护 IP 池）。</>}
+/>
+
+<Quiz
+  id="sc-3"
+  question="集群里既有容器业务也有 KubeVirt 虚机。比较合理的网络方案是？"
+  options={[
+    { text: '默认 CNI 用 Cilium 给容器，Kube-OVN 作次级 CNI 给虚机', correct: true },
+    { text: '全部用 Kube-OVN', feedback: '容器侧会失去 eBPF 数据平面在 Service 与策略上的优势。' },
+    { text: '全部用 Cilium，虚机也走它', feedback: '虚机需要独立 MAC、DHCP、VLAN 这类二层语义，不是 Cilium 的定位。' },
+    { text: '给虚机用 hostNetwork', feedback: '虚机需要自己的二层身份，共享宿主机网络栈不满足需求。' },
+  ]}
+  explain={<>职责分离：容器的性能与策略交给 eBPF，虚机的二层需求交给 OVN。不要试图用一个 CNI 满足两类完全不同的语义 —— 这也是次级 CNI 机制存在的价值。</>}
+/>
+
+## 这节课的落点
+
+- 只有两类场景需要第二张网卡：**RDMA/高性能** 与 **虚拟机的二层语义**
+- Multus 是 meta-plugin：按 Pod 注解去调真正的插件，配置载体是 NAD
+- 验证插上了没有：`ip -brief addr` 应该看到 `eth0` + `net1`
+- MacVLAN + nv-ipam 是 RoCE 场景的常用组合；Pod 侧还要 `rdma/hca` 与 `IPC_LOCK`
+- **`perNodeBlockSize` 决定单节点能跑几个这种 Pod**，与 Pod CIDR 同属一次性决定
+- MacVLAN / IPvlan / SR-IOV 的选择由交换机限制与性能要求决定
+- **hostNetwork 简单但同节点跑不了第二个任务**；共享集群用 MacVLAN 换独立端口空间
+- 虚机场景用 Kube-OVN 作次级 CNI，**职责分离**而不是让一个 CNI 兼顾两种语义
+- `Allocatable` 里没有 `rdma/hca` 是设备插件的问题，不是 Multus 的问题

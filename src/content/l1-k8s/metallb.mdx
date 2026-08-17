@@ -1,0 +1,298 @@
+## Service 那节留下的问题
+
+`type: LoadBalancer` 在云上一行就够——云厂商替你起一台 L4 负载均衡器。裸金属没有这个东西，
+所以 Service 会一直卡在 `<pending>`，拿不到 `EXTERNAL-IP`。
+
+MetalLB 补的就是这一段。它要解决两件事：
+
+1. **分配**：从一段你给的地址里挑一个 IP
+2. **宣告**：让物理网络知道"这个 IP 现在归某台节点"
+
+第 1 件容易，第 2 件是全部难点所在——而且有两种完全不同的做法。
+
+## 地址池：先把地盘划好
+
+```yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  addresses:
+    - 172.18.15.200-172.18.15.210      # 从机房网络组要一段空闲地址
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement          # 换成 BGPAdvertisement 就是 BGP 模式
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - default
+```
+
+```bash
+kubectl get ipaddresspools -n metallb-system
+# 已经分出去的 VIP
+kubectl get svc -A -o jsonpath='{.items[*].status.loadBalancer.ingress[*].ip}' | tr ' ' '\n' | sort -u
+```
+
+<Callout type="warn" title="地址池的三条硬要求">
+1. **必须是可路由的地址**，而且**由机房网络组分配**。自己随便挑一段会和别人冲突。
+2. **不能和节点网、Pod CIDR、Service CIDR 重叠**——[K8s 网络模型](/learn/l1-k8s/k8s-model)
+   那节讲的三套地址，这是第四套。
+3. **L2 模式下必须和节点在同一个二层域**。因为 ARP 是广播，跨网段的 ARP 到不了
+   （[二层与三层](/learn/l0-basics/switching-routing) 讲过）。这是 L2 模式最容易被忽略的前提。
+
+地址够不够用也要算：每个 LoadBalancer 类型的 Service 占一个。11 个地址就是 11 个服务上限。
+</Callout>
+
+## L2 模式：靠 gARP 抢占
+
+一台节点上的 `speaker` 声称"这个 IP 是我的"。声称的方式是 **gARP（无请求 ARP）**——
+不等别人问，主动广播：
+
+```
+speaker 广播：10 网段的各位注意，172.18.15.200 的 MAC 是 b8:ce:f6:2a:1c:40
+交换机与其它主机：更新 ARP 缓存
+此后发往这个 VIP 的流量全部进这台节点
+```
+
+### 关键限制：这不是负载均衡
+
+**VIP 在任意时刻只落在一个节点上。** 所以：
+
+| 你以为 | 实际 |
+| --- | --- |
+| 流量分摊到多节点 | 全部流量先进一台节点 |
+| 带宽是集群总和 | **带宽上限 = 那一台节点的网卡** |
+| 挂一台无影响 | 挂了要重新选主 + 重新宣告，有秒级中断 |
+
+进入那台节点之后，才由 Service 的 DNAT 把流量分发到各个 Pod。
+所以它提供的是**高可用**（故障能切换），不是**负载均衡**（带宽不叠加）。
+
+### VIP 现在在哪台节点
+
+排障第一问。三种查法，按可靠性排序：
+
+```bash
+# 1. 新版本直接有 CRD（最省事）
+kubectl get servicel2statuses.metallb.io -n metallb-system
+
+# 2. 从 speaker 日志里找
+kubectl logs -n metallb-system <speaker-pod> | grep serviceAnnounced | grep 172.18.15.200
+
+# 3. 用 ARP 反查（不依赖 MetalLB 版本）
+arping -c 3 172.18.15.200        # 拿到 MAC
+arp -n | grep <那个 MAC>          # 通常返回两个 IP：VIP 和物理节点 IP
+```
+
+### 故障切换靠什么
+
+原持有者挂了之后，新选出的 speaker 会**再发一轮 gARP**，让全网更新缓存。
+中断时长取决于：选主耗时 + gARP 传播 + 各设备缓存更新。通常在秒级。
+
+有些交换机的 ARP 缓存更新较慢或开了防 ARP 欺骗策略，会让切换更慢甚至失败——
+这也是 gARP 方案的固有弱点。
+
+## BGP 模式：真正的负载分担
+
+换成和上游路由器建 BGP 邻居，**多个节点同时宣告同一个 `/32`**，
+上游用 **ECMP** 把流量哈希分散到这些节点：
+
+```yaml
+apiVersion: metallb.io/v1beta2
+kind: BGPPeer
+metadata:
+  name: tor-switch
+  namespace: metallb-system
+spec:
+  myASN: 64512              # 集群自己的 AS 号
+  peerASN: 64513            # 上游交换机的 AS 号
+  peerAddress: 10.0.12.1
+---
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - default
+```
+
+### BGP 三个概念够用了
+
+| 概念 | 一句话 |
+| --- | --- |
+| **AS 号** | 一个自治域的编号。私有范围 64512–65534，集群随便挑一个，和上游约定好 |
+| **对等（peer）** | 两台设备建一条 TCP 179 的会话，互相交换路由 |
+| **宣告** | "我这里能到 172.18.15.200/32"，上游把它装进路由表 |
+
+```bash
+# 会话状态（要 Established 才算通）
+kubectl logs -n metallb-system <speaker-pod> | grep -i "BGP session"
+# 交换机侧：show ip bgp summary / show ip route 172.18.15.200
+```
+
+### 两种模式对照
+
+| | L2（gARP） | BGP |
+| --- | --- | --- |
+| 宣告方式 | 广播 ARP | 与路由器建邻居 |
+| 流量分担 | ❌ 单节点承载 | ✅ ECMP 多节点 |
+| 带宽上限 | 一台节点的网卡 | 参与宣告的节点之和 |
+| 跨网段 | ❌ 必须同二层 | ✅ 可以跨网段 |
+| 故障切换 | 秒级（重发 gARP） | 更快（BGP 会话中断即撤路由） |
+| 对网络组的要求 | **无**，直接能用 | 要交换机配 BGP 邻居 |
+| 适合 | 小集群、测试、网络组不配合 | 生产、要吞吐 |
+
+**选择逻辑很简单**：能让网络组配 BGP 就用 BGP；不能就用 L2，并接受单节点带宽上限。
+
+<Callout type="tip" title="ECMP 的一个副作用">
+ECMP 按五元组哈希选路径。**同一条连接的包始终走同一节点**（所以连接不会乱），
+但节点数变化时哈希桶重算，**部分已有连接会被重新分配到别的节点**——
+那些连接的 conntrack 表项不在新节点上，会被重置。
+
+表现是扩缩容节点时出现一小批连接中断。要缓解就用 `externalTrafficPolicy: Local`
+配合稳定的后端分布，或者让客户端有重连逻辑。
+</Callout>
+
+## 与 CNI 的配合：把 Pod CIDR 也宣告出去
+
+BGP 一旦通了，就不止能宣告 VIP。[CNI 那节](/learn/l1-k8s/cni) 讲的**原生路由模式**
+需要物理网络知道每个节点的 Pod CIDR 在哪——这正好也是 BGP 干的事。
+
+Cilium 自带 BGP 能力，可以把 Pod CIDR 直接宣告给上游：
+
+```yaml
+# 大意如此：让节点把自己的 Pod CIDR 宣告出去
+apiVersion: cilium.io/v2alpha1
+kind: CiliumBGPPeeringPolicy
+metadata:
+  name: tor
+spec:
+  virtualRouters:
+    - localASN: 64512
+      exportPodCIDR: true               # 关键：宣告 Pod CIDR
+      neighbors:
+        - peerAddress: 10.0.12.1/32
+          peerASN: 64513
+```
+
+收益是**免封装**：Pod IP 直接在物理网络上路由，没有 VXLAN 的 50 字节开销和 MTU 折扣。
+代价是**要和网络组谈**。
+
+<Callout type="note" title="两个 BGP 会不会打架">
+MetalLB 宣告 VIP、Cilium 宣告 Pod CIDR，如果都开，就有两个组件在和同一台交换机建邻居。
+技术上可行（交换机支持多个邻居），但要注意：
+
+- 两者的 AS 号规划要一致
+- 交换机侧的邻居数量与前缀数量限制
+- **更推荐的做法是统一由一个组件负责**：Cilium 本身也能接管 LoadBalancer IP 宣告，
+  这样就不需要 MetalLB 了
+
+新集群做选型时值得先想清楚这一层，避免后期两套 BGP 并存带来的排查复杂度。
+</Callout>
+
+## 排障：四条路
+
+VIP 不通时按顺序走：
+
+```bash
+# 1. Service 拿到 IP 了吗（pending = 地址池问题）
+kubectl get svc myapp
+kubectl describe svc myapp | tail -20        # Events 里会写分配失败原因
+
+# 2. 有节点在宣告吗
+kubectl get servicel2statuses -n metallb-system
+kubectl logs -n metallb-system -l app.kubernetes.io/component=speaker | grep -i announc
+
+# 3. 二层能不能看到（L2 模式）
+arping -c 3 172.18.15.200
+# 在宣告节点上抓 ARP
+tcpdump -i bond0 -nn arp and host 172.18.15.200
+
+# 4. Endpoint 有后端吗（VIP 通了但连接被拒）
+kubectl get endpointslices -l kubernetes.io/service-name=myapp
+```
+
+### 两个高频坑
+
+<Callout type="trap" title="① exclude-from-external-load-balancers 标签">
+节点带了 `node.kubernetes.io/exclude-from-external-load-balancers` 标签时，
+**speaker 不会在这台节点上宣告 VIP**。
+
+控制面节点默认常带这个标签。如果你只有 3 台控制面节点又想让它们承载 VIP，
+就会看到"MetalLB 装好了、Service 拿到 IP 了、但完全不通"。
+
+```bash
+kubectl get nodes -o json | jq -r \
+  '.items[] | select(.metadata.labels["node.kubernetes.io/exclude-from-external-load-balancers"]) | .metadata.name'
+```
+
+对应的处理是给 speaker 配 `ignoreExcludeLB: true`，或者去掉标签。
+</Callout>
+
+<Callout type="trap" title="② externalTrafficPolicy: Local 缩小了宣告范围">
+改成 `Local` 之后，**只有跑着该服务后端 Pod 的节点才会宣告 VIP**。
+
+好处是保留客户端真实源 IP（上一节讲过）。坏处有两个：
+
+- 后端 Pod 只在少数节点上 → 只有那几台宣告 → 流量倾斜
+- 后端 Pod 全部漂移走 → **没有节点宣告 → VIP 彻底不通**
+
+所以用 `Local` 时要配合 Pod 反亲和或 DaemonSet，保证后端分布均匀。
+症状是"改了一个字段之后 VIP 不通了"，而网络链路毫无问题。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="mlb-1"
+  question="L2 模式下给某个服务分配了 VIP，压测发现吞吐上不去，只有单机网卡的水平。为什么？"
+  options={[
+    { text: 'L2 模式下 VIP 只落在一个节点上，全部流量先进那一台，带宽上限就是它的网卡', correct: true },
+    { text: '地址池太小', feedback: '地址池大小只决定能有多少个 Service，不影响单个服务的带宽。' },
+    { text: 'Service 的 DNAT 成了瓶颈', feedback: 'DNAT 开销很小，瓶颈在入口只有一台节点。' },
+    { text: '需要调大 conntrack', feedback: '那影响的是连接数上限而不是带宽。' },
+  ]}
+  explain={<>L2 模式提供的是高可用而不是负载均衡。要让带宽叠加必须用 BGP 模式 —— 多节点宣告同一个 /32，上游用 ECMP 分担。这也是「能让网络组配 BGP 就用 BGP」的主要理由。</>}
+/>
+
+<Quiz
+  id="mlb-2"
+  question="MetalLB 装好、Service 拿到了 EXTERNAL-IP，但 VIP 完全不通。arping 也没有任何响应。最该先查什么？"
+  options={[
+    { text: '有没有节点在宣告：查 servicel2statuses 与 speaker 日志，以及节点上的 exclude-from-external-load-balancers 标签', correct: true },
+    { text: '后端 Pod 的就绪状态', feedback: 'Endpoint 为空会导致连接被拒（refused），而不是 ARP 都没响应。' },
+    { text: '交换机端口速率', feedback: '速率问题不会导致 ARP 无响应。' },
+    { text: 'Pod CIDR 配置', feedback: 'Pod CIDR 与 VIP 宣告无关。' },
+  ]}
+  explain={<>arping 无响应说明没有任何节点在宣告这个 VIP。两个高频原因：节点带了 exclude-from-external-load-balancers 标签（控制面节点默认常带），或 externalTrafficPolicy: Local 且该节点上没有后端 Pod。</>}
+/>
+
+<Quiz
+  id="mlb-3"
+  question="关于 MetalLB 的地址池，下面哪些说法正确？（多选）"
+  options={[
+    { text: '地址必须由机房网络组分配，且不能与节点网、Pod CIDR、Service CIDR 重叠', correct: true },
+    { text: 'L2 模式要求地址池与节点处于同一个二层域', correct: true },
+    { text: '每个 LoadBalancer 类型的 Service 占用一个地址', correct: true },
+    { text: '地址池可以用任意私有网段，只要集群内部不冲突', feedback: '它要在物理网络上可路由，随便挑会和机房其它设备冲突。' },
+  ]}
+  explain={<>L2 模式的同二层要求最容易被忽略 —— 因为 gARP 是广播，跨网段到不了。这是 L0《二层与三层》那节知识的直接应用。</>}
+/>
+
+## 这节课的落点
+
+- 裸金属没有云 LB，MetalLB 补两件事：**从地址池分配** + **让物理网络知道**
+- 地址池要网络组分配、不能与三套地址重叠、**L2 模式必须同二层**
+- **L2 模式（gARP）= 高可用，不是负载均衡**：VIP 只在一个节点，带宽上限是那台网卡
+- VIP 在哪台节点：`servicel2statuses` → speaker 日志 → `arping` + `arp -n` 反查
+- **BGP 模式 = 真正分担**：多节点宣告同一 `/32`，上游 ECMP；能配 BGP 就用 BGP
+- BGP 三个概念够用：AS 号、对等会话（TCP 179）、宣告
+- BGP 通了还能顺带宣告 Pod CIDR，实现原生路由**免封装**；但要考虑两套 BGP 是否并存
+- 两个高频坑：**`exclude-from-external-load-balancers` 标签**、
+  **`externalTrafficPolicy: Local` 缩小宣告范围**

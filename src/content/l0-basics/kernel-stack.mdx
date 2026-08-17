@@ -1,0 +1,248 @@
+## 先问一句：真的该调内核吗
+
+这一节讲的是旋钮。但**先说清什么时候不该动它们**：
+
+| 现象 | 该做的事 |
+| --- | --- |
+| 带宽跑不满，`cwnd` 小、重传高 | 查丢包，不是调参数 |
+| `Recv-Q` 堆积 | 优化应用，内核参数无用 |
+| 单核 `%soft` 100%、其它核闲 | **这一节**（多队列与亲和性） |
+| 小包 PPS 撞墙 | **这一节**，撑不住再考虑 XDP / DPDK |
+| 延迟要求微秒级 | 换方案（RDMA），调内核到不了 |
+
+调内核参数的正确姿势是**先有症状、再有假设、一次只改一处、改完看计数器**。
+照抄一份"优化脚本"是最糟的做法——你不知道它为什么好，也不知道它什么时候变坏。
+
+## 收包侧：从中断到多核
+
+L0 讲过收包路径：DMA → 硬中断 → NAPI 软中断 → 协议栈。这条路上有三个层次的"分发"：
+
+```
+网卡侧    RSS：硬件按包头哈希，分到多个接收队列       ← 最优，零 CPU 开销
+中断侧    IRQ affinity：每个队列的中断绑到不同 CPU
+软件侧    RPS/RFS：软件再分发一次（网卡不支持多队列时的补救）
+```
+
+### RSS：让网卡自己分
+
+```bash
+ethtool -l bond0        # 支持几个队列 / 当前用了几个
+ethtool -L bond0 combined 16    # 开到 16 个
+```
+
+`Combined: 1` 是那种"CPU0 打满、其它核闲着"故障的根因（L0 闯关就是这个）。
+**队列数取值经验：与要参与收包的 CPU 数匹配，不必开到硬件上限**——
+开 63 个队列意味着 63 个中断源，反而增加调度开销。
+
+### 中断亲和性：别让它们挤在一起
+
+```bash
+# 中断落在哪些 CPU 上
+cat /proc/interrupts | grep -i mlx5_comp
+
+# 单个中断的 CPU 掩码
+cat /proc/irq/142/smp_affinity_list
+```
+
+驱动一般会自动摊开。**手工绑的场合只有一个：NUMA 亲和**——
+把网卡的中断绑到和它同 NUMA 的 CPU 上，避免跨 socket 访问内存。
+
+```bash
+# 网卡属于哪个 NUMA 节点
+cat /sys/class/net/bond0/device/numa_node
+# 那个节点有哪些 CPU
+lscpu | grep NUMA
+```
+
+### RPS / RFS：软件补救
+
+网卡只有单队列时，可以在软中断里再做一次软件分发：
+
+| 机制 | 做什么 |
+| --- | --- |
+| **RPS** | 按包头哈希把包分给其它 CPU 处理协议栈 |
+| **RFS** | 进一步：让包落到**应用所在的那个 CPU**，提升缓存命中 |
+
+```bash
+# 给 rx-0 队列指定可以分发到哪些 CPU（十六进制掩码）
+echo ffff > /sys/class/net/eth0/queues/rx-0/rps_cpus
+sysctl -w net.core.rps_sock_flow_entries=32768
+```
+
+<Callout type="warn" title="有 RSS 就别开 RPS">
+RPS 是**给不支持多队列的网卡准备的补救措施**，它要多做一次跨 CPU 的软中断投递（IPI），
+本身有开销。现代服务器网卡都支持 RSS，开了 RSS 再叠 RPS 通常是净损失。
+
+判断依据：`ethtool -l` 显示 `Combined` 大于 1 且已经开够，就不要动 RPS。
+</Callout>
+
+## 队列深度与中断合并
+
+两个最常用的旋钮，作用相反：
+
+```bash
+ethtool -g bond0        # ring 深度
+ethtool -c bond0        # 中断合并参数
+```
+
+| 旋钮 | 调大的收益 | 代价 |
+| --- | --- | --- |
+| **ring 深度**（`-G rx 4096`） | 吸收突发，减少 `rx_missed` | 延迟上升，占内存 |
+| **中断合并**（`-C rx-usecs 64`） | 大幅降低 CPU 开销 | 延迟上升 |
+
+判断顺序很明确：
+
+- `rx_missed` / `rx_no_buffer` 在涨 → **先加队列数（RSS），再考虑加深 ring**
+- `%soft` 高但没丢包 → 加大中断合并
+- 要低延迟 → 反向调：`rx-usecs` 调小甚至关合并，ring 别太深
+
+<Callout type="trap" title="加深 ring 只是把问题推后">
+ring 从 1024 加到 4096，能扛住 4 倍长度的突发，但**处理能力一点没变**。
+如果是持续过载（不是突发），加深 ring 只会让丢包晚一点发生，而且每个包多排一段队。
+
+区分方法：看丢包是**尖刺状**（突发，加 ring 有效）还是**持续增长**（过载，要加 CPU 或减包）。
+</Callout>
+
+## Offload：把活交给网卡
+
+网卡能替内核干一部分活。用 `ethtool -k` 看当前状态：
+
+```bash
+ethtool -k bond0 | grep -E 'tcp-segmentation|generic|large-receive|checksum|scatter'
+```
+
+| 名称 | 全称 | 做什么 | 建议 |
+| --- | --- | --- | --- |
+| **TSO** | TCP Segmentation Offload | 内核交一个大块，**网卡切成 MTU 大小的包** | 开 |
+| **GSO** | Generic Segmentation Offload | 软件版 TSO，网卡不支持时用 | 开 |
+| **GRO** | Generic Receive Offload | 收方向把连续小包**合成大包**再交协议栈 | 开 |
+| **LRO** | Large Receive Offload | 硬件版 GRO，但**会丢失包边界信息** | **通常关** |
+| **checksum** | 校验和卸载 | 网卡算校验和 | 开 |
+
+开 TSO/GSO/GRO 的收益很实在：**包数减少一个数量级，CPU 开销随之下降**。
+这也是为什么 `tcpdump` 抓到的包会出现远超 MTU 的"巨型包"——那是 GRO 合并后的结果，不是线上真实的帧。
+
+<Callout type="warn" title="LRO 与转发不能共存">
+LRO 在硬件里合包时会丢弃原始包的边界和部分头部信息，**合了就拆不回来**。
+所以只要这台机器要做转发（路由器、NAT、K8s 节点、网桥），LRO 必须关：
+
+```bash
+ethtool -K bond0 lro off
+```
+
+GRO 是可逆的（保留了分段信息），转发场景下可以开。**记法：GRO 安全，LRO 危险。**
+
+另外一个经典坑：抓包分析性能问题时，GRO 会让你看到"1 个 40KB 的包"而误判 MTU。
+需要看真实帧就临时关掉 GRO 再抓。
+</Callout>
+
+## 发包侧：qdisc 与 XPS
+
+```bash
+# 当前的排队规则与丢包统计
+tc -s qdisc show dev bond0
+```
+
+默认的 `fq_codel` 对绝大多数场景是好选择——它自带 AQM，能治 bufferbloat（L0 讲过）。
+需要动它的场合只有三类：**限速**、**优先级**（RoCE 的 DSCP 标记）、**纯低延迟**（`pfifo_fast`）。
+
+发送侧也有对应 RSS 的机制，叫 **XPS**：让某个 CPU 发出的包固定走某个发送队列，避免锁竞争。
+
+```bash
+echo 0001 > /sys/class/net/eth0/queues/tx-0/xps_cpus
+```
+
+驱动通常自动配好，一般不用手动动。
+
+## socket 缓冲区
+
+```bash
+# 自动调节的三个值：min / default / max
+sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+sysctl net.core.rmem_max net.core.wmem_max
+```
+
+**默认值对同机房完全够用。** 需要调大只有一个理由：**BDP 超过了当前 max**
+（L0 算过：跨地域 10 Gbps × 30 ms ≈ 37 MB，远超默认的几 MB）。
+
+```bash
+# 长肥管道才需要
+sysctl -w net.core.rmem_max=67108864
+sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864"
+```
+
+调大的代价是**每条连接可能占用更多内存**，连接数多的机器要算总量。
+
+## 一份有节制的检查清单
+
+```bash
+# 1. 多队列开够了吗（最高频的真问题）
+ethtool -l bond0 | grep -A4 'Current'
+
+# 2. 中断摊开了吗
+cat /proc/interrupts | grep -c mlx5_comp
+
+# 3. 软中断是否集中在单核
+mpstat -P ALL 1 3 | awk '$NF!="idle" && $(NF-1)>20'
+
+# 4. 丢包在哪一层
+ethtool -S bond0 | grep -iE 'missed|no_buffer|drop'
+cat /proc/net/softnet_stat | head -4
+
+# 5. offload 状态是否符合场景（转发机器要确认 LRO 关闭）
+ethtool -k bond0 | grep -E 'large-receive|generic-receive'
+
+# 6. 只有跨地域场景才检查缓冲区上限
+sysctl net.core.rmem_max
+```
+
+**六条里前三条能解决绝大多数"内核侧"性能问题**，剩下三条是场景性的。
+
+## 检查点
+
+<Quiz
+  id="ks-1"
+  question="一台 K8s 节点做流量转发，性能不佳。下面哪个 offload 必须关闭？"
+  options={[
+    { text: 'LRO —— 它在硬件里合包时丢失了包边界，合了拆不回来', correct: true },
+    { text: 'GRO', feedback: 'GRO 保留分段信息、可逆，转发场景可以开。' },
+    { text: 'TSO', feedback: 'TSO 是发送侧分段卸载，转发场景照常开。' },
+    { text: 'checksum offload', feedback: '校验和卸载与转发不冲突。' },
+  ]}
+  explain={<>记法：GRO 安全、LRO 危险。只要机器要转发（路由、NAT、K8s 节点、网桥）就 <code>ethtool -K dev lro off</code>。另外抓包分析时 GRO 会让你看到超过 MTU 的巨型包，需要真实帧时临时关掉。</>}
+/>
+
+<Quiz
+  id="ks-2"
+  question="rx_missed_errors 持续增长。按这节课的顺序，第一步该做什么？"
+  options={[
+    { text: '看 ethtool -l 的队列数是否开够，并确认中断摊到了多个 CPU', correct: true },
+    { text: '直接把 ring 从 1024 加到 8192', feedback: '加深 ring 只能吸收突发；持续过载时只是让丢包晚一点发生。' },
+    { text: '开启 RPS', feedback: 'RPS 是网卡不支持多队列时的补救，有 RSS 就不该叠加。' },
+    { text: '调大 tcp_rmem', feedback: '那影响的是 socket 缓冲，与网卡 ring 层丢包无关。' },
+  ]}
+  explain={<>顺序是「先加队列（RSS）与摊中断，再考虑加深 ring」。区分丢包形态也很关键：尖刺状说明是突发（加 ring 有效），持续增长说明过载（要加 CPU 或减少包数）。</>}
+/>
+
+<Quiz
+  id="ks-3"
+  question="下面哪种情况才值得调大 net.core.rmem_max？"
+  options={[
+    { text: '跨地域长肥管道，BDP 已经超过当前上限', correct: true },
+    { text: '同机房带宽跑不满', feedback: '同机房 BDP 只有几百 KB，默认值远够用，问题在别处。' },
+    { text: 'Recv-Q 一直很高', feedback: '那是应用读得慢，加大缓冲只是让它堆更多。' },
+    { text: '连接数很多', feedback: '连接多反而要注意缓冲区总内存占用，不该盲目调大。' },
+  ]}
+  explain={<>唯一理由是 BDP 超过上限：带宽 × RTT ÷ 8。10 Gbps × 30 ms ≈ 37 MB，默认几 MB 确实不够。同机房场景调它没有收益，还会增加内存占用。</>}
+/>
+
+## 这节课的落点
+
+- **先有症状再调参**：一次改一处、改完看计数器，别照抄优化脚本
+- 收包分发三层：**RSS（网卡，最优）→ 中断亲和（NUMA）→ RPS/RFS（补救）**
+- `Combined: 1` 是"单核 %soft 打满"的头号原因；队列数与参与收包的 CPU 数匹配即可
+- **有 RSS 就别开 RPS**，它要多做一次跨 CPU 投递
+- ring 加深吸收突发、中断合并降 CPU，两者都以延迟为代价
+- **GRO 安全、LRO 危险**：转发机器必须关 LRO；抓包看到巨型包是 GRO 合并的结果
+- 默认 `fq_codel` 够用，动 qdisc 只为限速、优先级或极低延迟
+- socket 缓冲**只在 BDP 超限时才调**，也就是跨地域长肥管道

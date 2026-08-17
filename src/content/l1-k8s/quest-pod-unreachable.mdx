@@ -1,0 +1,296 @@
+## 接手
+
+业务群里在吵：
+
+> 前端调后端 `api` **三次里有两次超时**，重试能成功。今天上午还是好的，我们没发版。
+
+已知信息：
+
+- `frontend` 有 1 个副本，跑在 `k8s-work-101`
+- `api` 有 3 个副本，分别在 `k8s-work-101`、`102`、`103`
+- 集群用 Cilium，**VXLAN overlay** 模式
+- 运维说今天上午安全团队批量下发过一批主机加固规则
+
+<Callout type="tip" title="怎么玩">
+按 L1 的排障顺序来：**DNS → Endpoint → 连通性 → 隧道 → 策略**。
+输入 <code>goals</code> 看目标，<code>hint</code> 要提示。四个目标全达成即过关。
+
+"三次里两次失败"这个比例本身就是线索 —— 先想想它意味着什么。
+</Callout>
+
+<Terminal
+  id="pod-unreachable-quest"
+  host="root@k8s-work-101"
+  intro={`frontend 调 api 三次里有两次超时，未发版。
+api 有 3 个副本分布在 101 / 102 / 103 三台节点上。`}
+  commands={[
+    {
+      cmd: 'kubectl get pods -o wide',
+      output: `NAME                        READY   STATUS    IP            NODE
+frontend-7d9c4b8f6-x2klm    1/1     Running   10.244.1.5    k8s-work-101
+api-5f8d7c9b4-aa111         1/1     Running   10.244.1.7    k8s-work-101
+api-5f8d7c9b4-bb222         1/1     Running   10.244.2.9    k8s-work-102
+api-5f8d7c9b4-cc333         1/1     Running   10.244.3.4    k8s-work-103
+
+# 三个副本都 Running，分布在三台节点上。`,
+    },
+    {
+      cmd: 'kubectl exec frontend-7d9c4b8f6-x2klm -- nslookup api',
+      aliases: ['kubectl exec -it frontend-7d9c4b8f6-x2klm -- nslookup api'],
+      output: `Server:    10.96.0.10
+Address 1: 10.96.0.10 kube-dns.kube-system.svc.cluster.local
+
+Name:      api
+Address 1: 10.96.132.41 api.default.svc.cluster.local
+
+# DNS 正常，解析到 ClusterIP。排除第一嫌疑。`,
+    },
+    {
+      cmd: 'kubectl get endpointslices',
+      goal: '确认 Endpoint 里有几个就绪的后端',
+      hint: 'Endpoint 为空或部分缺失会直接决定后面往哪查',
+      aliases: ['kubectl get endpointslices -l kubernetes.io/service-name=api'],
+      output: `NAME        ADDRESSTYPE   PORTS   ENDPOINTS                            AGE
+api-x7k2p   IPv4          8080    10.244.1.7,10.244.2.9,10.244.3.4     42d
+
+# 三个后端全部在 Endpoint 里 —— 说明就绪探针都通过了。
+# 排除「Pod 没就绪」这类应用侧原因。`,
+    },
+    {
+      cmd: 'kubectl exec frontend-7d9c4b8f6-x2klm -- curl -m 3 -sS api:8080/health',
+      aliases: ['kubectl exec -it frontend-7d9c4b8f6-x2klm -- curl -m 3 -sS api:8080/health'],
+      output: `ok
+
+# 再跑几次：
+# ok
+# curl: (28) Connection timed out after 3001 milliseconds
+# curl: (28) Connection timed out after 3001 milliseconds
+# ok
+#
+# 三分之一成功 —— 正好等于「3 个后端里有 1 个能用」。
+# Service 轮询打到哪个后端，成败就跟着变。`,
+    },
+    {
+      cmd: 'kubectl exec frontend-7d9c4b8f6-x2klm -- curl -m 3 -sS 10.244.1.7:8080/health',
+      goal: '分别直连三个 Pod IP，确认失败是否与节点相关',
+      hint: '绕开 Service 的轮询，直接按 Pod IP 逐个试，把「间歇」变成「确定」',
+      aliases: [
+        'kubectl exec -it frontend-7d9c4b8f6-x2klm -- curl -m 3 -sS 10.244.1.7:8080/health',
+        'kubectl exec frontend-7d9c4b8f6-x2klm -- curl -m 3 -sS 10.244.2.9:8080/health',
+      ],
+      output: `ok
+
+# 换成另外两个 Pod IP：
+# $ curl -m 3 -sS 10.244.2.9:8080/health   → curl: (28) Connection timed out
+# $ curl -m 3 -sS 10.244.3.4:8080/health   → curl: (28) Connection timed out
+#
+# 规律很清楚：
+#   10.244.1.7 （同节点 101）        → 通
+#   10.244.2.9 （跨节点 102）        → 超时
+#   10.244.3.4 （跨节点 103）        → 超时
+#
+# 「间歇性」是假象，真相是：同节点通、跨节点全不通。`,
+    },
+    {
+      cmd: 'cilium-dbg monitor --type drop',
+      goal: '排除 NetworkPolicy：看数据平面有没有策略拒绝事件',
+      hint: '被策略拦掉的表现是超时，而且只能在宿主机侧看到 drop 事件',
+      aliases: ['cilium-dbg monitor --type drop -n 20'],
+      output: `Listening for events on 64 CPUs with 64x4096 of shared memory
+Press Ctrl-C to quit
+^C
+Received an interrupt, disabling monitor...
+
+# 一条 drop 事件都没有。
+# 如果是 NetworkPolicy 拦的，这里会明确打印 "Policy denied"。
+# 排除策略问题 —— 包压根没走到策略判定那一步。`,
+    },
+    {
+      cmd: 'kubectl get pods -n kube-system -l k8s-app=cilium -o wide',
+      output: `NAME           READY   STATUS    RESTARTS   AGE   NODE
+cilium-4x8kq   1/1     Running   0          42d   k8s-work-101
+cilium-9m2pl   1/1     Running   0          42d   k8s-work-102
+cilium-lz7vn   1/1     Running   0          42d   k8s-work-103
+
+# CNI 自己是健康的，没有重启。`,
+    },
+    {
+      cmd: 'ip route show table all | grep 10.244',
+      output: `10.244.0.0/16 via 10.244.1.1 dev cilium_host src 10.244.1.1 mtu 1450
+10.244.1.0/24 via 10.244.1.1 dev cilium_host src 10.244.1.1
+local 10.244.1.1 dev cilium_host table local
+
+# 路由存在，MTU 1450（1500 − 50 字节 VXLAN 封装），配置是对的。`,
+    },
+    {
+      cmd: 'tcpdump -i bond0 -nn udp port 8472 -c 5',
+      goal: '确认封装后的隧道流量到底走到哪一步',
+      hint: 'overlay 的包在物理网卡上是 UDP 8472，看它发出去了没有、对端收到了没有',
+      aliases: ['tcpdump -i bond0 -nn udp port 8472'],
+      output: `listening on bond0, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+09:41:12.118234 IP 10.0.12.101.51234 > 10.0.12.102.8472: UDP, length 118
+09:41:13.119887 IP 10.0.12.101.51234 > 10.0.12.102.8472: UDP, length 118
+09:41:15.123441 IP 10.0.12.101.51234 > 10.0.12.102.8472: UDP, length 118
+09:41:19.131002 IP 10.0.12.101.51234 > 10.0.12.102.8472: UDP, length 118
+^C
+4 packets captured
+
+# 本机在不停往 102 发（这是 TCP SYN 在重试），但一个回包都没有。
+# 同时在 102 上抓：一个包都收不到 —— 说明包在中间就没了。`,
+    },
+    {
+      cmd: 'iptables -nvL INPUT',
+      goal: '找出根因：谁把隧道流量丢了',
+      hint: '安全团队今天上午下发过主机加固规则，看看 INPUT 链上多了什么',
+      aliases: ['iptables -nvL INPUT --line-numbers', 'iptables -L INPUT -n -v'],
+      output: `Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination
+ 892K   67M ACCEPT     all  --  lo     *       0.0.0.0/0            0.0.0.0/0
+ 4.2M  918M ACCEPT     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0   tcp dpt:22
+ 1.1M  142M ACCEPT     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0   tcp dpt:6443
+ 2.8M  331M ACCEPT     all  --  *      *       10.0.12.0/24         0.0.0.0/0   /* HARDENING-2026-08 */
+18411  2.2M DROP       udp  --  *      *       0.0.0.0/0            0.0.0.0/0   /* HARDENING-2026-08 */
+  733 88.0K DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0   /* HARDENING-2026-08 */
+
+# 找到了：加固规则里有一条「丢弃所有 UDP」，而且计数 18411 还在涨。
+# 它排在 ACCEPT 10.0.12.0/24 之后 —— 但注意上面那条 ACCEPT 只放通了源地址
+# 在 10.0.12.0/24 的流量……而抓包显示对端确实是 10.0.12.102。
+#
+# 关键在于：本机的 INPUT 放通了，但对端 102 上同样有这条 DROP UDP 规则，
+# 所以是「我发出去了、对端 INPUT 把它丢了」。
+# VXLAN 走 UDP 8472，正好被这条规则命中。`,
+    },
+    {
+      cmd: 'iptables -nvL INPUT | grep -c HARDENING',
+      output: `3
+
+# 三条加固规则。在三台节点上都存在（运维批量下发）。`,
+    },
+    {
+      cmd: 'nstat -az | grep -i drop',
+      output: `TcpExtListenDrops               0    0.0
+TcpExtTCPBacklogDrop            0    0.0
+
+# 协议栈侧没有丢包 —— 再次印证问题不在本机协议栈，在中间的防火墙。`,
+    },
+    {
+      cmd: 'kubectl exec frontend-7d9c4b8f6-x2klm -- ping -c 2 10.244.2.9',
+      aliases: ['kubectl exec -it frontend-7d9c4b8f6-x2klm -- ping -c 2 10.244.2.9'],
+      output: `PING 10.244.2.9 (10.244.2.9): 56 data bytes
+
+--- 10.244.2.9 ping statistics ---
+2 packets transmitted, 0 packets received, 100% packet loss
+
+# 连 ICMP 都不通 —— 不是端口或应用问题，是整条跨节点路径不通。`,
+    },
+  ]}
+/>
+
+## 结论应该长什么样
+
+| 证据 | 排除 / 确认了什么 |
+| --- | --- |
+| `nslookup api` 正常 | 排除 DNS |
+| Endpoint 里有 3 个后端 | 排除就绪探针与应用侧 |
+| 直连三个 Pod IP：同节点通、跨节点全超时 | **"间歇性"是假象**，真相是跨节点不通 |
+| `cilium-dbg monitor --type drop` 无事件 | 排除 NetworkPolicy（包没走到策略判定） |
+| Cilium Pod 健康、路由存在、MTU 1450 正确 | 排除 CNI 自身与 MTU 配置 |
+| 抓包：本机在发 UDP 8472，无任何回包 | 确认**封装流量出得去、回不来** |
+| `iptables -nvL INPUT` 有 `DROP udp`，计数在涨 | **根因**：主机加固规则丢弃了 VXLAN 隧道流量 |
+
+**根因**：安全团队批量下发的加固规则里有一条"丢弃所有 UDP"，
+而 Cilium 的 VXLAN overlay 走 **UDP 8472**。三台节点都被下发了这条规则，
+于是所有跨节点的 Pod 流量在对端 `INPUT` 链上被丢弃。同节点通信不出物理网卡，所以不受影响。
+
+**修法**：在 DROP 之前放通隧道端口。
+
+```bash
+# 立刻恢复（临时）
+iptables -I INPUT 1 -p udp --dport 8472 -s 10.0.12.0/24 -j ACCEPT \
+  -m comment --comment "cilium vxlan"
+
+# 验证：跨节点应该立刻通
+kubectl exec frontend-7d9c4b8f6-x2klm -- curl -m 3 -sS 10.244.2.9:8080/health
+
+# 持久化交给加固规则的下发渠道，别只改运行时
+```
+
+<Callout type="warn" title="主机加固与 CNI 的端口清单">
+这类事故的根本预防是**把 CNI 需要的端口写进加固规则的白名单**。常见的几个：
+
+| 端口 | 用途 |
+| --- | --- |
+| UDP **8472** | VXLAN（Cilium / Flannel 默认） |
+| UDP **6081** | Geneve |
+| UDP **4789** | VXLAN（部分实现用标准端口） |
+| TCP **4240** | Cilium 健康检查 |
+| UDP **51871** | Cilium WireGuard 加密 |
+| IP 协议 **4** | IP-in-IP（Calico 的一种模式） |
+
+改主机防火墙前先问一句"CNI 用什么封装"。原生路由模式没有隧道端口，
+但需要放通 Pod CIDR 的转发——同样不能一刀切。
+</Callout>
+
+<Callout type="trap" title="「间歇性」几乎总是「某个维度上的确定性」">
+这一关最重要的方法论：**遇到"三次里两次失败"，先把它变成确定性问题。**
+
+做法是绕开负载均衡、逐个直连后端。这次的比例是 1/3 成功、3 个后端 1 个同节点——
+一算就对上了。同类比例的含义：
+
+| 成功比例 | 通常意味着 |
+| --- | --- |
+| 1/N（N = 后端数） | 只有一个后端可用，且往往与节点相关 |
+| 约一半 | 双活的一侧有问题（两台 LB、两个可用区、双上行链路） |
+| 完全随机、比例不固定 | conntrack 表满、连接数上限这类资源型问题 |
+
+**先看比例、再算它等于什么**，比反复重试快得多。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="qpu-1"
+  question="Service 有 3 个后端，访问成功率稳定在三分之一。第一步该做什么？"
+  options={[
+    { text: '绕开 Service，直接按 Pod IP 逐个访问，把间歇性变成确定性', correct: true },
+    { text: '增加副本数', feedback: '成功比例不会变，只是把问题摊薄。' },
+    { text: '重启 Service', feedback: 'Service 只是规则，重启不解决底层连通性问题。' },
+    { text: '抓包分析所有流量', feedback: '范围太大。先定位到「哪个后端不通」再抓包效率高得多。' },
+  ]}
+  explain={<>1/N 的成功率强烈暗示「只有一个后端可用」。逐个直连能立刻把它变成确定性结论 —— 本例中通的正好是同节点那个，于是问题收敛到「跨节点路径」。</>}
+/>
+
+<Quiz
+  id="qpu-2"
+  question="cilium-dbg monitor --type drop 一条事件都没有，但跨节点确实不通。说明什么？"
+  options={[
+    { text: '包在到达 CNI 数据平面的策略判定之前就被丢了，比如被主机防火墙拦在 INPUT 链', correct: true },
+    { text: 'NetworkPolicy 配置正确所以没问题', feedback: '没有 drop 事件只能排除策略，不代表整条路径没问题。' },
+    { text: '监控命令用法不对', feedback: '命令正常工作，输出为空本身就是有效信息。' },
+    { text: '一定是 MTU 问题', feedback: 'MTU 问题的特征是小包通大包卡，而这里连 ICMP 都不通。' },
+  ]}
+  explain={<>drop 事件为空是一条重要的排除性证据：策略判定发生在 CNI 数据平面，包连那里都没到，说明更早的位置（主机防火墙、物理网络）就丢了。下一步就该去抓封装后的隧道流量。</>}
+/>
+
+<Quiz
+  id="qpu-3"
+  question="改主机防火墙规则前，为什么必须先确认 CNI 的封装方式？"
+  options={[
+    { text: 'overlay 模式依赖特定 UDP 端口（VXLAN 8472 / Geneve 6081），被拦就全部跨节点不通', correct: true },
+    { text: '因为 CNI 会自动改防火墙规则', feedback: 'CNI 不会去覆盖主机加固规则，冲突就是冲突。' },
+    { text: '因为封装方式决定 Pod CIDR 大小', feedback: '两者无关，CIDR 由 IPAM 配置决定。' },
+    { text: '因为原生路由模式不需要任何放通', feedback: '原生路由虽然没有隧道端口，但需要放通 Pod CIDR 的转发，同样不能一刀切。' },
+  ]}
+  explain={<>把 CNI 端口写进加固白名单是这类事故的根本预防：UDP 8472（VXLAN）、6081（Geneve）、4789、TCP 4240（健康检查）、UDP 51871（WireGuard 加密）、IP 协议 4（IP-in-IP）。</>}
+/>
+
+## 这一关的落点
+
+- 排障顺序：**DNS → Endpoint → 逐个直连 → 数据平面 drop → 隧道抓包 → 主机防火墙**
+- **"间歇性"几乎总是某个维度上的确定性**：先看成功比例，再算它等于什么
+- 1/N 成功率 = 只有一个后端可用；约一半 = 双活的一侧坏了；完全随机 = 资源型问题
+- 绕开 Service 直连 Pod IP，是把间歇性变确定性最快的一招
+- `drop` 事件为空是**排除性证据**：包没走到策略判定，要往更早的位置查
+- overlay 的跨节点流量在物理网卡上是 **UDP 8472**（Geneve 是 6081），抓它能定位到"发出去了但没回来"
+- **主机加固规则必须给 CNI 端口留白名单**，改防火墙前先问清封装方式
+- 同节点通、跨节点不通 = 问题一定在物理网络这一段（隧道、防火墙、路由），不在 Pod 里

@@ -1,0 +1,272 @@
+## 目标：不用容器，手搓一个容器网络
+
+容器网络之所以让人觉得像魔法，是因为平时看到的都是成品。这一节把它拆开——
+**只用 `ip` 命令**，让两个"容器"互通、并且能出网。做完这个实验，L1 后面几节就没有秘密了。
+
+需要的环境：一台能 root 的 Linux（虚拟机也行），不需要装任何东西。
+
+<Callout type="note" title="这些命令会改动网络配置">
+实验会创建命名空间、虚拟网卡和 NAT 规则。**建议在虚拟机或测试机上做**，别在生产机上练。
+最后有完整的清理命令，全部对象都是临时的，重启后自动消失。
+</Callout>
+
+## 第一步：网络命名空间隔离了什么
+
+```bash
+# 创建两个命名空间，当作两个"容器"
+ip netns add ns1
+ip netns add ns2
+ip netns list
+```
+
+进去看看里面有什么：
+
+```bash
+ip netns exec ns1 ip addr
+```
+
+```
+1: lo: <LOOPBACK> mtu 65536 qdisc noop state DOWN
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+```
+
+**只有一个没启动的 `lo`。** 命名空间隔离的是整套网络栈：
+
+| 隔离的东西 | 含义 |
+| --- | --- |
+| 网卡列表 | 看不到宿主机的任何网卡 |
+| 路由表 | 空的，连默认路由都没有 |
+| ARP / 邻居表 | 独立 |
+| iptables / nftables 规则 | 独立 |
+| socket 与端口空间 | **两个 ns 里可以各自监听 80，不冲突** |
+| `/proc/sys/net` 参数 | 部分独立 |
+
+最后两条是关键：**端口不冲突**正是 K8s 网络模型第一条铁律（每个 Pod 独立 IP、
+不共享宿主机端口空间）的实现基础。
+
+## 第二步：veth pair —— 一根虚拟网线
+
+veth 总是成对出现，**一端进、另一端立刻出**，像一根两头都是网卡的网线：
+
+```bash
+# 建一对，然后把两头分别塞进两个命名空间
+ip link add veth1 type veth peer name veth2
+ip link set veth1 netns ns1
+ip link set veth2 netns ns2
+```
+
+配地址、启动：
+
+```bash
+ip netns exec ns1 ip addr add 10.99.0.1/24 dev veth1
+ip netns exec ns1 ip link set veth1 up
+ip netns exec ns1 ip link set lo up
+
+ip netns exec ns2 ip addr add 10.99.0.2/24 dev veth2
+ip netns exec ns2 ip link set veth2 up
+ip netns exec ns2 ip link set lo up
+```
+
+验证：
+
+```bash
+ip netns exec ns1 ping -c 3 10.99.0.2
+```
+
+通了。**这就是"同节点 Pod 到 Pod"的最小实现**——包全程在内存里，没经过任何物理网卡。
+
+<Callout type="tip" title="回头看那张路径图">
+[一个包的旅程](/learn/l0-basics/packet-journey) 里的「同节点 Pod → Pod」场景，
+现在你手上就有一个真实的了。用 `ip netns exec ns1 tcpdump -i veth1` 抓一下，
+能看到 ICMP 请求和响应，源目地址就是这两个 IP。
+</Callout>
+
+## 第三步：加网桥，接入更多"容器"
+
+两两拉线不可扩展：3 个容器要 3 根，10 个要 45 根。真实方案是**每个容器一根 veth 接到网桥上**——
+网桥就是宿主机里的一台虚拟交换机。
+
+先清掉上一步：
+
+```bash
+ip netns del ns1
+ip netns del ns2
+```
+
+建网桥和两个命名空间：
+
+```bash
+# 网桥
+ip link add br0 type bridge
+ip addr add 10.99.0.254/24 dev br0     # 网桥自己也有地址，充当网关
+ip link set br0 up
+
+# 两个命名空间
+for i in 1 2; do
+  ip netns add ns$i
+  ip link add veth$i type veth peer name br-veth$i
+  ip link set veth$i netns ns$i
+  ip link set br-veth$i master br0          # 宿主机侧那头插进网桥
+  ip link set br-veth$i up
+  ip netns exec ns$i ip link set lo up
+  ip netns exec ns$i ip addr add 10.99.0.$i/24 dev veth$i
+  ip netns exec ns$i ip link set veth$i up
+  ip netns exec ns$i ip route add default via 10.99.0.254    # 默认路由指向网桥
+done
+```
+
+看一眼拓扑：
+
+```bash
+bridge link show                # 网桥上挂了哪些口
+ip netns exec ns1 ping -c 2 10.99.0.2       # 容器互通
+ip netns exec ns1 ping -c 2 10.99.0.254     # 能到网关（宿主机）
+```
+
+```
+br-veth1 ... master br0 state forwarding
+br-veth2 ... master br0 state forwarding
+```
+
+`forwarding` 说明网桥在正常转发。这就是**传统 CNI（bridge 模式）的数据平面原型**。
+
+## 第四步：让容器能出网
+
+现在 ping 外网还不通：
+
+```bash
+ip netns exec ns1 ping -c 2 223.5.5.5     # 不通
+```
+
+两个原因，缺两样东西：
+
+```bash
+# 1. 宿主机要愿意转发别人的包
+sysctl -w net.ipv4.ip_forward=1
+
+# 2. 源地址 10.99.0.1 是私有地址，外网回不来 → 需要 SNAT
+#    出宿主机时把源地址改写成宿主机的地址
+ip -o -4 route show default | awk '{print $5}'      # 找到出口网卡，假设是 eth0
+iptables -t nat -A POSTROUTING -s 10.99.0.0/24 ! -o br0 -j MASQUERADE
+```
+
+再试：
+
+```bash
+ip netns exec ns1 ping -c 2 223.5.5.5     # 通了
+```
+
+<Callout type="warn" title="这里的 SNAT 正是 K8s 要消灭的东西">
+容器出**集群外**做 SNAT 是合理的（私有地址出不去）。但如果**容器到容器**也做 SNAT，
+就违反了 K8s 网络模型的第二、第四条铁律：对端看到的源地址会变成节点 IP，
+[K8s 网络模型](/learn/l1-k8s/k8s-model) 那节讲过为什么这不能接受。
+
+注意上面规则里的 `! -o br0`：**从网桥出去的（容器之间）不做 SNAT**，
+只有真正离开宿主机的才做。这一个条件就是"东西向免 NAT、南北向 NAT"的分界，
+真实 CNI 也是这么处理的。
+</Callout>
+
+## 第五步：回到 K8s —— 找到某个 Pod 的 netns
+
+真实集群里，Pod 的网络命名空间不是用 `ip netns add` 建的，所以 `ip netns list` 看不到它。
+找它的标准套路：
+
+```bash
+# 1. 拿到 Pod 所在节点与容器 ID
+kubectl get pod mypod -o wide
+kubectl get pod mypod -o jsonpath='{.status.containerStatuses[0].containerID}'
+
+# 2. 在那个节点上拿到容器主进程 PID（containerd）
+crictl inspect <container-id> | grep -m1 '"pid"'
+
+# 3. 用 nsenter 进它的网络命名空间
+nsenter -t <pid> -n ip addr
+nsenter -t <pid> -n ip route
+nsenter -t <pid> -n ss -lntp
+```
+
+这套动作在排障时极其有用：**容器镜像里往往没有 `ip`、`ss`、`tcpdump`，
+但宿主机上有。** `nsenter -n` 让你用宿主机的工具去看容器的网络。
+
+```bash
+# 甚至可以在宿主机上抓 Pod 内部的包
+nsenter -t <pid> -n tcpdump -i eth0 -nn -c 20
+```
+
+反过来，从宿主机找 Pod 对应的那根 veth：
+
+```bash
+# Pod 内看 eth0 的 peer 索引
+nsenter -t <pid> -n ip -d link show eth0 | grep -o 'peer_ifindex.*'
+# 宿主机上按索引找网卡
+ip link | grep '^<索引>:'
+```
+
+<Callout type="tip" title="记住这三条就够用">
+```bash
+nsenter -t <pid> -n ip addr        # Pod 的地址与网卡
+nsenter -t <pid> -n ip route       # Pod 的路由表
+nsenter -t <pid> -n ss -lntp       # Pod 里谁在监听
+```
+「Pod 里没装工具」这个借口从此不成立。后面《Pod 之间不通》那一关会反复用到。
+</Callout>
+
+## 清理
+
+```bash
+ip netns del ns1
+ip netns del ns2
+ip link del br0
+iptables -t nat -D POSTROUTING -s 10.99.0.0/24 ! -o br0 -j MASQUERADE
+sysctl -w net.ipv4.ip_forward=0     # 如果原本是 0
+```
+
+删命名空间会自动带走里面的 veth（veth 的另一头也会消失）。
+
+## 检查点
+
+<Quiz
+  id="nv-1"
+  question="两个网络命名空间里可以各自监听 80 端口而不冲突。这对应 K8s 网络模型的哪一条？"
+  options={[
+    { text: '每个 Pod 有独立 IP，不与宿主机共享端口空间', correct: true },
+    { text: 'Pod 之间通信不做 NAT', feedback: '那是第二条，与端口空间隔离是不同的约束。' },
+    { text: '节点上的进程能访问本节点的 Pod', feedback: '那是第三条，讲的是可达性。' },
+    { text: 'Pod 看到的自己和别人看到的一致', feedback: '那是第四条，讲的是地址视角一致性。' },
+  ]}
+  explain={<>端口空间隔离正是「独立 IP」的实现基础 —— 这也是 K8s 能摆脱 Docker 时代端口映射的原因。命名空间隔离的是整套网络栈：网卡、路由、ARP、iptables、socket 与端口。</>}
+/>
+
+<Quiz
+  id="nv-2"
+  question="实验里的 SNAT 规则写了 ! -o br0。去掉这个条件会怎样？"
+  options={[
+    { text: '容器之间通信也会被 SNAT，对端看到的源地址变成网桥地址，违反免 NAT 约束', correct: true },
+    { text: '容器无法出网', feedback: '出网仍然能做 SNAT，只是范围变大了。' },
+    { text: '没有区别', feedback: '有区别：它决定了东西向流量是否被改写源地址。' },
+    { text: '网桥会停止转发', feedback: 'iptables NAT 规则不影响网桥的二层转发。' },
+  ]}
+  explain={<>这一个条件就是「东西向免 NAT、南北向 NAT」的分界。真实 CNI 也是同样处理：Pod 到 Pod 保持原始地址，只有真正离开集群时才做 SNAT。</>}
+/>
+
+<Quiz
+  id="nv-3"
+  question="Pod 镜像里没有 ip 和 tcpdump，要看它的路由表和抓它的包，怎么做？"
+  options={[
+    { text: '在宿主机上用 nsenter -t <pid> -n 进它的网络命名空间，用宿主机的工具', correct: true },
+    { text: 'kubectl exec 进去装工具', feedback: '很多生产镜像是只读或无包管理器的，而且改动了容器现场。' },
+    { text: '重建一个带工具的 Pod', feedback: '现场就没了，间歇性问题更难复现。' },
+    { text: 'ip netns exec 直接进', feedback: 'Pod 的 netns 不是 ip netns 创建的，ip netns list 看不到它。' },
+  ]}
+  explain={<>三条命令：<code>nsenter -t pid -n ip addr</code>、<code>ip route</code>、<code>ss -lntp</code>。拿 PID 的路径是 kubectl 拿 containerID → crictl inspect 拿 pid。这是容器网络排障最基本的手法。</>}
+/>
+
+## 这节课的落点
+
+- 网络命名空间隔离整套网络栈，其中**端口空间独立**是 K8s「独立 IP」的实现基础
+- **veth pair** 是一根虚拟网线，一端进另一端立刻出，纯内存操作
+- 两两拉线不可扩展，真实方案是**每容器一根 veth 接到网桥**（宿主机里的虚拟交换机）
+- 出网要两样：`ip_forward=1` 与 SNAT（`MASQUERADE`）
+- `! -o br0` 这个条件就是**东西向免 NAT、南北向 NAT** 的分界
+- Pod 的 netns 用 `ip netns list` 看不到，要走 `crictl inspect` 拿 PID + `nsenter -n`
+- **`nsenter -t <pid> -n` 让你用宿主机的工具看容器的网络**——"容器里没装工具"不再是借口

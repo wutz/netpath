@@ -256,7 +256,7 @@ export const tracks: Track[] = [
         title: '内核网络栈调优：中断、队列与 offload',
         summary: '同一张网卡，配置对不对能差出几倍性能。这节讲能动的旋钮和动的理由。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '解释 RSS / RPS / RFS 各自解决什么问题',
@@ -689,7 +689,7 @@ export const tracks: Track[] = [
         title: '动手：用 netns 和 veth 手搓一个容器网络',
         summary: '不用 K8s、不用 Docker，纯 ip 命令把两个"容器"连通，容器网络就没有秘密了。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '手工创建 netns、veth pair 和网桥，让两个命名空间互通',
@@ -776,7 +776,7 @@ export const tracks: Track[] = [
         title: 'MetalLB：裸金属集群的 LoadBalancer',
         summary: '云上一行 type: LoadBalancer 就有 VIP，裸金属得自己实现。两种宣告方式，选错了要么不通、要么只有高可用没有负载均衡。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '解释 L2 模式下 VIP 是怎么被宣告与抢占的，以及为什么它只是高可用',
@@ -807,7 +807,7 @@ export const tracks: Track[] = [
         title: 'kube-proxy 的三代实现与 eBPF 替换',
         summary: 'iptables 模式在几千个 Service 时会退化。这节讲退化的原因和替代方案。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '解释 iptables 模式的规则数量与匹配开销为何随 Service 数增长',
@@ -829,7 +829,7 @@ export const tracks: Track[] = [
         title: '南北流量：Ingress、Gateway API 与出口治理',
         summary: '流量从集群外进来的几种正规入口，以及出方向该不该管、怎么管。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '说出 Ingress 与 Gateway API 的能力差异和迁移路径',
@@ -856,7 +856,7 @@ export const tracks: Track[] = [
         title: 'CoreDNS 与 NetworkPolicy',
         summary: '集群里一半的"网络故障"其实是 DNS；另一半是策略拦了没人知道。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 25,
         objectives: [
           '解释 Pod 内 DNS 查询的完整过程与 ndots 带来的额外查询',
@@ -878,7 +878,7 @@ export const tracks: Track[] = [
         title: '动手：给 Pod 插第二张网卡',
         summary: 'AI 训练和虚拟机场景都需要 Pod 直连物理网。Multus、Spiderpool、MacVLAN 的实际配法。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '用注解给 Pod 申请次级网卡与固定 IP 段',
@@ -903,7 +903,7 @@ export const tracks: Track[] = [
         title: '闯关：Pod 之间不通',
         summary: '同一个 Service 有些副本能访问、有些不行。在模拟终端里一层层剥开。',
         kind: 'quest',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '按 Pod → 节点 → CNI → Service → 策略的顺序收敛问题',

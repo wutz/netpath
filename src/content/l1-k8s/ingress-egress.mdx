@@ -1,0 +1,261 @@
+## 入口的三层结构
+
+集群外的一个 HTTPS 请求要走到 Pod，中间是三层，各管一件事：
+
+```
+客户端
+  ↓  DNS 解析到 VIP
+LoadBalancer（MetalLB / 云 LB）    ← 四层：把 VIP 引到某台节点
+  ↓
+Ingress 控制器 / Gateway           ← 七层：按域名和路径挑后端，终止 TLS
+  ↓
+Pod                                ← 直接用 Pod IP，通常跳过 Service 的 DNAT
+```
+
+排障时**先分清是哪一层**：VIP 不通是上一节的事；能连上但 404/证书错是这一层。
+
+<Callout type="note" title="Ingress 控制器自己也需要一个 VIP">
+新人常绕不过来的一环：Ingress 控制器本身是跑在集群里的 Pod，
+它也要被集群外访问，所以它自己就是一个 `type: LoadBalancer` 的 Service。
+
+```bash
+kubectl get svc -n ingress-nginx
+# NAME                       TYPE           EXTERNAL-IP      PORT(S)
+# ingress-nginx-controller   LoadBalancer   172.18.15.200    80:31234/TCP,443:31235/TCP
+```
+
+**整个集群通常只需要一到两个这样的 VIP**，之后所有 HTTP 服务共享它，靠域名区分。
+这就是 Ingress 相对"每个服务一个 LoadBalancer"的最大价值——省地址、省成本。
+</Callout>
+
+## Ingress API：够用但表达力有限
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"     # 能力靠注解扩展
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [web.example.com]
+      secretName: web-tls
+  rules:
+    - host: web.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port: { number: 8080 }
+```
+
+Ingress 的核心表达能力只有三样：**Host、Path、TLS**。超出这三样的需求
+（改写、超时、限流、灰度、gRPC、mTLS）全靠**控制器自定义注解**——
+于是配置就绑死在某个控制器上，换实现要重写。
+
+```bash
+kubectl get ingress -A
+kubectl describe ingress web        # Events 里能看到证书与后端解析结果
+kubectl logs -n ingress-nginx <pod> | tail -50
+```
+
+## Gateway API：把角色拆开
+
+Gateway API 是 Ingress 的接班人。它最重要的改变不是功能更多，而是**把一份配置拆成三种资源，
+对应三种人**：
+
+| 资源 | 谁维护 | 管什么 |
+| --- | --- | --- |
+| `GatewayClass` | 平台/基础设施团队 | 用哪个实现（Istio、kgateway、nginx…） |
+| `Gateway` | 平台团队 | 监听哪些端口、绑哪些证书、哪些命名空间可以接入 |
+| `HTTPRoute` | **业务团队** | 我的域名、路径、后端与权重 |
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shared
+  namespace: infra
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        certificateRefs: [{ name: wildcard-tls }]
+      allowedRoutes:
+        namespaces: { from: Selector, selector: { matchLabels: { gateway-access: "true" } } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: web
+  namespace: team-a
+spec:
+  parentRefs: [{ name: shared, namespace: infra }]
+  hostnames: [web.example.com]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: /api } }]
+      backendRefs:
+        - { name: api-v1, port: 8080, weight: 90 }
+        - { name: api-v2, port: 8080, weight: 10 }      # 灰度是原生能力
+```
+
+比 Ingress 强的地方：**权重灰度、按 Header 匹配、跨命名空间引用、
+超时与重试都是标准字段**，不再依赖注解。
+
+<Callout type="tip" title="迁移建议：不用二选一">
+Gateway API 和 Ingress 可以并存，控制器大多同时支持两者。实际路径：
+
+1. **新服务用 HTTPRoute**，老的 Ingress 先不动
+2. 平台团队先把 `Gateway` 建好（证书、端口、准入范围）
+3. 遇到需要灰度或按 Header 路由的服务，顺手迁过来
+4. 依赖大量 nginx 注解的服务放到最后——它们迁移成本最高
+
+不要为了"用新 API"做一次性大迁移，收益不匹配风险。
+</Callout>
+
+## 证书：交给 cert-manager
+
+TLS 在这一层终止，所以证书管理是入口层的固定组成部分。手工签发和续期是不可持续的——
+证书过期是最常见的"网络故障"之一，而它跟网络毫无关系。
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@example.com
+    privateKeySecretRef: { name: letsencrypt-account }
+    solvers:
+      - dns01:                       # 泛域名证书必须用 DNS-01
+          cloudflare:
+            apiTokenSecretRef: { name: cf-token, key: token }
+```
+
+之后 Ingress 上加一个注解就自动签发续期：
+
+```yaml
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+```
+
+```bash
+# 签发状态：READY=True 才算好
+kubectl get certificate -A
+kubectl describe certificate web-tls | tail -20      # 卡住时看 Events
+kubectl get certificaterequest,order,challenge -A    # 逐层往下查
+```
+
+<Callout type="trap" title="证书签发卡住的两个典型原因">
+`kubectl get certificate` 显示 `READY: False` 时，按 Certificate → CertificateRequest →
+Order → Challenge 一层层 describe 下去，失败原因写在最里面那层的 Events 里。
+
+- **HTTP-01 校验失败**：Let's Encrypt 要从公网访问 `/.well-known/acme-challenge/...`，
+  这要求域名已经解析到你的 VIP 且 80 端口可达。内网服务用 HTTP-01 永远签不下来。
+- **泛域名用了 HTTP-01**：`*.example.com` **只能用 DNS-01**，这是 ACME 协议的规定。
+
+内网场景的正解是 DNS-01（只需要 DNS API 权限，不需要公网可达），
+或者干脆自建 CA 签发内部证书。
+</Callout>
+
+## Egress：出方向该不该管
+
+默认情况下 **Pod 可以访问任何外部地址**。这在很多环境里是不可接受的：
+被入侵的容器可以往外传数据、可以当跳板扫内网。
+
+三种做法，代价递增：
+
+| 做法 | 怎么实现 | 代价 |
+| --- | --- | --- |
+| **NetworkPolicy 限制出方向** | 白名单允许的目标 | 只能按 IP/端口，域名支持有限 |
+| **强制走出口代理** | 只放通代理地址，其它 deny | 要维护代理与白名单 |
+| **Egress Gateway** | 指定几台节点作为统一出口 | 依赖 CNI 支持，多一跳 |
+
+Egress Gateway 还有一个非安全的用途，而且经常是引入它的真实原因：
+**固定出口 IP**。对方要求"把你的 IP 加白名单"时，你不能给出全部节点 IP
+（节点会扩缩容），需要一个稳定的出口。
+
+```yaml
+# 大意如此：让匹配的 Pod 统一从某个节点、以某个源 IP 出网
+apiVersion: cilium.io/v2
+kind: CiliumEgressGatewayPolicy
+metadata:
+  name: to-partner
+spec:
+  selectors:
+    - podSelector: { matchLabels: { app: payment } }
+  destinationCIDRs: ["203.0.113.0/24"]
+  egressGateway:
+    nodeSelector: { matchLabels: { egress-node: "true" } }
+    egressIP: 10.0.12.200
+```
+
+<Callout type="warn" title="Egress Gateway 是新的单点">
+所有匹配流量都从那几台节点出去，它们就成了故障域和带宽瓶颈。三件事要做：
+
+- **至少两台**出口节点，别配单台
+- 监控它们的带宽与 conntrack 用量（所有出网连接都记在这里）
+- 想清楚它挂掉时的行为：是流量中断，还是回退到直接出网（**后者可能是安全问题**）
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="ie-1"
+  question="集群里有 50 个需要对外提供 HTTPS 的服务。最合理的入口方案是？"
+  options={[
+    { text: '一个 LoadBalancer VIP 给 Ingress 控制器，50 个服务用 Ingress/HTTPRoute 按域名区分', correct: true },
+    { text: '50 个 type: LoadBalancer Service，各占一个 VIP', feedback: '要 50 个可路由地址，成本高且地址池通常不够。' },
+    { text: '50 个 NodePort，客户端记端口号', feedback: '端口号无法对外提供，节点 IP 变化时客户端还要改。' },
+    { text: '全部用 hostNetwork', feedback: '会有端口冲突，且失去调度灵活性。' },
+  ]}
+  explain={<>这正是 Ingress 存在的理由：一到两个 VIP 承载所有 HTTP 服务，靠域名区分，省地址也省成本。注意 Ingress 控制器自己就是那个 type: LoadBalancer 的 Service。</>}
+/>
+
+<Quiz
+  id="ie-2"
+  question="给内网服务申请 *.internal.example.com 的证书，cert-manager 一直卡在 READY: False。最可能的原因？"
+  options={[
+    { text: '泛域名只能用 DNS-01 校验，且 HTTP-01 还要求公网能访问到你的 80 端口', correct: true },
+    { text: 'cert-manager 版本太旧', feedback: '在排除配置问题前不该先怀疑版本。' },
+    { text: 'Ingress 控制器没装好', feedback: '那会导致服务不通，而不是证书签不下来。' },
+    { text: '证书 Secret 名字冲突', feedback: '冲突会有明确报错，且不是最常见原因。' },
+  ]}
+  explain={<>两条 ACME 规则：泛域名必须 DNS-01；HTTP-01 需要公网可达。内网场景用 DNS-01（只要 DNS API 权限）或自建 CA。排查手法是 Certificate → CertificateRequest → Order → Challenge 逐层 describe。</>}
+/>
+
+<Quiz
+  id="ie-3"
+  question="合作方要求把你的出口 IP 加白名单，但集群节点会扩缩容。怎么办？"
+  options={[
+    { text: '用 Egress Gateway 指定固定出口节点与出口 IP，并至少配两台', correct: true },
+    { text: '把所有节点 IP 都给对方', feedback: '扩容加节点就得重新报备，不可维护。' },
+    { text: '让 Pod 用 hostNetwork', feedback: '源 IP 仍是所在节点的，节点变化问题没解决。' },
+    { text: '配 NetworkPolicy 白名单', feedback: 'NetworkPolicy 控制的是能不能出去，不改变源 IP。' },
+  ]}
+  explain={<>固定出口 IP 往往是引入 Egress Gateway 的真实动机（而不是安全）。注意它会成为新的单点与带宽瓶颈：至少两台、监控 conntrack、并想清楚它挂掉时是中断还是回退直连 —— 后者可能是安全问题。</>}
+/>
+
+## 这节课的落点
+
+- 入口三层：**LoadBalancer（四层引流）→ Ingress/Gateway（七层路由 + TLS）→ Pod**
+- Ingress 控制器自己就是一个 `type: LoadBalancer`；**一到两个 VIP 承载所有 HTTP 服务**
+- Ingress 的表达力只有 Host / Path / TLS，其余靠注解，配置绑死在某个控制器上
+- Gateway API 的关键改变是**角色分离**：平台管 `Gateway`，业务管 `HTTPRoute`；
+  灰度、Header 匹配、超时都是标准字段
+- 迁移不要二选一：新服务用 HTTPRoute，重注解的老服务放最后
+- 证书交给 cert-manager；**泛域名只能 DNS-01**，HTTP-01 要求公网可达
+- 证书卡住按 Certificate → CertificateRequest → Order → Challenge 逐层查
+- Egress 默认全放开；限制有三档，而**固定出口 IP** 常是引入 Egress Gateway 的真实原因
+- Egress Gateway 是新单点：至少两台、监控 conntrack、明确故障时的行为

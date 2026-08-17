@@ -1,0 +1,307 @@
+## 集群里一半的"网络故障"是 DNS
+
+这句话不夸张。DNS 的特点是**它失败时不像 DNS 失败**：表现为连接超时、
+偶发 5xx、启动慢、健康检查抖动——全都指向"网络问题"，而实际是解析出了问题。
+
+所以排障顺序里 DNS 永远在第一位（[Service 那节](/learn/l1-k8s/service) 的排障清单第一条就是它）。
+
+## 一个 Service 域名有四段
+
+```
+web.default.svc.cluster.local
+└┬┘ └──┬──┘ └┬┘ └─────┬─────┘
+服务名 命名空间 类型   集群域名
+```
+
+Pod 里可以只写前面几段，靠 `search` 域补全：
+
+```bash
+kubectl exec -it mypod -- cat /etc/resolv.conf
+```
+
+```
+nameserver 10.96.0.10
+search default.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5
+```
+
+于是这些写法都能通：
+
+| 写法 | 补全成 |
+| --- | --- |
+| `web` | `web.default.svc.cluster.local` |
+| `web.other` | `web.other.svc.cluster.local` |
+| `web.other.svc` | `web.other.svc.cluster.local` |
+| `web.other.svc.cluster.local.` | 末尾有点 = 完全限定，不补全 |
+
+## ndots:5 —— 一个真实的性能陷阱
+
+`ndots:5` 的含义是：**域名里的点少于 5 个时，先依次拼 search 域去试，都失败了才当绝对域名查。**
+
+看一次 `curl https://api.github.com` 会发生什么：
+
+```
+api.github.com 有 2 个点 < 5  → 先走 search 域
+① api.github.com.default.svc.cluster.local   → NXDOMAIN
+② api.github.com.svc.cluster.local           → NXDOMAIN
+③ api.github.com.cluster.local               → NXDOMAIN
+④ api.github.com                             → 命中
+```
+
+**一次外部域名解析变成 4 次查询**，而且 A 和 AAAA 各来一遍，实际是 **8 个 DNS 包**。
+集群里外部调用一多，CoreDNS 的 QPS 就被放大好几倍。
+
+三种缓解，从省事到彻底：
+
+```yaml
+# ① 给外部调用密集的 Pod 单独降低 ndots
+spec:
+  dnsConfig:
+    options:
+      - name: ndots
+        value: "2"
+```
+
+```bash
+# ② 代码或配置里把外部域名写成完全限定（末尾加点）
+curl https://api.github.com./           # 注意 com 后面那个点，直接跳过 search
+```
+
+**③ 部署 NodeLocal DNSCache**：每个节点上跑一个本地缓存，Pod 查本地而不是跨节点查 CoreDNS。
+这条收益最大——省掉网络往返，还挡住了大部分重复查询。
+
+<Callout type="trap" title="AAAA 查询在纯 IPv4 集群里是纯浪费">
+glibc 默认同时发 A 和 AAAA。集群没有 IPv6 时，AAAA 全部返回 NXDOMAIN，
+但**每个包都真实占用了 CoreDNS 的处理能力**。
+
+而且有些基础镜像（Alpine 用的 musl libc）对 `search` 域和并发查询的处理与 glibc 不同，
+会出现"同样的代码在 Alpine 镜像里解析慢或偶发失败"。
+
+排查思路：先在 Pod 里手工验证一次解析要发多少个包。
+```bash
+kubectl exec -it mypod -- sh -c 'time nslookup api.github.com'
+```
+</Callout>
+
+## CoreDNS 容量与配置
+
+```bash
+kubectl get deploy -n kube-system coredns
+kubectl get cm -n kube-system coredns -o yaml
+```
+
+```
+.:53 {
+    errors
+    health { lameduck 5s }
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+      pods insecure
+      fallthrough in-addr.arpa ip6.arpa
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf { max_concurrent 1000 }
+    cache 30
+    loop
+    reload
+    loadbalance
+}
+```
+
+几个真正影响体验的点：
+
+| 配置 | 作用 |
+| --- | --- |
+| `cache 30` | 缓存 30 秒。**调大能显著降 QPS**，代价是 Service IP 变化后有延迟 |
+| `forward . /etc/resolv.conf` | 集群外域名转发给上游。上游慢 = 集群里所有外部解析都慢 |
+| `max_concurrent` | 并发上限，打满会开始丢查询 |
+| 副本数 | **按 QPS 而不是按节点数定**；通常配 HPA 或至少 2 副本反亲和 |
+
+监控要看的两个指标：
+
+```bash
+# 请求量与延迟
+coredns_dns_requests_total
+coredns_dns_request_duration_seconds
+# 转发到上游的失败
+coredns_forward_healthcheck_failures_total
+```
+
+<Callout type="tip" title="上游 DNS 是集群外的隐形依赖">
+`forward . /etc/resolv.conf` 意味着**集群的外部解析能力等于节点 DNS 的能力**。
+上游 DNS 抖动时，症状是"集群里访问外部服务全部变慢"，而集群内部一切正常。
+
+所以排障要分清是**内部域名**还是**外部域名**慢：
+
+```bash
+kubectl exec -it mypod -- nslookup web.default.svc.cluster.local     # 内部
+kubectl exec -it mypod -- nslookup github.com                        # 外部
+```
+
+只有外部慢 → 查上游与 forward 配置，不用动 CoreDNS 副本数。
+</Callout>
+
+## NetworkPolicy：默认全通，一开就全拦
+
+K8s 的默认行为是**任意 Pod 可以访问任意 Pod**。NetworkPolicy 的模型有一个关键特性：
+
+> **一旦有任何一条策略选中了某个 Pod，这个 Pod 就从"默认全通"变成"只允许被明确放通的"。**
+
+所以第一条策略往往会造成大面积中断——不是策略写错了，是语义如此。
+
+### 标准写法：先默认拒绝，再逐个放通
+
+```yaml
+# ① 默认拒绝该命名空间的所有入向与出向
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: team-a
+spec:
+  podSelector: {}                    # 选中所有 Pod
+  policyTypes: [Ingress, Egress]
+```
+
+```yaml
+# ② 放通 DNS —— 必须最先做，否则一切都解析不了
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: team-a
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+```
+
+```yaml
+# ③ 放通业务：只让 frontend 访问 api 的 8080
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-from-frontend
+  namespace: team-a
+spec:
+  podSelector: { matchLabels: { app: api } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: frontend } }
+      ports:
+        - { protocol: TCP, port: 8080 }
+```
+
+<Callout type="trap" title="忘了放通 DNS —— 第一次上策略必踩">
+默认拒绝 Egress 之后，Pod 连 CoreDNS 都访问不了。症状是**所有域名解析失败**，
+业务日志里全是 `no such host` / `Temporary failure in name resolution`。
+
+而且很容易误判：看起来像 CoreDNS 挂了，实际 CoreDNS 好得很，是流量被自己的策略拦了。
+
+**顺序永远是：先写 allow-dns，再写 default-deny。** 反过来的话中间那段时间业务全挂。
+</Callout>
+
+## 验证策略真的生效了
+
+写完不能只看 `kubectl get networkpolicy`。要**双向验证**：该通的通、该拦的拦。
+
+```bash
+# 该通：从 frontend 访问 api
+kubectl exec -it frontend-xxx -- curl -m 3 -sS api:8080/health
+
+# 该拦：从别的 Pod 访问 api，应该超时（不是 refused）
+kubectl exec -it other-xxx -- curl -m 3 -sS api:8080/health
+# 期望：curl: (28) Connection timed out
+```
+
+**被策略拦掉的表现是超时而不是拒绝**——因为包被静默丢弃，没有 RST 返回。
+这一点能帮你区分"策略拦了"和"服务没起来"（后者是 refused）。
+
+关键一步：**在宿主机侧看 drop 事件**。Pod 内部对此毫无痕迹（[CNI 那节](/learn/l1-k8s/cni) 讲过）：
+
+```bash
+# 实时看被丢弃的包及原因
+kubectl -n kube-system exec -it <cilium-pod> -- cilium-dbg monitor --type drop
+
+# 看某个 Pod 的策略判定结果
+kubectl -n kube-system exec -it <cilium-pod> -- cilium-dbg endpoint list
+kubectl -n kube-system exec -it <cilium-pod> -- cilium-dbg policy get
+```
+
+```
+xx drop (Policy denied) flow 0x0 to endpoint 1234, identity 5678->9012: 10.244.1.7 -> 10.244.2.9 tcp SYN
+   ↑ 原因写得很明确
+```
+
+## 基于身份而不是 IP
+
+最后一个概念上的跃迁。传统防火墙按 IP 写规则，但 **Pod IP 每次重启都变**，
+按 IP 写的规则活不过一次滚动更新。
+
+所以 CNI 的做法是：把 Pod 的标签算成一个**身份（identity）**，策略针对身份生效。
+
+```bash
+kubectl -n kube-system exec -it <cilium-pod> -- cilium-dbg identity list | head
+```
+
+这解释了为什么 NetworkPolicy 用的是 `podSelector`（标签选择器）而不是 IP 段——
+标签稳定，IP 不稳定。同一个道理：**`ipBlock` 只该用于集群外的地址**，
+集群内一律用选择器。
+
+## 检查点
+
+<Quiz
+  id="dp-1"
+  question="Pod 里访问 api.github.com，抓包发现产生了 8 个 DNS 查询包。为什么？"
+  options={[
+    { text: 'ndots:5 让它先试 3 个 search 域再试绝对域名，共 4 次，A 与 AAAA 各一遍', correct: true },
+    { text: 'CoreDNS 配置错误导致重试', feedback: '这是 search 域与双栈查询的正常行为，不是重试。' },
+    { text: 'Pod 网络丢包导致重发', feedback: '丢包重发的包内容相同，而这里是 4 个不同的查询名。' },
+    { text: 'CoreDNS 副本太少', feedback: '副本数不影响单次解析产生几个查询。' },
+  ]}
+  explain={<>点数少于 ndots 就先拼 search 域。缓解办法三档：给 Pod 单独设 ndots:2、外部域名写成完全限定（末尾加点）、或部署 NodeLocal DNSCache（收益最大）。</>}
+/>
+
+<Quiz
+  id="dp-2"
+  question="给命名空间加了默认拒绝策略后，所有 Pod 报 no such host。原因是？"
+  options={[
+    { text: '默认拒绝 Egress 把访问 CoreDNS 的流量也拦了，必须显式放通 53 端口', correct: true },
+    { text: 'CoreDNS 挂了', feedback: 'CoreDNS 正常，是自己的策略拦住了去它的流量 —— 这正是最容易误判的地方。' },
+    { text: 'resolv.conf 被覆盖了', feedback: '策略不会改 resolv.conf。' },
+    { text: 'Service CIDR 配置错误', feedback: '加策略前一切正常，说明 CIDR 没问题。' },
+  ]}
+  explain={<>顺序永远是先 allow-dns 再 default-deny。放通时要同时开 UDP 53 与 TCP 53（大响应会走 TCP），目标用 kube-system 的 kube-dns Pod 选择器。</>}
+/>
+
+<Quiz
+  id="dp-3"
+  question="怀疑某个请求被 NetworkPolicy 拦了。最直接的确认方式是？"
+  options={[
+    { text: '在宿主机侧看 CNI 的 drop 事件，原因会写明 Policy denied', correct: true },
+    { text: '在 Pod 里抓包', feedback: 'Pod 内部看不到，包在宿主机的数据平面就被静默丢弃了。' },
+    { text: '看 kubectl get networkpolicy 是否存在', feedback: '存在不代表命中，要看实际判定结果。' },
+    { text: '重启 Pod 试试', feedback: '策略针对标签身份，重启后 IP 变了但策略照旧生效。' },
+  ]}
+  explain={<>被策略拦的表现是超时（静默丢弃、无 RST），与服务没起来的 refused 不同。确认手段是宿主机侧的 drop 事件 —— 容器网络的丢包多数只能在那里看到。</>}
+/>
+
+## 这节课的落点
+
+- **DNS 失败时不像 DNS 失败**：表现为超时、5xx、启动慢，所以排障永远先查它
+- Service 域名四段；`search` 域负责补全，末尾加点表示完全限定
+- **`ndots:5` 让一次外部解析变成 8 个包**；缓解三档：调 ndots、写完全限定名、
+  部署 NodeLocal DNSCache
+- CoreDNS 副本按 QPS 定；`cache 30` 调大最省 QPS；**上游 DNS 是集群外的隐形依赖**
+- 分清内部域名慢还是外部域名慢，只有外部慢就去查 `forward` 与上游
+- NetworkPolicy 语义：**一被策略选中就从"全通"变成"只放通明确允许的"**
+- **先写 allow-dns 再写 default-deny**，否则中间那段业务全挂
+- 被策略拦是**超时**（静默丢弃），服务没起来是 **refused**
+- 验证要双向，并在**宿主机侧看 drop 事件**；集群内规则一律用选择器而不是 IP 段
