@@ -31,6 +31,22 @@ export interface Lesson {
   refs?: LessonRef[]
 }
 
+/**
+ * 阶段内的小组。
+ *
+ * 分组承担两件事：把「循序渐进」显式写出来，以及**定义学习顺序** ——
+ * 全站的课程顺序由 groups[].lessons 决定，Track.lessons 只是课程池，顺序无关。
+ * 想调整顺序只改这里，不用挪 Lesson 对象。
+ */
+export interface LessonGroup {
+  id: string
+  title: string
+  /** 一句话说明这一组解决什么问题 */
+  hint: string
+  /** 本组课程 id，按学习顺序排列 */
+  lessons: string[]
+}
+
 export interface Track {
   id: string
   level: string
@@ -44,6 +60,7 @@ export interface Track {
     border: string
     dot: string
   }
+  groups: LessonGroup[]
   lessons: Lesson[]
 }
 
@@ -99,6 +116,26 @@ export const tracks: Track[] = [
       border: 'border-sky-200',
       dot: 'bg-sky-500',
     },
+    groups: [
+      {
+        id: 'l0-foundation',
+        title: '打地基',
+        hint: '先统一口径、再看清二三层怎么转发。这两节后面每一课都要用到，跳过去会处处别扭。',
+        lessons: ['metrics-units', 'switching-routing'],
+      },
+      {
+        id: 'l0-path',
+        title: '走通一个包',
+        hint: '沿着收发路径走一遍，再看 TCP 的实际行为和内核侧能动的旋钮。',
+        lessons: ['packet-journey', 'tcp-behavior', 'kernel-stack'],
+      },
+      {
+        id: 'l0-practice',
+        title: '动手排障',
+        hint: '把前面的知识收成一套固定的命令顺序，然后拿一个真实故障练手。',
+        lessons: ['toolbox', 'quest-slow-host'],
+      },
+    ],
     lessons: [
       {
         id: 'packet-journey',
@@ -264,6 +301,26 @@ export const tracks: Track[] = [
       border: 'border-emerald-200',
       dot: 'bg-emerald-500',
     },
+    groups: [
+      {
+        id: 'l1-model',
+        title: '从 netns 到网络模型',
+        hint: '先用 ip 命令手搓一个容器网络，再理解 K8s 定下的四条约束和各家 CNI 的取舍。',
+        lessons: ['netns-veth', 'k8s-model', 'cni'],
+      },
+      {
+        id: 'l1-service',
+        title: 'Service 与南北流量',
+        hint: '一个不存在的 IP 怎么工作、流量从集群外怎么进来、DNS 与策略各在哪一层生效。',
+        lessons: ['service', 'kube-proxy-ebpf', 'ingress-egress', 'dns-policy'],
+      },
+      {
+        id: 'l1-extend',
+        title: '扩展与排障',
+        hint: '给 Pod 插第二张网卡，然后练一次「Pod 之间不通」。',
+        lessons: ['secondary-cni', 'quest-pod-unreachable'],
+      },
+    ],
     lessons: [
       {
         id: 'netns-veth',
@@ -482,6 +539,32 @@ export const tracks: Track[] = [
       border: 'border-violet-200',
       dot: 'bg-violet-500',
     },
+    groups: [
+      {
+        id: 'l2-intra',
+        title: '机内互联',
+        hint: 'PCIe 决定网卡能不能跑满，NVLink 决定 GPU 之间有多快。机间网络的账建立在这两笔账之上，所以先看机内。',
+        lessons: ['pcie-topology', 'nvlink'],
+      },
+      {
+        id: 'l2-rdma',
+        title: 'RDMA 原理',
+        hint: '为什么快、IB 与 RoCE 差在哪，以及无损以太网到底靠什么撑住。',
+        lessons: ['why-rdma', 'infiniband', 'roce'],
+      },
+      {
+        id: 'l2-handson',
+        title: '打通一条链路',
+        hint: '先在两台裸机之间跑出线速，再把 RDMA 交给容器。原理讲完就动手，别等到最后。',
+        lessons: ['perftest', 'k8s-rdma'],
+      },
+      {
+        id: 'l2-collective',
+        title: '集群拓扑与集合通信',
+        hint: '拓扑决定 AllReduce 能跑多快，而 busbw 是验收整条链路的唯一指标。',
+        lessons: ['topology-rail', 'nccl', 'quest-slow-allreduce'],
+      },
+    ],
     lessons: [
       {
         id: 'pcie-topology',
@@ -732,6 +815,26 @@ export const tracks: Track[] = [
       border: 'border-amber-200',
       dot: 'bg-amber-500',
     },
+    groups: [
+      {
+        id: 'l3-require',
+        title: '把需求变成数字',
+        hint: '业务话术里没有一个可以拿去采购的数字，先问出来。',
+        lessons: ['requirements'],
+      },
+      {
+        id: 'l3-eth',
+        title: '以太网这一套',
+        hint: '端口账与收敛比，加上一次性决定、长期后悔的地址规划。',
+        lessons: ['ethernet-plan', 'ip-plan'],
+      },
+      {
+        id: 'l3-fabric',
+        title: '计算网这一套',
+        hint: 'Rail 布线账，以及最后那道 IB / RoCE / Spectrum-X 的选型题。',
+        lessons: ['fabric-plan', 'ib-vs-roce'],
+      },
+    ],
     lessons: [
       {
         id: 'requirements',
@@ -857,6 +960,32 @@ export const tracks: Track[] = [
       border: 'border-rose-200',
       dot: 'bg-rose-500',
     },
+    groups: [
+      {
+        id: 'l4-fastpath',
+        title: '绕开常规数据路径',
+        hint: '从把网卡切给容器，到把逻辑塞进内核，再到干脆自己轮询。三种做法由浅入深，代价也依次变大。',
+        lessons: ['sriov-macvlan', 'ebpf-xdp', 'dpdk'],
+      },
+      {
+        id: 'l4-route',
+        title: '让外界找到你的服务',
+        hint: 'VIP 是怎么被宣告出去的 —— L1 里 MetalLB 那两种模式在这里讲透。',
+        lessons: ['bgp-arp'],
+      },
+      {
+        id: 'l4-domain',
+        title: 'GPU 与存储专项',
+        hint: '把 L2 的 RDMA 知识往上接：显存直通、远端盘、集合通信库，以及卸载到卡上的趋势。',
+        lessons: ['gpudirect', 'nvme-of', 'mpi', 'dpu'],
+      },
+      {
+        id: 'l4-ops',
+        title: '长期运维',
+        hint: '把前面所有东西变成看板、告警，和别人能照着执行的流程。',
+        lessons: ['observability', 'oncall'],
+      },
+    ],
     lessons: [
       {
         id: 'sriov-macvlan',
@@ -1093,6 +1222,32 @@ export const tracks: Track[] = [
       border: 'border-teal-200',
       dot: 'bg-teal-500',
     },
+    groups: [
+      {
+        id: 'l5-proxy',
+        title: '代理与端口转发',
+        hint: '两种代理的区别、ssh 的三把钥匙，以及 ssh 搞不定（UDP、长期穿透）时换成 gost。',
+        lessons: ['proxy-basics', 'ssh-tunnels', 'ssh-advanced', 'gost-toolbox'],
+      },
+      {
+        id: 'l5-vpn',
+        title: 'VPN 组网',
+        hint: '从两台机器的 WireGuard，到自动组网的 Tailscale，再到需要组织与审计时的 Pritunl。',
+        lessons: ['wireguard', 'tailscale', 'pritunl'],
+      },
+      {
+        id: 'l5-restricted',
+        title: '受限网络实战',
+        hint: '先诊断再动手：分清症状、看懂流量特征、写对分流规则，必要时做成网关。',
+        lessons: ['restricted-network', 'traffic-shaping', 'clash-rules', 'transparent-gateway'],
+      },
+      {
+        id: 'l5-quest',
+        title: '排障',
+        hint: '隧道昨天还好今天不通，从客户端一路查到出口。',
+        lessons: ['quest-proxy-broken'],
+      },
+    ],
     lessons: [
       {
         id: 'proxy-basics',
@@ -1391,27 +1546,130 @@ export const tracks: Track[] = [
   },
 ]
 
-/* ---------- 派生查询 ---------- */
+/* ---------- 前置依赖 ---------- */
 
-export const allLessons = tracks.flatMap((track) =>
-  track.lessons.map((lesson) => ({ track, lesson })),
-)
+/**
+ * 建议先学的课程：`${trackId}/${lessonId}` → 前置课程 key 列表。
+ *
+ * 集中放在一处而不是散在每个 Lesson 上，是为了能一眼看完整张依赖图。
+ * 只记「跳过会看不懂」的强依赖，同组相邻的自然顺序不重复登记。
+ */
+export const PREREQ: Record<string, string[]> = {
+  // L0：路径 → 行为与调优 → 排障
+  'l0-basics/packet-journey': ['l0-basics/switching-routing'],
+  'l0-basics/tcp-behavior': ['l0-basics/packet-journey', 'l0-basics/metrics-units'],
+  'l0-basics/kernel-stack': ['l0-basics/packet-journey'],
+  'l0-basics/toolbox': ['l0-basics/packet-journey'],
+  'l0-basics/quest-slow-host': ['l0-basics/toolbox'],
+
+  // L1：模型 → 数据平面 → Service
+  'l1-k8s/cni': ['l1-k8s/k8s-model', 'l0-basics/switching-routing'],
+  'l1-k8s/service': ['l1-k8s/k8s-model'],
+  'l1-k8s/kube-proxy-ebpf': ['l1-k8s/service'],
+  'l1-k8s/ingress-egress': ['l1-k8s/service'],
+  'l1-k8s/quest-pod-unreachable': ['l1-k8s/cni', 'l1-k8s/service', 'l1-k8s/dns-policy'],
+
+  // L2：机内 → 原理 → 动手 → 集合通信
+  'l2-hpc/pcie-topology': ['l0-basics/metrics-units'],
+  'l2-hpc/why-rdma': ['l0-basics/packet-journey'],
+  'l2-hpc/roce': ['l2-hpc/why-rdma', 'l0-basics/tcp-behavior'],
+  'l2-hpc/perftest': ['l2-hpc/roce'],
+  'l2-hpc/k8s-rdma': ['l2-hpc/perftest', 'l1-k8s/secondary-cni'],
+  'l2-hpc/nccl': ['l2-hpc/topology-rail', 'l2-hpc/nvlink'],
+  'l2-hpc/quest-slow-allreduce': ['l2-hpc/nccl', 'l2-hpc/pcie-topology'],
+
+  // L3：规划全都建立在前面的账上
+  'l3-planning/ethernet-plan': ['l0-basics/metrics-units'],
+  'l3-planning/ip-plan': ['l1-k8s/k8s-model'],
+  'l3-planning/fabric-plan': ['l2-hpc/topology-rail', 'l2-hpc/nvlink'],
+  'l3-planning/ib-vs-roce': ['l2-hpc/infiniband', 'l2-hpc/roce'],
+
+  // L4：进阶专题各自接在对应的基础课后面
+  'l4-advanced/sriov-macvlan': ['l1-k8s/cni'],
+  'l4-advanced/ebpf-xdp': ['l1-k8s/cni', 'l0-basics/kernel-stack'],
+  'l4-advanced/dpdk': ['l0-basics/kernel-stack'],
+  'l4-advanced/bgp-arp': ['l1-k8s/service', 'l0-basics/switching-routing'],
+  'l4-advanced/gpudirect': ['l2-hpc/pcie-topology', 'l2-hpc/why-rdma'],
+  'l4-advanced/nvme-of': ['l2-hpc/why-rdma'],
+  'l4-advanced/mpi': ['l2-hpc/nccl'],
+  'l4-advanced/dpu': ['l2-hpc/roce'],
+  'l4-advanced/observability': ['l0-basics/toolbox'],
+
+  // L5：独立分支，只依赖组内顺序和 L0 的基础
+  'l5-tunnel/ssh-tunnels': ['l5-tunnel/proxy-basics'],
+  'l5-tunnel/ssh-advanced': ['l5-tunnel/ssh-tunnels'],
+  'l5-tunnel/gost-toolbox': ['l5-tunnel/proxy-basics'],
+  'l5-tunnel/wireguard': ['l0-basics/switching-routing'],
+  'l5-tunnel/tailscale': ['l5-tunnel/wireguard'],
+  'l5-tunnel/pritunl': ['l5-tunnel/wireguard'],
+  'l5-tunnel/clash-rules': ['l5-tunnel/proxy-basics', 'l5-tunnel/restricted-network'],
+  'l5-tunnel/transparent-gateway': ['l5-tunnel/clash-rules'],
+  'l5-tunnel/quest-proxy-broken': ['l5-tunnel/gost-toolbox', 'l5-tunnel/clash-rules'],
+}
+
+/* ---------- 派生查询 ---------- */
 
 export function getTrack(trackId: string): Track | undefined {
   return tracks.find((t) => t.id === trackId)
 }
 
+/** 按分组展开一个阶段的课程；这也是全站的学习顺序 */
+export function groupedLessons(track: Track) {
+  return track.groups.map((group) => {
+    const lessons = group.lessons
+      .map((id) => track.lessons.find((l) => l.id === id))
+      .filter((l): l is Lesson => Boolean(l))
+    return {
+      group,
+      lessons,
+      minutes: lessons.reduce((sum, l) => sum + l.minutes, 0),
+      readyCount: lessons.filter((l) => l.status === 'ready').length,
+    }
+  })
+}
+
+/** 一个阶段里按学习顺序排好的全部课程 */
+export function orderedLessons(track: Track): Lesson[] {
+  return track.groups.flatMap((group) =>
+    group.lessons
+      .map((id) => track.lessons.find((l) => l.id === id))
+      .filter((l): l is Lesson => Boolean(l)),
+  )
+}
+
+export function getLessonGroup(track: Track, lessonId: string): LessonGroup | undefined {
+  return track.groups.find((g) => g.lessons.includes(lessonId))
+}
+
+/** 全站课程，已按阶段与分组排好顺序 */
+export const allLessons = tracks.flatMap((track) =>
+  orderedLessons(track).map((lesson) => ({ track, lesson })),
+)
+
 export function getLesson(trackId: string, lessonId: string) {
   const track = getTrack(trackId)
   if (!track) return undefined
-  const index = track.lessons.findIndex((l) => l.id === lessonId)
+  const ordered = orderedLessons(track)
+  const index = ordered.findIndex((l) => l.id === lessonId)
   if (index === -1) return undefined
   return {
     track,
-    lesson: track.lessons[index],
-    prev: track.lessons[index - 1],
-    next: track.lessons[index + 1],
+    lesson: ordered[index],
+    group: getLessonGroup(track, lessonId),
+    prev: ordered[index - 1],
+    next: ordered[index + 1],
   }
+}
+
+/** 解析出「建议先学」的课程列表 */
+export function getPrereqs(trackId: string, lessonId: string) {
+  return (PREREQ[lessonKey(trackId, lessonId)] ?? [])
+    .map((key) => {
+      const [t, l] = key.split('/')
+      const found = getLesson(t, l)
+      return found ? { track: found.track, lesson: found.lesson, key } : undefined
+    })
+    .filter((x): x is { track: Track; lesson: Lesson; key: string } => Boolean(x))
 }
 
 /** 全局线性顺序，用于"上一课 / 下一课"跨阶段跳转 */

@@ -1,6 +1,14 @@
 import { MDXProvider } from '@mdx-js/react'
 import { Link, createFileRoute } from '@tanstack/react-router'
-import { KIND_LABEL, KIND_STYLE, getFlatNeighbors, getLesson, lessonKey } from '#/lib/curriculum'
+import {
+  KIND_LABEL,
+  KIND_STYLE,
+  getFlatNeighbors,
+  getLesson,
+  getPrereqs,
+  groupedLessons,
+  lessonKey,
+} from '#/lib/curriculum'
 import { getLessonContent } from '#/lib/content'
 import { setLessonDone, useProgress } from '#/lib/progress'
 import { LessonKeyContext } from '#/components/lesson-context'
@@ -28,12 +36,13 @@ function LessonPage() {
     )
   }
 
-  const { track, lesson } = found
+  const { track, lesson, group } = found
   const key = lessonKey(track.id, lesson.id)
   const Content = getLessonContent(track.id, lesson.id)
   const done = progress.done.includes(key)
   const passedCheckpoints = progress.quiz.filter((q) => q.startsWith(`${key}#`)).length
   const { prev, next } = getFlatNeighbors(track.id, lesson.id)
+  const prereqs = getPrereqs(track.id, lesson.id)
 
   return (
     <div className="lg:grid lg:grid-cols-[1fr_15rem] lg:gap-8">
@@ -50,6 +59,14 @@ function LessonPage() {
           >
             {track.level} {track.title}
           </Link>
+          {group && (
+            <>
+              <span className="mx-1.5">/</span>
+              <a href={`/tracks/${track.id}#${group.id}`} className="hover:text-gray-700">
+                {group.title}
+              </a>
+            </>
+          )}
         </nav>
 
         <header className="mt-3 border-b border-gray-200 pb-5">
@@ -79,6 +96,41 @@ function LessonPage() {
             ))}
           </ul>
         </section>
+
+        {prereqs.length > 0 && (
+          <section className="mt-4 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
+            <h2 className="text-xs font-semibold text-gray-500">
+              建议先学
+              <span className="ml-1.5 font-normal text-gray-400">
+                跳过这几节会看不懂本节的部分推导
+              </span>
+            </h2>
+            <ul className="mt-2 flex flex-wrap gap-1.5">
+              {prereqs.map((item) => {
+                const ok = progress.done.includes(item.key)
+                return (
+                  <li key={item.key}>
+                    <Link
+                      to="/learn/$trackId/$lessonId"
+                      params={{ trackId: item.track.id, lessonId: item.lesson.id }}
+                      className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-xs transition ${
+                        ok
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                          : 'border-gray-300 bg-white text-gray-700 hover:border-brand-500 hover:text-brand-700'
+                      }`}
+                    >
+                      <span className={ok ? 'text-emerald-500' : 'text-gray-300'}>
+                        {ok ? '✓' : '○'}
+                      </span>
+                      <span className="text-[10px] text-gray-400">{item.track.level}</span>
+                      {item.lesson.title}
+                    </Link>
+                  </li>
+                )
+              })}
+            </ul>
+          </section>
+        )}
 
         <LessonKeyContext.Provider value={key}>
           <div className="lesson-body mt-8">
@@ -167,29 +219,40 @@ function LessonPage() {
           <div className="text-xs font-semibold text-gray-500">
             {track.level} · {track.title}
           </div>
-          <ol className="mt-2 space-y-0.5 text-sm">
-            {track.lessons.map((item) => {
-              const active = item.id === lesson.id
-              const itemDone = progress.done.includes(lessonKey(track.id, item.id))
-              return (
-                <li key={item.id}>
-                  <Link
-                    to="/learn/$trackId/$lessonId"
-                    params={{ trackId: track.id, lessonId: item.id }}
-                    className={`block rounded-lg px-2 py-1.5 leading-snug transition ${
-                      active
-                        ? 'bg-brand-50 font-medium text-brand-700'
-                        : 'text-gray-600 hover:bg-gray-50'
-                    }`}
-                  >
-                    <span className={`mr-1.5 text-xs ${itemDone ? 'text-emerald-500' : 'text-gray-300'}`}>
-                      {itemDone ? '✓' : '○'}
-                    </span>
-                    {item.title}
-                  </Link>
-                </li>
-              )
-            })}
+          <ol className="mt-2 space-y-2.5 text-sm">
+            {groupedLessons(track).map(({ group: g, lessons }) => (
+              <li key={g.id}>
+                <div className="px-2 text-[11px] font-semibold tracking-wide text-gray-400">
+                  {g.title}
+                </div>
+                <ol className="mt-1 space-y-0.5">
+                  {lessons.map((item) => {
+                    const active = item.id === lesson.id
+                    const itemDone = progress.done.includes(lessonKey(track.id, item.id))
+                    return (
+                      <li key={item.id}>
+                        <Link
+                          to="/learn/$trackId/$lessonId"
+                          params={{ trackId: track.id, lessonId: item.id }}
+                          className={`block rounded-lg px-2 py-1.5 leading-snug transition ${
+                            active
+                              ? 'bg-brand-50 font-medium text-brand-700'
+                              : 'text-gray-600 hover:bg-gray-50'
+                          }`}
+                        >
+                          <span
+                            className={`mr-1.5 text-xs ${itemDone ? 'text-emerald-500' : 'text-gray-300'}`}
+                          >
+                            {itemDone ? '✓' : '○'}
+                          </span>
+                          {item.title}
+                        </Link>
+                      </li>
+                    )
+                  })}
+                </ol>
+              </li>
+            ))}
           </ol>
         </div>
       </aside>
