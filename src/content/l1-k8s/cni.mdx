@@ -1,0 +1,157 @@
+## CNI 只是一份很薄的约定
+
+CNI 规范本身简单到令人意外：kubelet 要创建 Pod 网络时，调用一个可执行文件，
+通过标准输入传 JSON，插件负责把网卡准备好、把结果 JSON 打回来。就这样。
+
+真正的差别全在**数据平面**：包在宿主机上到底怎么走。三条主流路线，代价各不相同。
+
+## 路线一：Overlay
+
+在原包外面再套一层，外层地址是节点 IP。物理网络只看到节点之间的通信，完全不需要知道 Pod CIDR 的存在。
+
+```
+[ 外层 IP: 节点A → 节点B ][ UDP ][ VXLAN 头 ][ 原始包: PodA → PodB ]
+```
+
+| 封装 | 端口 | 额外开销 |
+| --- | --- | --- |
+| VXLAN | UDP 8472 | 50 字节 |
+| Geneve | UDP 6081 | 50 字节起（有可变选项） |
+
+**优点**：对物理网络零要求，跨网段、跨机房都能跑，落地最快。
+**代价**：封装解封装的 CPU 开销，以及一笔必须算清的 MTU 账。
+
+### MTU 账：最经典的 overlay 事故
+
+```
+物理网卡 MTU 1500
+  − VXLAN 封装开销 50
+  = Pod 网卡 MTU 最多 1450
+```
+
+如果 Pod 网卡还是 1500，封装后变成 1550，超过物理网卡的 1500 —— 包被丢弃。
+
+<Callout type="trap" title="MTU 黑洞：小包正常、大包卡死">
+症状极具迷惑性：`ping` 通、`curl` 小接口正常、`kubectl exec` 能进去，
+但传大文件、拉大镜像、返回大 JSON 就**卡住不动**（不是报错，是卡住）。
+
+因为 TCP 会协商 MSS，小包永远不触发问题，只有满载的大包才超限。验证方式：
+
+```bash
+# 在 Pod 里发不允许分片的大包
+kubectl exec pod-a -- ping -M do -s 1422 <pod-b-ip>   # 1450 − 28 = 1422
+```
+
+规划时的正解：**物理网络开巨帧（9000）**，这样 overlay 封装完仍远小于上限，
+Pod 侧不必迁就。这也是机房条件允许时应该默认开巨帧的原因之一。
+</Callout>
+
+## 路线二：原生路由
+
+不封装。宿主机上直接有一条到对端 Pod CIDR 的路由，包带着 Pod IP 原样走上物理网络。
+
+要成立必须满足一个条件：**物理网络得知道每个 Pod CIDR 在哪台机器上**。两种做法：
+
+- **同网段直连**：所有节点在一个二层域里，宿主机之间互加路由即可
+- **BGP 宣告**：每个节点把自己的 Pod CIDR 宣告给上游交换机（L4 会细讲 BGP）
+
+**优点**：没有封装开销，MTU 不用打折，抓包能直接看到 Pod IP（排障舒服很多）。
+**代价**：对物理网络有要求，要么同二层，要么网络组配合开 BGP。
+
+## 路线三：eBPF 数据平面
+
+这是当前的主流方向。传统方案在宿主机上要过网桥、iptables 链、conntrack，
+eBPF 把这些逻辑直接编译进内核挂载点，包在更早的位置就被送到目的地。
+
+主要收益有三点：
+
+- **绕开 iptables 的线性匹配** —— Service 数量多时差距明显（下一节细讲）
+- **绕开 conntrack** —— 少一张会满的表，少一类随机失败
+- **基于身份而非 IP 的策略** —— Pod IP 天天变，用标签算出的身份才稳定
+
+<Callout type="note" title="Cilium 部署时的几个实际坑">
+来自实践的三条，都不是文档首页会写的：
+
+- **路由表冲突**：Cilium 会占用 `200 / 202 / 2004 / 2005` 这几张路由表。
+  宿主机网络（尤其是自定义多网卡方案）如果也在用，会出现莫名的网络异常，得先改宿主机配置。
+- **`k8sServiceHost` 要填 API Server 直连地址**，让 init 容器绕过 ClusterIP，
+  避免"CNI 还没起来但要访问 ClusterIP"的鸡生蛋问题。Kubespray 部署的集群填 `127.0.0.1`
+  （节点本地代理，天然 HA）比填 VIP 更稳；不推荐 `auto`，它读到的往往是单个 master IP，没有 HA。
+- **`bpf.enableTCX`** 在部分版本有清理不干净的 bug，遇到就先关掉。
+</Callout>
+
+## 怎么选
+
+| 机房条件 | 建议 |
+| --- | --- |
+| 只有一条普通网络，网络组不配合 | overlay（VXLAN），把 MTU 账算清 |
+| 同二层、可开巨帧 | 原生路由 + eBPF，性能最好 |
+| 能开 BGP | 原生路由 + BGP 宣告，跨网段也能免封装 |
+| 有 KubeVirt 虚机 | 默认 CNI 之外挂 Kube-OVN 作次级 CNI |
+| 有 RDMA / AI 训练 | 默认 CNI + MacVLAN/SR-IOV 次级网卡（L2 详解） |
+
+选型的顺序是**先问机房能给什么，再决定用什么模式**，不是反过来。
+
+## 走一遍：同节点与跨节点
+
+同节点通信根本不出网卡；跨节点才轮到 overlay 或路由登场。点开每一跳对照看：
+
+<PacketPathExplorer scenario="pod-cross-node" only={["pod-same-node", "pod-cross-node"]} />
+
+<Callout type="tip" title="Pod 里看不到的丢包，要在宿主机上看">
+NetworkPolicy 拒绝、eBPF 数据平面丢弃，这些都发生在宿主机的 root netns 里，
+Pod 内部什么痕迹都没有。所以容器网络排障的关键动作是**跳到宿主机侧看 drop 事件**：
+
+```bash
+cilium-dbg monitor --type drop
+cilium-dbg endpoint list
+```
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="cni-1"
+  question="集群用 VXLAN overlay，物理网卡 MTU 1500，Pod 网卡 MTU 也是 1500。会出现什么现象？"
+  options={[
+    { text: 'ping 和小请求正常，传大文件时卡住', correct: true },
+    { text: '所有网络完全不通', feedback: '小包封装后不超限，照样能通 —— 这正是它难查的原因。' },
+    { text: 'Pod 起不来', feedback: 'MTU 不影响 Pod 创建。' },
+    { text: '只有 DNS 不通', feedback: 'DNS 查询包很小，反而是最不受影响的。' },
+  ]}
+  explain={<>1500 + 50 字节封装 = 1550 &gt; 1500，满载大包被丢弃。Pod 网卡应设为 1450，或者把物理网络改成巨帧 9000 从根上消除这个约束。验证用 <code>ping -M do -s 1422</code>。</>}
+/>
+
+<Quiz
+  id="cni-2"
+  question="想让抓包时直接看到 Pod IP、并且不损失 MTU，该选哪条路线？"
+  options={[
+    { text: '原生路由模式（同二层互加路由，或用 BGP 宣告 Pod CIDR）', correct: true },
+    { text: 'VXLAN overlay', feedback: 'overlay 抓到的外层是节点 IP，还要解封装才能看到 Pod IP，且 MTU 要打折。' },
+    { text: 'Geneve overlay', feedback: '同上，Geneve 也是封装方案。' },
+    { text: '给每个 Pod 配 hostNetwork', feedback: '那 Pod 就没有独立 IP 了，还会有端口冲突。' },
+  ]}
+  explain={<>原生路由不封装，所以既没有 MTU 折扣也没有封装开销，抓包直接是 Pod IP。代价是物理网络必须知道 Pod CIDR 的位置 —— 要么同二层，要么开 BGP。</>}
+/>
+
+<Quiz
+  id="cni-3"
+  question="eBPF 数据平面相比传统 iptables 方案，主要收益有哪些？（多选）"
+  options={[
+    { text: '避免 Service 数量增长带来的规则线性匹配开销', correct: true },
+    { text: '可以绕开 conntrack，少一张会写满的表', correct: true },
+    { text: '基于 Pod 身份而不是 IP 做策略，IP 变化不影响规则', correct: true },
+    { text: '不再需要规划 Pod CIDR', feedback: 'Pod 依然要 IP，地址规划照做。' },
+  ]}
+  explain={<>三点收益分别对应性能、稳定性和可维护性。注意它不改变 K8s 网络模型本身，四条铁律仍然要满足。</>}
+/>
+
+## 这节课的落点
+
+- CNI 规范很薄，差别全在数据平面
+- overlay 对物理网络零要求，代价是封装开销 + 50 字节 MTU 折扣
+- MTU 黑洞的特征是"小包通、大包卡"，用 `ping -M do` 验证；物理网开巨帧能一次性消除隐患
+- 原生路由没有封装开销、抓包直观，但要求同二层或能开 BGP
+- eBPF 数据平面绕开 iptables 与 conntrack，并用身份代替 IP 做策略
+- Cilium 落地要注意：路由表 200/202/2004/2005 冲突、`k8sServiceHost` 的填法
+- 容器网络的丢包多数只能在宿主机侧看到，Pod 内部无痕迹

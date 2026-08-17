@@ -1,0 +1,153 @@
+## 为什么先背路径
+
+"网络慢"这三个字信息量几乎为零。它可能是应用没及时读、可能是本机队列满了、可能是网卡在丢包、也可能是交换机上行拥塞。
+
+区别在于：**如果你脑子里有一张路径图，报障就会自动变成一道"排除题"**——每一段都有对应的计数器，看一眼就能划掉一段。没有这张图，你只能从"重启一下试试"开始。
+
+所以这节课不讲优化，只做一件事：把发包和收包路径拆成可观测的若干段，并记住每一段用什么命令看。
+
+<Callout type="note" title="路径是一切的地基">
+后面 L1 讲容器网络、L2 讲 RDMA，本质都是在这条路径上做手术：CNI 在中间插了一段虚拟设备，
+RDMA 则是把中间整段切掉。不先看清原版，就看不出它们改了什么。
+</Callout>
+
+## 发送方向：四个队列
+
+调用一次 `send()`，数据并不会立刻上网线。它要依次经过四个排队点：
+
+```
+应用 buffer
+   │ send()            ← 一次拷贝 + 一次上下文切换
+   ▼
+socket sndbuf          ← 队列 1：受窗口与拥塞控制约束
+   │ TCP 分段、加头、查路由
+   ▼
+qdisc 排队规则          ← 队列 2：限速、优先级、主动丢包
+   │
+   ▼
+驱动 tx ring           ← 队列 3：满了就停止投递
+   │ 网卡 DMA 取数据
+   ▼
+网卡串行化上线          ← 队列 4：物理线速就是硬上限
+```
+
+**发送方向的丢包几乎全在这些队列上**，而且各有各的计数器：
+
+| 排队点 | 满了会怎样 | 怎么看 |
+| --- | --- | --- |
+| socket sndbuf | `send()` 阻塞或返回 `EAGAIN` | `ss -tim` 看 `Send-Q` |
+| qdisc | 主动丢包 | `tc -s qdisc show dev bond0` 看 `dropped` |
+| tx ring | 内核停止投递，严重时网卡复位 | `ethtool -S` 看 `tx_dropped`；`dmesg` 看 tx timeout |
+| 物理线速 | 排队延迟上升 | `ethtool bond0 \| grep Speed` |
+
+<Callout type="tip" title="Send-Q 长期不降，别在本机找原因">
+`Send-Q` 是"我想发但发不出去"的量。它高说明对端收得慢或者路径在丢包，
+瓶颈在对端或中间，不在这台机器。这时候调本机内核参数是白费功夫。
+</Callout>
+
+## 接收方向：更容易丢
+
+收包比发包脆弱，因为四个环节的速度必须互相匹配：网卡收得快、CPU 取得慢，中间就会丢。
+
+```
+网线
+   │ 网卡校验、RSS 哈希选队列
+   ▼
+DMA 写入 rx ring        ← 没有空描述符 → 直接丢
+   │ 硬中断（可合并）
+   ▼
+NAPI 软中断轮询          ← 预算用尽 / backlog 满 → 丢
+   │ GRO 合包、netfilter、路由、TCP 状态机
+   ▼
+socket rcvbuf           ← 应用不读 → 窗口缩小到 0
+   │ read()
+   ▼
+应用
+```
+
+三个必看计数器，按出现顺序：
+
+```bash
+# 1. 网卡来不及 DMA：CPU 回收描述符跟不上收包速度
+ethtool -S bond0 | grep -iE 'rx_missed|rx_no_buf|discard'
+
+# 2. 软中断跟不上：第 2 列是 backlog 丢包，第 3 列是预算用尽
+cat /proc/net/softnet_stat
+
+# 3. 应用读得慢：Recv-Q 持续堆积
+ss -tim | grep -A1 ':8080'
+```
+
+<Callout type="trap" title="Recv-Q 高的时候优化网络是徒劳">
+`Recv-Q` 堆积意味着数据早就到了本机，是应用没来取。这种"网络慢"的报障里，
+真正该改的是应用的处理逻辑或线程模型。先看这个计数器，能省下大量白干的时间。
+</Callout>
+
+### 硬中断只是"敲门"
+
+一个常见误解是"网卡收一个包就中断一次 CPU"。实际上：
+
+- **硬中断**只负责登记"有活儿了"，几乎不干活
+- 真正的取包在 **NET_RX 软中断**里批量完成，这就是 NAPI
+- 中断合并（coalescing）会攒一批再敲门，用一点延迟换大幅下降的 CPU 开销
+
+所以看到某个核 `%soft` 跑到 100%、其它核闲着，不是"网络忙"，是**中断亲和性没配好**，
+包全散到了一个核上。
+
+```bash
+cat /proc/interrupts | grep -i mlx   # 中断落在哪些 CPU 上
+mpstat -P ALL 1                      # 看 %soft 的分布
+ethtool -c bond0                     # 当前的中断合并参数
+```
+
+## 自己走一遍
+
+下面把两个方向的路径都放进来。点开每一跳，看它干了什么、用什么命令看、典型怎么坏。
+
+<PacketPathExplorer only={["host-tx", "host-rx"]} />
+
+## 检查点
+
+<Quiz
+  id="pj-1"
+  question="应用调用 send() 后返回 EAGAIN，最直接说明什么？"
+  options={[
+    { text: 'socket 发送缓冲区已满，数据还没能交出去', correct: true },
+    { text: '网线断了', feedback: '链路断开会体现在 ip link 的状态和 dmesg 里，不是 EAGAIN。' },
+    { text: '对端进程崩溃了', feedback: '对端崩溃会收到 RST，表现为 ECONNRESET。' },
+    { text: '本机 CPU 不够用', feedback: 'CPU 不足会拖慢整体吞吐，但不会直接触发这个返回值。' },
+  ]}
+  explain={<>EAGAIN 在非阻塞 socket 上就是「现在写不进去」。下一步该看 <code>ss -tim</code> 的 Send-Q 与 cwnd，判断是被对端窗口卡住还是路径在丢包。</>}
+/>
+
+<Quiz
+  id="pj-2"
+  question="ethtool -S 里 rx_missed_errors 持续增长，最合理的解释是？"
+  options={[
+    { text: 'CPU 回收 rx 描述符的速度跟不上收包速度，网卡无处可放只能丢', correct: true },
+    { text: '对端发的包校验和错了', feedback: '校验错误有独立的 rx_crc_errors 计数。' },
+    { text: '应用没有调用 read()', feedback: '应用不读会堆在 socket 缓冲区，表现为 Recv-Q 高，不是网卡丢。' },
+    { text: '交换机端口配置错误', feedback: '那会表现为链路协商速率异常或端口错误计数。' },
+  ]}
+  explain={<>这是典型的收方向背压：可以加大 ring（<code>ethtool -G</code>）、把中断散到更多核（RSS/RPS），或者降低单核负载。注意加大 ring 只是把缓冲拉深，处理能力不足的话仍然会丢。</>}
+/>
+
+<Quiz
+  id="pj-3"
+  question="下面哪些排队点在发送方向上会主动丢包？（多选）"
+  options={[
+    { text: 'qdisc 排队规则', correct: true },
+    { text: '驱动 tx ring', correct: true },
+    { text: 'socket 接收缓冲区', feedback: '这是收方向的队列，不在发送路径上。' },
+    { text: 'NAPI 软中断 backlog', feedback: '这也是收方向的环节。' },
+  ]}
+  explain={<>发送路径的四个排队点：sndbuf（阻塞而非丢）、qdisc（丢并计数）、tx ring（丢并计数）、物理线速（排队）。收方向的 rcvbuf 与 backlog 属于另一条路径，混在一起找会绕远路。</>}
+/>
+
+## 这节课的落点
+
+- 排障的第一动作不是猜，是**在路径上定位**：发送有四个排队点，接收有四个环节
+- 发送方向看 `Send-Q`、`tc -s qdisc`、`ethtool -S` 的 tx 计数
+- 接收方向看 `ethtool -S` 的 rx_missed、`/proc/net/softnet_stat`、`Recv-Q`
+- 硬中断只登记，实际取包在软中断里做（NAPI）；单核 `%soft` 打满是亲和性问题
+- `Recv-Q` 堆积说明该优化应用，不是优化网络

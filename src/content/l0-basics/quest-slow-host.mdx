@@ -1,0 +1,283 @@
+## 接手
+
+工单原文只有一句：
+
+> 我们的服务部署在 `10.10.1.103` 上，最近**偶发超时**，客户端重试就好了。运维说网络没问题，ping 都是通的。
+
+你现在 ssh 到了这台机器上。已知信息：
+
+- 业务是高并发短请求（大量小包），单机 QPS 约 15 万
+- 网卡是 25GbE，监控上带宽利用率只有 30% 左右
+- 客户端在 `10.10.0.51`
+
+<Callout type="tip" title="怎么玩">
+在下面的终端里按 L0 学过的顺序敲命令。输入 <code>goals</code> 看目标，
+<code>hint</code> 要提示，<code>↑↓</code> 翻历史。四个目标全部达成就算过关。
+
+别急着抓包 —— 前三层的计数器足够定位这个问题。
+</Callout>
+
+<Terminal
+  id="slow-host-quest"
+  host="root@k8s-work-103"
+  intro={`Last login: Mon Aug 17 09:12:44 from 10.10.0.51
+业务偶发超时，带宽利用率仅 30%。按分层顺序开始排查。`}
+  commands={[
+    {
+      cmd: 'ethtool bond0',
+      goal: '确认链路速率协商与状态正常',
+      hint: '第一层永远是接口与链路：速率协商错了，后面全都白查',
+      aliases: ['ethtool bond0 | grep Speed'],
+      output: `Settings for bond0:
+	Supported ports: [ ]
+	Supported link modes:   Not reported
+	Speed: 25000Mb/s
+	Duplex: Full
+	Auto-negotiation: off
+	Port: Other
+	Link detected: yes`,
+    },
+    {
+      cmd: 'ip -s link show bond0',
+      output: `6: bond0: BROADCAST,MULTICAST,MASTER,UP,LOWER_UP mtu 9000 qdisc noqueue state UP mode DEFAULT group default qlen 1000
+    link/ether b8:ce:f6:2a:1c:40 brd ff:ff:ff:ff:ff:ff
+    RX:            bytes        packets errors dropped  missed   mcast
+           9182734512334     7623418899      0  418223  418223  120934
+    TX:            bytes        packets errors dropped carrier collsns
+           4123998812340     3011234871      0       0       0       0`,
+    },
+    {
+      cmd: 'ping -c 5 10.10.0.51',
+      output: `PING 10.10.0.51 (10.10.0.51) 56(84) bytes of data.
+64 bytes from 10.10.0.51: icmp_seq=1 ttl=63 time=0.118 ms
+64 bytes from 10.10.0.51: icmp_seq=2 ttl=63 time=0.104 ms
+64 bytes from 10.10.0.51: icmp_seq=3 ttl=63 time=0.121 ms
+64 bytes from 10.10.0.51: icmp_seq=4 ttl=63 time=0.109 ms
+64 bytes from 10.10.0.51: icmp_seq=5 ttl=63 time=0.113 ms
+
+--- 10.10.0.51 ping statistics ---
+5 packets transmitted, 5 received, 0% packet loss, time 4081ms
+rtt min/avg/max/mdev = 0.104/0.113/0.121/0.006 ms
+
+# ping 用的是低速小流量，它通不代表高负载下不丢包。`,
+    },
+    {
+      cmd: 'ethtool -S bond0',
+      goal: '定位丢包发生在哪一层：网卡收方向还是别处',
+      hint: '网卡自己的计数器最诚实，重点看 missed / no_buffer / crc 三类',
+      aliases: [
+        'ethtool -S bond0 | grep -i drop',
+        'ethtool -S bond0 | grep -iE "err|drop|missed"',
+      ],
+      output: `NIC statistics:
+     rx_packets: 7623418899
+     rx_bytes: 9182734512334
+     tx_packets: 3011234871
+     tx_bytes: 4123998812340
+     rx_crc_errors: 0
+     rx_frame_errors: 0
+     rx_length_errors: 0
+     rx_missed_errors: 418223
+     rx_no_buffer_count: 402118
+     rx_out_of_buffer: 418223
+     tx_dropped: 0
+     tx_errors: 0
+     rx_pause_ctrl_phy: 0
+     tx_pause_ctrl_phy: 0
+
+# crc / frame 全 0 → 不是物理层问题。
+# rx_missed / rx_no_buffer 在涨 → 网卡想放包，但 ring 里没有空描述符。`,
+    },
+    {
+      cmd: 'tc -s qdisc show dev bond0',
+      output: `qdisc noqueue 0: root refcnt 2
+ Sent 4123998812340 bytes 3011234871 pkt (dropped 0, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+
+# 发送侧一个都没丢，问题在收方向。`,
+    },
+    {
+      cmd: 'cat /proc/net/softnet_stat',
+      goal: '确认软中断侧是否也在丢包 / 预算耗尽',
+      hint: '第 2 列是 backlog 丢包，第 3 列是 time_squeeze（一次轮询预算用尽）',
+      output: `1f8a2b41 000660ef 00013c9a 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+00000112 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+0000009e 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+000000c4 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+0000008a 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+000000b1 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+
+# 第 1 行 = CPU0：processed 0x1f8a2b41，dropped 0x660ef ≈ 41.7 万，squeezed 0x13c9a ≈ 8.1 万。
+# 其余 CPU 几乎没处理过包 —— 收包全压在一个核上。`,
+    },
+    {
+      cmd: 'mpstat -P ALL 1 1',
+      output: `Linux 5.15.0  (k8s-work-103)  08/17/26  _x86_64_  (64 CPU)
+
+09:14:02  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %idle
+09:14:03  all    12.40    0.00    6.31    0.02    0.14    1.58   79.55
+09:14:03    0     0.99    0.00    1.98    0.00    0.99   96.04    0.00
+09:14:03    1    13.86    0.00    6.93    0.00    0.00    0.00   79.21
+09:14:03    2    12.75    0.00    7.84    0.00    0.00    0.00   79.41
+09:14:03    3    14.00    0.00    6.00    0.00    0.00    0.00   80.00
+
+# CPU0 的 %soft 96%，其它核 0 —— 单核已经饱和。`,
+    },
+    {
+      cmd: 'cat /proc/interrupts | grep mlx',
+      output: ` 142:  2418773341    0    0    0    0    0    0    0  IR-PCI-MSI 1572864-edge  mlx5_comp0@pci:0000:31:00.0
+ 143:           0    0    0    0    0    0    0    0  IR-PCI-MSI 1572865-edge  mlx5_async0@pci:0000:31:00.0
+
+# 只有一个 comp 队列，且中断全部落在 CPU0。`,
+    },
+    {
+      cmd: 'ethtool -l bond0',
+      goal: '找出根因：网卡的多队列到底开了几个',
+      hint: '硬件支持多少个队列，当前实际用了多少个？',
+      aliases: ['ethtool -l ens1f0'],
+      output: `Channel parameters for bond0:
+Pre-set maximums:
+RX:		n/a
+TX:		n/a
+Other:		n/a
+Combined:	63
+Current hardware settings:
+RX:		n/a
+TX:		n/a
+Other:		n/a
+Combined:	1
+
+# 硬件支持 63 个队列，当前只启用了 1 个。
+# RSS 无法把流量散到多核，所有收包中断和软中断都堆在 CPU0。`,
+    },
+    {
+      cmd: 'ethtool -g bond0',
+      output: `Ring parameters for bond0:
+Pre-set maximums:
+RX:		8192
+TX:		8192
+Current hardware settings:
+RX:		1024
+TX:		1024`,
+    },
+    {
+      cmd: 'nstat',
+      output: `#kernel
+IpInReceives                    7623418899         0.0
+TcpInSegs                       7418223401         0.0
+TcpOutSegs                      3011234871         0.0
+TcpRetransSegs                     8912344         0.0
+TcpExtListenOverflows                    0         0.0
+TcpExtTCPTimeouts                   412887         0.0
+TcpExtTCPLostRetransmit              23441         0.0
+
+# 重传 891 万 / 发出 30 亿 ≈ 0.3%，已超过 0.1% 警戒线。
+# TCPTimeouts 41 万次 —— 每次至少 200ms，正好对上"偶发超时"。`,
+    },
+    {
+      cmd: 'iperf3 -c 10.10.0.51 -t 5',
+      output: `Connecting to host 10.10.0.51, port 5201
+[  5] local 10.10.1.103 port 51422 connected to 10.10.0.51 port 5201
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-5.00   sec  13.1 GBytes  22.4 Gbits/sec  118
+
+# 大块流能跑到 22.4 Gbps，接近线速 —— 带宽本身没问题。
+# 这也解释了为什么监控看着"利用率只有 30%"却在丢包：业务是小包，瓶颈是 PPS 不是带宽。`,
+    },
+    {
+      cmd: 'dmesg | tail',
+      output: `[3921882.113] bond0: (slave ens1f0): link status definitely up, 25000 Mbps full duplex
+[3921882.114] bond0: active interface up!
+
+# 没有网卡复位、没有 tx timeout。`,
+    },
+  ]}
+/>
+
+## 结论应该长什么样
+
+四个目标走完，证据链是这样的：
+
+| 证据 | 排除了什么 |
+| --- | --- |
+| `Speed: 25000Mb/s`、`Link detected: yes` | 排除速率协商与链路故障 |
+| `rx_crc_errors: 0`、`rx_frame_errors: 0` | 排除光模块、光纤、端口的物理问题 |
+| `tc -s qdisc` 发送侧 dropped 0 | 排除发送方向 |
+| `rx_missed_errors` / `rx_no_buffer_count` 在涨 | 确认丢在**收方向、网卡 ring 层** |
+| `softnet_stat` 第 1 行 dropped 与 squeezed 都在涨，其余行为 0 | 确认**收包全压在 CPU0** |
+| `ethtool -l` 显示 `Combined: 1`（硬件支持 63） | **根因**：只启用了 1 个队列，RSS 散不开 |
+| `iperf3` 大流能跑 22.4 Gbps | 印证带宽不是瓶颈，PPS 才是 |
+
+**根因**：网卡多队列只启用了 1 个，所有收包中断与软中断集中在 CPU0，
+该核 `%soft` 饱和后来不及回收 rx 描述符，网卡开始丢包，触发大量 TCP 超时重传，
+业务侧表现为"偶发超时"。
+
+**修法**（按顺序验证，不要一次改一堆）：
+
+```bash
+# 1. 把队列数打开到与 CPU 数匹配（先取 16，别一上来就 63）
+ethtool -L bond0 combined 16
+
+# 2. 确认中断散到多个 CPU 上了
+cat /proc/interrupts | grep mlx5_comp | head
+
+# 3. ring 偏浅，配合调深一档
+ethtool -G bond0 rx 4096
+
+# 4. 观察 15 分钟，确认这两个计数不再增长
+watch -n5 "ethtool -S bond0 | grep -E 'rx_missed|rx_no_buffer'"
+```
+
+<Callout type="trap" title="为什么「ping 是通的」这句话没有意义">
+ping 每秒发几个包、每个包几十字节。这台机器的问题只在**每秒十几万个小包**的负载下才出现。
+低速探测通过，完全不能说明高负载下不丢包。
+
+同理，"带宽利用率只有 30%" 也是误导 —— 小包场景的瓶颈是 PPS 和单核软中断能力，
+带宽图表上永远看不出来。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="qsh-1"
+  question="rx_missed_errors 在涨、而 rx_crc_errors 为 0，这组合说明什么？"
+  options={[
+    { text: '包收到了但主机侧来不及处理，不是物理层问题', correct: true },
+    { text: '光模块或光纤有问题', feedback: '那会体现在 crc / frame 错误上，这里是 0。' },
+    { text: '对端发送速率超过了链路带宽', feedback: '超过线速会在交换机侧排队或丢，不会记成本机的 missed。' },
+    { text: 'MTU 不匹配', feedback: 'MTU 问题通常表现为大包不通或 length_errors。' },
+  ]}
+  explain={<>missed / no_buffer 的含义是「网卡想 DMA，但 ring 里没有空描述符」，根因在 CPU 侧回收太慢：队列太少、中断亲和性差、单核饱和，或者 ring 太浅。</>}
+/>
+
+<Quiz
+  id="qsh-2"
+  question="/proc/net/softnet_stat 第一行的 dropped 和 time_squeeze 都在涨，其余行全是 0。下一步最该查什么？"
+  options={[
+    { text: '网卡启用了几个队列，中断落在哪些 CPU 上', correct: true },
+    { text: '交换机端口的错误计数', feedback: '本机内部的软中断分布问题，与交换机无关。' },
+    { text: '应用的线程数', feedback: '软中断丢包发生在应用之前，调应用不解决。' },
+    { text: 'TCP 拥塞控制算法', feedback: '换算法不会改变收包只用一个核这件事。' },
+  ]}
+  explain={<>只有第一行有数字 = 收包全在 CPU0。接着就该看 <code>ethtool -l</code>（队列数）和 <code>/proc/interrupts</code>（中断分布），这两条能直接指向根因。</>}
+/>
+
+<Quiz
+  id="qsh-3"
+  question="这次故障里，下面哪些「正常指标」实际上具有误导性？（多选）"
+  options={[
+    { text: 'ping 全通且 RTT 很低', correct: true },
+    { text: '带宽利用率只有 30%', correct: true },
+    { text: 'iperf3 单流能跑到 22.4 Gbps', correct: true },
+    { text: 'rx_missed_errors 有 41 万', feedback: '这个不是误导，它正是关键证据。' },
+  ]}
+  explain={<>三个「正常」指标都建立在大包或低速探测上，而故障只在高 PPS 的小包负载下出现。这也是为什么监控看板上一切正常、业务却在超时 —— 看板缺的是 PPS 和 softnet 丢包这两条曲线。</>}
+/>
+
+## 这一关的落点
+
+- 分层收敛：链路 → 网卡计数 → 软中断 → 协议栈，每一步都在**排除**而不是猜测
+- `rx_missed` + `crc 为 0` = 主机侧跟不上，不是物理层
+- `softnet_stat` 只有第一行有数 = 收包挤在一个核上
+- `ethtool -l` 是这类问题的收官命令：硬件支持多队列，但没启用
+- ping 通、带宽利用率低、iperf3 跑满，这三件事都**不能**证明网络健康

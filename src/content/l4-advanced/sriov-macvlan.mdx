@@ -1,0 +1,227 @@
+## 为什么要绕开默认 CNI
+
+默认 CNI 给 Pod 的那张网卡走的是软件转发路径：veth → 宿主机数据平面 → 物理网卡。
+对绝大多数业务，这条路径的开销完全可以忽略。
+
+但两类场景不行：
+
+- **RDMA / AI 训练**：需要 Pod 直接使用物理网卡的 RDMA 能力，软件转发路径帮不上忙
+- **虚拟机（KubeVirt）**：虚机需要二层网络语义，要能自己收发任意 MAC 的帧
+
+这时候的做法是**给 Pod 插第二张网卡**：业务流量走默认 CNI，高性能流量走这张直连物理网的卡。
+三种实现方式，从软到硬。
+
+## MacVLAN：一张卡，多个 MAC
+
+在一张物理网卡上派生出多个虚拟接口，**每个都有自己独立的 MAC 地址**，直接挂在物理二层网络上。
+
+```
+        物理网卡 bond0（MAC: aa:bb:cc:00:00:01）
+                │
+    ┌───────────┼───────────┐
+ macvlan1    macvlan2    macvlan3
+ MAC:...:11   MAC:...:12  MAC:...:13
+ (Pod A)      (Pod B)     (Pod C)
+```
+
+**优点**：配置简单，性能接近物理网卡（不过宿主机协议栈的转发路径），Pod 有真实的物理网 IP。
+
+**代价与限制**：
+
+- 交换机端口必须允许一个端口上出现多个 MAC（多数交换机默认允许，但有 MAC 数量上限，
+  开了端口安全策略的会直接拦掉）
+- **同一张物理卡上的 macvlan 子接口默认无法与宿主机自身通信**（bridge 模式下子接口之间可以互通，
+  但和 master 接口之间不行）
+- 需要一个能管的 IP 池：Pod 的 IP 来自物理网段，得有人负责分配和回收
+
+k8s-in-action 里的实际配法（配合 NVIDIA 的 nv-ipam）：
+
+```yaml
+apiVersion: mellanox.com/v1alpha1
+kind: MacvlanNetwork
+metadata:
+  name: hca
+  namespace: network-operator
+spec:
+  networkNamespace: "default"
+  master: "bond0"          # 派生自哪张物理卡
+  mode: "bridge"
+  mtu: 1500
+  ipam: |
+    {
+      "type": "nv-ipam",
+      "poolName": "hca"
+    }
+---
+apiVersion: nv-ipam.nvidia.com/v1alpha1
+kind: IPPool
+metadata:
+  name: hca
+  namespace: network-operator
+spec:
+  subnet: 192.168.0.0/20
+  perNodeBlockSize: 8      # 每节点先领 8 个地址
+  gateway: 192.168.0.1
+```
+
+Pod 侧用注解申请这张网卡：
+
+```yaml
+metadata:
+  annotations:
+    k8s.v1.cni.cncf.io/networks: network-operator/hca
+spec:
+  containers:
+    - name: app
+      resources:
+        limits:
+          rdma/hca: 1      # 同时申请 RDMA 设备
+```
+
+<Callout type="warn" title="MacVLAN 场景要留意 perNodeBlockSize">
+每个节点从 IP 池里领一整块地址（例子里是 8 个）。这意味着：
+**单节点上用这张网的 Pod 数不能超过块大小**，超了就分不到 IP。
+同时整个池子的容量也限制了节点数 × 块大小。和 Pod CIDR 一样，这是个一次性决定，
+规划时要按未来的并发任务数算，不要按当前用量算。
+</Callout>
+
+## IPvlan：共用 MAC，只分 IP
+
+和 MacVLAN 几乎一样，唯一区别是**所有子接口共用物理网卡的 MAC**，只有 IP 不同。
+
+什么时候用它：
+
+- 交换机开了端口安全，**限制一个端口只能有一个 MAC**
+- 云环境限制了每个网卡的 MAC 数量
+- 无线网络场景（一个 MAC 一个关联）
+
+代价是二层功能受限：既然共用 MAC，就没法做基于 MAC 的隔离，某些需要独立二层身份的应用会不适应。
+
+## SR-IOV：硬件级切分
+
+前两种是内核软件派生。SR-IOV 是**网卡硬件自己把自己切成多个设备**：
+
+| 概念 | 全称 | 是什么 |
+| --- | --- | --- |
+| **PF** | Physical Function | 物理功能，就是那张卡本体 |
+| **VF** | Virtual Function | 虚拟功能，硬件切出来的"小网卡"，可以直通进容器或虚机 |
+
+```bash
+# 看这张卡支持多少个 VF，当前开了几个
+cat /sys/class/net/ens1f0/device/sriov_totalvfs
+cat /sys/class/net/ens1f0/device/sriov_numvfs
+
+# 开启 8 个 VF（重启失效，要写进启动配置）
+echo 8 > /sys/class/net/ens1f0/device/sriov_numvfs
+```
+
+**优点**：性能最好——VF 在硬件层面就是独立设备，数据路径完全不经过宿主机的软件转发，
+延迟和带宽几乎等于独占物理卡。
+
+**代价**：
+
+- **VF 数量由硬件写死**，通常几十到一百多个，用完就没了
+- **改 VF 数量要重置网卡**，多数情况下需要重启节点或至少中断链路
+- Pod 迁移麻烦：VF 是绑定到具体节点具体网卡的，不像软件方案那样自由
+- 需要 BIOS 里开 SR-IOV、开 IOMMU/VT-d
+
+## 三者对比
+
+| 维度 | MacVLAN | IPvlan | SR-IOV |
+| --- | --- | --- | --- |
+| 性能 | 好 | 好 | **最好** |
+| 隔离 | 独立 MAC | 共用 MAC | **硬件级** |
+| 数量上限 | 受交换机 MAC 表限制 | 宽松 | **受硬件 VF 数限制** |
+| 配置复杂度 | 低 | 低 | 高（BIOS + 驱动 + 插件） |
+| 交换机要求 | 允许多 MAC | 无特殊要求 | 无特殊要求 |
+| 适合 | RoCE、需要隔离多任务 | 交换机限制 MAC 的环境 | 极致性能、虚机直通 |
+
+## 和 RDMA 的组合：两种模式
+
+跑 RDMA 时有两条常见路线，取舍很实际：
+
+| | hostNetwork | MacVLAN |
+| --- | --- | --- |
+| 配置 | `hostNetwork: true` + `rdma/hca: 1` | 注解申请网卡 + `rdma/hca: 1` |
+| 额外组件 | **不需要** | 需要 Multus/Spiderpool + IP 池 |
+| Pod IP | 就是宿主机 IP | 独立 IP |
+| 单节点并行多任务 | **不行**（端口冲突） | 可以 |
+| 适合 | 单任务独占整机的训练 | 多任务共享集群 |
+
+两条关键规则记牢：
+
+- **RoCE 用 hostNetwork 模式时必须设 `hostNetwork: true`**，让宿主机网卡进入 Pod 的网络命名空间——
+  因为 RoCE 需要用宿主机 IP 来建链
+- **纯 IB 场景**通常只申请 `rdma/hca: 1` 就够了，不必动网络配置
+
+```yaml
+# RoCE + hostNetwork
+spec:
+  hostNetwork: true
+  containers:
+    - name: trainer
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+          rdma/hca: 1
+      securityContext:
+        capabilities:
+          add: ["IPC_LOCK"]
+```
+
+<Callout type="trap" title="hostNetwork 下同节点跑两个任务会端口冲突">
+`hostNetwork: true` 意味着 Pod 直接用宿主机的端口空间。NCCL、sshd（MPI 启动器要用）
+这些都要监听固定端口，同一节点上起第二个任务时**端口直接撞车**，
+症状是第二个任务的 Pod 一直 CrashLoopBackOff 或 sshd 起不来。
+
+这就是共享集群里要上 MacVLAN 的实际理由：给每个任务一套独立 IP 和端口空间。
+单任务独占整机时，hostNetwork 更省事。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="sm-1"
+  question="交换机开了端口安全，限制每个端口只允许一个 MAC 地址。这时候该选哪种方案给 Pod 接入物理网？"
+  options={[
+    { text: 'IPvlan —— 所有子接口共用物理网卡的 MAC，只分配不同 IP', correct: true },
+    { text: 'MacVLAN', feedback: 'MacVLAN 每个子接口一个独立 MAC，会被端口安全策略拦掉。' },
+    { text: '默认 CNI 的 overlay 模式', feedback: '那就没有直连物理网了，回到了软件转发路径。' },
+    { text: 'hostNetwork', feedback: '可以绕过限制，但 Pod 就没有独立 IP 了，同节点多任务会端口冲突。' },
+  ]}
+  explain={<>这正是 IPvlan 存在的意义：牺牲独立二层身份，换取在限制 MAC 数量的环境里也能给 Pod 分配物理网 IP。</>}
+/>
+
+<Quiz
+  id="sm-2"
+  question="共享的 GPU 集群里，同一个节点上要能同时跑多个训练任务。RDMA 该怎么接？"
+  options={[
+    { text: '用 MacVLAN 给每个任务的 Pod 独立 IP，避免端口空间冲突', correct: true },
+    { text: '统一用 hostNetwork: true，简单可靠', feedback: 'hostNetwork 共享宿主机端口空间，同节点第二个任务会端口冲突。' },
+    { text: '关掉 RDMA 走 TCP', feedback: '那就放弃了性能，不是解决办法。' },
+    { text: '给每个任务分配不同的 GPU 就够了', feedback: 'GPU 隔离了，但网络端口空间仍然是共享的。' },
+  ]}
+  explain={<>hostNetwork 省事但独占端口空间，适合单任务独占整机；共享集群应上 Multus/Spiderpool + MacVLAN，给每个 Pod 一套独立 IP。代价是要维护 IP 池。</>}
+/>
+
+<Quiz
+  id="sm-3"
+  question="关于 SR-IOV，下面哪些说法正确？（多选）"
+  options={[
+    { text: 'VF 是硬件切出来的独立设备，数据路径不经过宿主机软件转发', correct: true },
+    { text: 'VF 的数量上限由网卡硬件决定，用完就没有了', correct: true },
+    { text: '修改 VF 数量通常需要重置网卡甚至重启节点', correct: true },
+    { text: '开启 SR-IOV 不需要改 BIOS 设置', feedback: '通常要在 BIOS 里开 SR-IOV 和 IOMMU/VT-d。' },
+  ]}
+  explain={<>SR-IOV 性能最好，代价是灵活性：数量受硬件限制、调整要中断、Pod 与具体节点网卡绑定。所以它更适合固定用途的高性能场景，而不是弹性调度的通用负载。</>}
+/>
+
+## 这节课的落点
+
+- 默认 CNI 够用，只有 RDMA/AI 与虚拟机两类场景需要 Pod 直连物理网
+- MacVLAN：独立 MAC，配置简单；要求交换机允许多 MAC，注意 `perNodeBlockSize` 的容量账
+- IPvlan：共用 MAC，专为限制 MAC 数量的环境准备
+- SR-IOV：硬件切分，性能最好，但 VF 数量写死、调整要重置、与节点绑定
+- RoCE + hostNetwork 必须设 `hostNetwork: true`；纯 IB 只申请 `rdma/hca` 即可
+- hostNetwork 简单但同节点跑不了第二个任务；共享集群用 MacVLAN 换独立端口空间
+- 容器里做 RDMA 别忘了 `IPC_LOCK`

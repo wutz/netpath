@@ -1,0 +1,222 @@
+## 一个统一的心智模型
+
+gost 的参数看着杂，其实只有四个角色，而且是对称的：
+
+```
+        入口侧                              出口侧
+   ┌──────────────────┐            ┌──────────────────┐
+   │ Listener  收连接 │            │ Dialer    建连接 │
+   │ Handler   懂协议 │  ────────► │ Connector 懂协议 │
+   └──────────────────┘            └──────────────────┘
+        由 -L 定义                      由 -F 定义
+```
+
+- **Listener / Dialer** 管**传输**：裸 TCP、TLS、WebSocket、gRPC、QUIC、KCP……
+- **Handler / Connector** 管**协议**：HTTP、SOCKS5、Relay、SS……
+- **`-L`** 起一个服务（我在这儿收），**`-F`** 指定下一跳（我从那儿出去）
+- 多个 `-F` 串起来就是**转发链**（chain），按参数出现顺序逐跳走
+
+理解这四个角色之后，gost 的能力就变成一道组合题：**任意协议 × 任意传输 × 任意跳数**。
+
+## 起一个代理服务：-L
+
+```bash
+# HTTP 代理
+gost -L http://:8080
+
+# 两个服务同时起：HTTP 8080 + SOCKS5 1080
+gost -L http://:8080 -L socks5://:1080
+
+# 省略协议名 = auto，同一个端口自动识别 HTTP / SOCKS4 / SOCKS5
+gost -L :8080
+```
+
+最后那个 `auto` 很实用：**一个端口同时伺候三种协议**，相当于 Clash 里的 `mixed-port`，
+客户端配 HTTP 还是 SOCKS5 都能用。
+
+认证信息写在 URL 的 userinfo 部分：
+
+```bash
+gost -L "http://user:pass@:8080"
+```
+
+<Callout type="note" title="URL 就是配置">
+gost 的每个 `-L` / `-F` 都是一个完整 URL：`协议+传输://用户:密码@地址:端口?参数=值`。
+协议特有的开关都走 query 参数，比如后面会用到的 `bypass=`。
+参数清单按协议不同，查官方的 listener / handler 参考页最快。
+
+命令行适合临时验证；长期跑的服务建议转成 YAML 配置文件（gost 支持把等价的 YAML 打印出来）。
+</Callout>
+
+## 串成转发链：-F
+
+```bash
+# 本地 8080 收，经 192.168.1.1:8080 这个上游代理出去
+gost -L http://:8080 -F http://192.168.1.1:8080
+
+# 两跳：先 HTTP 代理，再 SOCKS5 代理，最终从 192.168.1.2 出网
+gost -L :8080 -F http://192.168.1.1:8080 -F socks5://192.168.1.2:1080
+```
+
+**`-F` 的顺序就是流量经过的顺序**，最后一个 `-F` 是真正的出口。这是 ssh 隧道做不到的：
+`ssh -J` 只能串 SSH，gost 能把不同协议混在一条链上。
+
+## 端口转发
+
+语法是在监听地址后面直接跟目标：`协议://:本地端口/目标:端口`
+
+```bash
+# TCP：本地 8080 → 192.168.1.1:80
+gost -L tcp://:8080/192.168.1.1:80
+
+# UDP：本地 10053 → 192.168.1.1:53（DNS 转发）
+gost -L udp://:10053/192.168.1.1:53
+
+# 经转发链做端口转发
+gost -L=tcp://:8080/192.168.1.1:80 -F socks5://192.168.1.2:1080
+```
+
+对照 SSH：`gost -L tcp://:8080/目标:80` ≈ `ssh -L 8080:目标:80`，
+但 gost 这条**多了 UDP 支持**——这是 SSH 端口转发的硬缺口。
+
+## 反向转发：内网穿透
+
+`rtcp` / `rudp` 把监听端口开在**链路对端**，等于 `ssh -R`，但不需要对端开 `GatewayPorts`：
+
+```bash
+# 在内网机器上执行：把本机 22 端口暴露到 192.168.1.2 的 2222 上
+gost -L=rtcp://:2222/:22 -F socks5://192.168.1.2:1080
+```
+
+流量方向：外面的人连 `192.168.1.2:2222` → 经隧道回到内网机器 → 落到它的 `:22`。
+
+<Callout type="tip" title="什么时候该从 ssh 换到 gost">
+| 场景 | 用什么 |
+| --- | --- |
+| 临时看一眼远端服务、手上只有 ssh | `ssh -L` |
+| 一次性 SOCKS5 代理 | `ssh -D` |
+| **需要转发 UDP** | **gost**（ssh 不支持） |
+| **要长期挂着的内网穿透** | **gost** rtcp（不依赖 GatewayPorts，重连逻辑更完善） |
+| **要串多种协议的多级链** | **gost** `-F` |
+| **要换传输层伪装成 HTTPS 流量** | **gost** wss / mwss / h2 |
+| **要按域名分流** | **gost** bypass |
+
+一句话：**ssh 是随手就有，gost 是专门为此而生。** 临时排障用 ssh，长期服务用 gost。
+</Callout>
+
+## 换传输层
+
+同一个协议可以跑在不同传输之上，这是 gost 最有价值的能力之一。写法是 `协议+传输`：
+
+| 写法 | 含义 | 适用 |
+| --- | --- | --- |
+| `http://` | 裸 HTTP | 内网，无需伪装 |
+| `http+tls://` / `https://` | HTTP over TLS | 需要加密 |
+| `relay+wss://` | Relay over WebSocket over TLS | 要穿过只放 HTTP(S) 的网络 |
+| `relay+mwss://` | 同上，**多路复用** | 要经 CDN 前置（复用能显著降低握手开销） |
+| `http2://` / `grpc://` | HTTP/2 / gRPC | 长连接多路复用，特征自然 |
+| `kcp://` / `quic://` | UDP 基础上的可靠传输 | 高丢包链路 |
+
+选择依据很实际：**看你的网络放什么过去**。只放 443 的环境用 `wss`；
+需要经 CDN 就得用 WebSocket 系（CDN 只代理 HTTP 语义的流量）；
+链路丢包严重才考虑 `kcp`/`quic`。
+
+## 分流：bypass
+
+不是所有流量都该走隧道。`bypass` 让指定目标直连：
+
+```bash
+# 这些域名不走上游链路，直接本地出网
+gost -L :8080 -F "socks5://1.2.3.4:1080?bypass=*.cn,*.internal,10.0.0.0/8"
+
+# 反过来：只有匹配的才绕过（~ 前缀表示取反）
+gost -L :8080 -F "socks5://1.2.3.4:1080?bypass=~*.example.com"
+```
+
+企业内网场景里这个几乎必配：**内网域名和私网段必须直连**，
+否则请求绕一圈出去再回来，慢且经常失败——和上一节 `NO_PROXY` 是同一个道理，
+只是这次由代理自己判断。
+
+## 一个真实的服务端形态
+
+社区里流传较广的自建方案（见 [haoel 的科学上网笔记](https://github.com/haoel/haoel.github.io)）
+大致是这个形状：
+
+```bash
+# 服务端：HTTP/2 over TLS，用真实证书，带主动探测抵抗
+docker run -d --name gost --restart=always --net=host \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  gogost/gost \
+  -L "http2://user:pass@:443?cert=/etc/letsencrypt/live/example.com/fullchain.pem\
+&key=/etc/letsencrypt/live/example.com/privkey.pem&probe_resist=file:/var/www/index.html"
+```
+
+```bash
+# 客户端：本地 mixed 端口，转发到服务端
+gost -L :1080 -F "http2://user:pass@example.com:443"
+```
+
+三个要点：
+
+- **用真实域名和真实证书**（Let's Encrypt + certbot 自动续期），别用自签
+- **`probe_resist`** 决定"别人直接用浏览器访问这个端口时看到什么"——
+  返回一个正常网页比返回错误更不引人注意，这属于下一节流量特征的话题
+- 服务端顺手把 **BBR** 打开（`net.ipv4.tcp_congestion_control=bbr`），
+  长肥链路上的收益很直接（L0 讲过原因）
+
+<Callout type="warn" title="别把认证省了">
+`-L http://:8080` 不带认证，就是一个**开放代理**。挂在公网上几小时内就会被扫到并滥用，
+你的 IP 会被拿去发垃圾邮件、扫端口，最后账号被云厂商封禁。
+
+三条底线：加认证、只监听需要的地址、用安全组把端口收到必要来源。
+临时测试也别偷懒——`gost -L socks5://:1080` 绑的是 `0.0.0.0`。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="gt-1"
+  question="gost -L :8080 -F http://A:8080 -F socks5://B:1080 这条命令，流量最终从哪台机器出网？"
+  options={[
+    { text: 'B —— 最后一个 -F 是真正的出口', correct: true },
+    { text: 'A —— 第一个 -F 优先', feedback: '-F 是按顺序逐跳，A 只是第一跳。' },
+    { text: '本机 —— -F 只是备用', feedback: '-F 指定的是必经的下一跳，不是备用。' },
+    { text: '随机选一个做负载均衡', feedback: '负载均衡要在同一个 hop 里配多个节点，多个 -F 是串联不是并联。' },
+  ]}
+  explain={<>多个 -F 构成转发链，按参数出现顺序串联：本机 → A → B → 目标。这也是它比 ssh -J 更灵活的地方 —— 每一跳可以是不同协议。</>}
+/>
+
+<Quiz
+  id="gt-2"
+  question="需要把内网一台机器的 UDP 服务（比如 DNS）转发给外部访问，长期挂着。用什么？"
+  options={[
+    { text: 'gost 的 rudp 反向转发', correct: true },
+    { text: 'ssh -R 远程转发', feedback: 'SSH 端口转发不支持 UDP，这是它的硬缺口。' },
+    { text: 'ssh -D 动态转发', feedback: '-D 提供 SOCKS5，虽然 SOCKS5 规范支持 UDP，但 OpenSSH 的实现不转发 UDP。' },
+    { text: 'ssh -L 本地转发', feedback: '方向不对，而且同样不支持 UDP。' },
+  ]}
+  explain={<>UDP 转发和长期挂着的内网穿透是 gost 相对 ssh 的两个主要优势。写法是 -L=rudp://:端口/:目标端口 配合 -F 指向对端。</>}
+/>
+
+<Quiz
+  id="gt-3"
+  question="在企业内网部署 gost 代理，为什么几乎一定要配 bypass？"
+  options={[
+    { text: '内网域名与私网段必须直连，绕出去再回来会变慢甚至失败', correct: true },
+    { text: '为了提升加密强度', feedback: 'bypass 是分流规则，与加密无关。' },
+    { text: '为了绕过认证', feedback: '它决定哪些目标不走上游链路，不影响认证。' },
+    { text: '为了支持 UDP', feedback: 'UDP 支持取决于协议与传输的选择。' },
+  ]}
+  explain={<>和 NO_PROXY 同一个道理：本该直连的地址被送进隧道，轻则慢，重则完全不通（上游根本解析不了内网域名）。区别是 bypass 由代理自己判断，不依赖每个客户端都配对。</>}
+/>
+
+## 这节课的落点
+
+- 四个角色：Listener/Dialer 管传输，Handler/Connector 管协议；`-L` 起服务，`-F` 指下一跳
+- `-L :8080` 的 auto 模式让一个端口同时支持 HTTP 与 SOCKS5
+- 多个 `-F` 按顺序串成转发链，**最后一个是出口**
+- 端口转发 `-L tcp://:8080/目标:80`，反向 `rtcp` / `rudp` 做内网穿透
+- gost 相对 ssh 的三个优势：**UDP 转发、长期穿透、多协议混合链 + 传输层可换**
+- 传输层按"网络放什么过去"选：只放 443 用 `wss`，经 CDN 必须 WebSocket 系
+- `bypass` 必配，内网域名与私网段一律直连
+- 公网上的代理一定要加认证，否则很快会被扫到滥用

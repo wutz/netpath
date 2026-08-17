@@ -1,0 +1,186 @@
+## 一条连接建立时的两个队列
+
+三次握手在内核里对应两个队列，它们满了的表现完全不同：
+
+| 队列 | 存什么 | 满了会怎样 | 怎么看 |
+| --- | --- | --- | --- |
+| **SYN 队列**（半连接） | 收到 SYN、还没完成握手 | 丢 SYN 或回 SYN cookie | `nstat -az \| grep -i listendrop` |
+| **accept 队列**（全连接） | 握手完成、等应用 `accept()` | 丢连接，客户端表现为超时 | `ss -lnt` 的 `Recv-Q` / `Send-Q` |
+
+```bash
+# LISTEN socket 上：Recv-Q = accept 队列当前积压，Send-Q = backlog 上限
+ss -lnt
+```
+
+```
+State   Recv-Q  Send-Q  Local Address:Port
+LISTEN  128     128     0.0.0.0:8080
+```
+
+`Recv-Q` 顶到 `Send-Q` 就是 accept 队列满了。**这不是网络问题，是应用 accept 得太慢**——
+调 `somaxconn` 只能缓冲更久，治不了根。
+
+<Callout type="trap" title="连接超时不等于网络不通">
+客户端 connect 超时，很多人第一反应是查网络。但 accept 队列满、SYN 队列满、
+conntrack 表满这三种情况，症状都是"连不上"而链路完全正常。
+先在服务端看 <code>ss -lnt</code> 和 <code>nstat</code>，比抓包快得多。
+</Callout>
+
+## 两个窗口，谁在限速
+
+发送方一次能放出去多少数据，取决于两个窗口的**较小值**：
+
+- **rwnd（接收窗口）** —— 对端说"我还能收这么多"。对端应用读得慢，它就缩小。
+- **cwnd（拥塞窗口）** —— 发送方自己判断"网络还能吃这么多"。丢包就砍半。
+
+```
+实际可发送量 = min(rwnd, cwnd) − 已发出未确认
+```
+
+这个式子决定了排障方向：
+
+| 现象 | 判断 | 该去哪查 |
+| --- | --- | --- |
+| cwnd 小，rwnd 大 | 网络在丢包，拥塞控制压着 | 查路径丢包、重传率 |
+| rwnd 小，cwnd 大 | 对端应用消费不过来 | 查对端 `Recv-Q` 和应用 |
+| 两个都大但发不快 | 应用没喂够数据，或受 BDP 限制 | 查应用逻辑、并发数 |
+
+```bash
+# 一条连接的真实状态：cwnd、rtt、重传、发送速率全在这
+ss -tim dst 10.10.1.103
+```
+
+```
+ESTAB 0 1173600  10.10.0.51:44212  10.10.1.103:8080
+   cubic wscale:7,7 rto:204 rtt:3.6/0.5 mss:1448 cwnd:210
+   bytes_sent:8419283 bytes_retrans:12984 retrans:0/9
+   send 675Mbps  pacing_rate 810Mbps  delivery_rate 640Mbps
+```
+
+读法：`cwnd:210` × `mss:1448` ≈ 304 KB 在途上限；`retrans:0/9` 是"当前 0 次、累计 9 次"；
+`delivery_rate` 是实测送达速率，比 `send` 更可信。
+
+## 慢启动、拥塞避免与算法选择
+
+```
+cwnd
+ │        ┌── 拥塞避免（线性增长）
+ │       /
+ │      /  ← 丢包，cwnd 砍半
+ │     /╲
+ │    /  ╲___/‾‾‾
+ │   / 慢启动（指数增长）
+ └──────────────────────► 时间
+```
+
+- **慢启动**：每收到一个 ACK 就涨，指数上升，直到丢包或达到阈值
+- **拥塞避免**：转为线性缓增，试探极限
+- **丢包**：Cubic 之类的算法把 cwnd 砍掉一部分，重新往上爬
+
+算法的差别在于"用什么信号判断拥塞"：
+
+| 算法 | 判断依据 | 适合 |
+| --- | --- | --- |
+| **Cubic**（默认） | 丢包 | 数据中心内、常规场景 |
+| **BBR** | 实测带宽与最小 RTT | 长肥管道、有随机丢包的链路 |
+
+BBR 不等丢包才降速，所以在跨地域链路上通常明显更快。但它在同机房短 RTT 场景下未必有优势，
+**换算法要用业务流量实测，别照抄结论**。
+
+```bash
+sysctl net.ipv4.tcp_congestion_control     # 当前算法
+sysctl net.ipv4.tcp_available_congestion_control
+```
+
+## 重传：两种，危害差一个数量级
+
+| 类型 | 触发 | 代价 |
+| --- | --- | --- |
+| **快速重传** | 收到 3 个重复 ACK（或 SACK 指明空洞） | 几个 RTT，业务基本无感 |
+| **RTO 超时重传** | 定时器到点还没收到 ACK | 最少 200 ms 起步，业务一定有感知 |
+
+Linux 的 `TCP_RTO_MIN` 是 200 ms。所以**一次超时重传就等于一次 200 ms 的卡顿**，
+在要求 P99 延迟的场景里这是致命的。
+
+```bash
+# 重传总量与分类
+nstat -az | grep -iE 'RetransSegs|TCPLostRetransmit|TCPTimeouts|TCPFastRetrans'
+
+# 每秒重传率：retrans/s ÷ oseg/s
+sar -n ETCP 1 5
+```
+
+判断口径：**持续超过 0.1% 就该查，超过 1% 业务一定有感知**。
+
+<Callout type="warn" title="重传率不是丢包率">
+重传率是"发送方认为需要重发的比例"，它会被乱序、ACK 丢失、
+延迟确认放大。看到 0.5% 重传不代表链路真丢了 0.5%，
+要结合 `ethtool -S` 的网卡计数和交换机端口计数一起判断。
+</Callout>
+
+## Bufferbloat：带宽正常，延迟爆炸
+
+一个反直觉的现象：把队列做得很深，丢包变少了，但延迟变得极差。
+
+因为 TCP 靠丢包判断拥塞。队列深 → 迟迟不丢包 → 发送方一直加速 → 数据全堆在队列里排队 →
+**带宽还是那么多，但每个包多等了几十毫秒**。
+
+症状识别：
+
+```bash
+# 空载时的 RTT
+ping -c 10 10.10.1.103          # rtt min/avg/max = 0.1/0.12/0.15 ms
+
+# 满载时再量一次
+ping -c 10 10.10.1.103          # rtt min/avg/max = 0.1/45/120 ms  ← 排队
+```
+
+**空载延迟正常、满载延迟涨几百倍**，就是典型的 bufferbloat。解法是用带 AQM 的 qdisc
+（`fq_codel`、`cake`）主动早丢一点，而不是把队列继续加深。
+
+## 检查点
+
+<Quiz
+  id="tcp-1"
+  question="ss -tim 显示某条连接 cwnd 很小、rtt 正常、retrans 累计很高。瓶颈最可能在哪？"
+  options={[
+    { text: '路径上在丢包，拥塞控制把发送窗口压住了', correct: true },
+    { text: '对端应用读得太慢', feedback: '那会表现为 rwnd 变小、对端 Recv-Q 堆积，而不是重传高。' },
+    { text: '本机 CPU 不足', feedback: 'CPU 不足不会让 cwnd 变小，重传也不会因此升高。' },
+    { text: '应用没喂够数据', feedback: '那种情况下 cwnd 通常是大的，只是没用满。' },
+  ]}
+  explain={<>cwnd 小 + 重传高 = 拥塞控制在反复挨打后不敢涨窗口。下一步是定位丢在哪：网卡计数、交换机端口错误、上行是否拥塞，逐段排除。</>}
+/>
+
+<Quiz
+  id="tcp-2"
+  question="业务 P99 延迟偶发跳到 200 ms 以上，平均延迟正常。最先该查什么？"
+  options={[
+    { text: 'RTO 超时重传的次数', correct: true },
+    { text: '带宽利用率是否打满', feedback: '带宽满会整体变慢，不会只影响 P99。' },
+    { text: '磁盘 IOPS', feedback: '可能相关，但 200 ms 这个数字太像 Linux 的最小 RTO 了，先排除它。' },
+    { text: 'DNS 解析耗时', feedback: '值得查，但它通常影响的是连接建立而不是稳定期的 P99。' },
+  ]}
+  explain={<>200 ms 正好是 Linux 的 TCP_RTO_MIN。P99 出现这个量级的尖刺，第一嫌疑就是超时重传。用 <code>nstat -az | grep TCPTimeouts</code> 对比时间线即可确认。</>}
+/>
+
+<Quiz
+  id="tcp-3"
+  question="关于 accept 队列，下面哪些说法正确？（多选）"
+  options={[
+    { text: 'ss -lnt 里 LISTEN 行的 Recv-Q 是当前积压，Send-Q 是 backlog 上限', correct: true },
+    { text: '队列满了会丢连接，客户端表现为连接超时', correct: true },
+    { text: '调大 somaxconn 能从根本上解决积压', feedback: '只是把缓冲拉深，应用 accept 不过来的话仍会满。' },
+    { text: '队列满意味着网络链路有问题', feedback: '链路完全正常也会满，这纯粹是应用侧的消费速度问题。' },
+  ]}
+  explain={<>accept 队列积压是应用问题的经典伪装：症状看起来是「连不上」，实际链路健康。所以服务端排障要先看 <code>ss -lnt</code> 和 <code>nstat</code> 里的 ListenDrops。</>}
+/>
+
+## 这节课的落点
+
+- 握手对应两个队列：SYN 队列与 accept 队列，满了都表现为"连不上"但都不是链路问题
+- 发送量 = min(rwnd, cwnd)；哪个小就往哪个方向查
+- `ss -tim` 一条命令能看到 cwnd、rtt、重传、delivery_rate
+- 快速重传影响小，**RTO 超时重传最少 200 ms 起步**，是 P99 尖刺的头号嫌疑
+- 重传率 0.1% 是警戒线，1% 业务必有感知；但重传率 ≠ 丢包率
+- 空载延迟正常、满载延迟暴涨 = bufferbloat，用 AQM 而不是加深队列

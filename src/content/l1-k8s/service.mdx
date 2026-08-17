@@ -1,0 +1,224 @@
+## 从一个奇怪的现象开始
+
+```bash
+$ kubectl get svc web
+NAME   TYPE        CLUSTER-IP     PORT(S)
+web    ClusterIP   10.96.132.41   80/TCP
+
+$ ping 10.96.132.41
+PING 10.96.132.41: 56 data bytes
+^C  --- 100% packet loss
+
+$ curl 10.96.132.41
+<html>...   # 却能访问
+```
+
+**ping 不通但能访问**，这不是故障。ClusterIP 不是任何网卡上的地址，
+没有任何设备会响应它的 ICMP。它只是一条**规则的索引**。
+
+Service 的本质：**一条分布式的 DNAT 规则**。每个节点上都装着同一份"看到这个 VIP 就改写成某个 Pod IP"的规则。
+
+## 转换发生在客户端一侧
+
+这是最关键、也最容易搞错的一点：
+
+```
+客户端 Pod ──► [ 本节点完成 DNAT ] ──► 后端 Pod IP ──► 网络 ──► 后端 Pod
+              ↑
+        包在这里就已经不带 ClusterIP 了
+```
+
+**推论**：在后端 Pod 里抓包，永远抓不到 ClusterIP。新人经常在服务端 `tcpdump` 找 VIP，
+找不到就以为流量没到——其实早就到了，只是目的地址已经被改写。
+
+三种实现方式，改写发生的位置不同：
+
+| 模式 | 怎么改写 | 特点 |
+| --- | --- | --- |
+| iptables | 在转发路径上按规则链匹配 | Service 多了会退化 |
+| IPVS | 内核里的哈希表查找 | 规模友好，支持多种调度算法 |
+| eBPF 替换 | 在 `connect()` 的 socket 层就改掉目的地址 | 包根本没进转发路径 |
+
+eBPF 模式最彻底：应用以为自己连的是 VIP，实际内核在建连时就把地址换了，
+后续的包一路都是 Pod IP，**连一次 DNAT 都省了**。
+
+## 四种类型，四种用途
+
+### ClusterIP —— 集群内默认
+
+给一组 Pod 一个稳定的虚拟地址。Pod 换 IP、扩缩容、重启都不影响这个地址。
+
+### Headless（`clusterIP: None`）—— 把 Pod IP 直接给你
+
+不分配 VIP，DNS 查询直接返回全部 Pod IP。适合**客户端自己管连接**的场景：
+
+- 数据库集群（客户端需要区分主从）
+- Kafka / Zookeeper 这类要连特定成员的中间件
+- StatefulSet 里需要按序号访问某个副本
+
+```bash
+# ClusterIP 类型：返回一个 VIP
+nslookup web.default.svc.cluster.local     # → 10.96.132.41
+
+# Headless 类型：返回所有 Pod IP
+nslookup db.default.svc.cluster.local      # → 10.244.1.7, 10.244.2.9, 10.244.3.4
+```
+
+### NodePort —— 在每个节点占一个静态端口
+
+构建在 ClusterIP 之上，在宿主机的 root netns 里开一个端口（默认 30000–32767），
+访问任意节点的这个端口都会被转发到后端 Pod。
+
+**问题**：端口号是随机高位端口，需要外部记住"哪个服务是哪个端口"，且节点 IP 变化时客户端要改。
+通常只用于测试或作为 LoadBalancer 的底座。
+
+### LoadBalancer —— 一个可路由的 IP
+
+云上由云厂商的 L4 负载均衡器提供。**裸金属集群没有这个东西**，要靠 MetalLB 自己实现。
+
+MetalLB 从预留的地址池里分配一个 IP，然后用两种方式把它宣告出去：
+
+| 模式 | 怎么宣告 | 效果 |
+| --- | --- | --- |
+| **L2** | 某个 speaker 用 gARP 声称"这个 IP 归我" | 单节点承载全部流量，**只是高可用，不是负载均衡** |
+| **BGP** | 多个节点把同一个 `/32` 宣告给上游路由器 | ECMP 真正分担流量 |
+
+```yaml
+# 地址池要从机房网络组要一段空闲的可路由地址
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  addresses:
+    - 172.18.15.200-172.18.15.210
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: default
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - default
+```
+
+<Callout type="warn" title="L2 模式下的 VIP 只在一个节点上">
+很多人以为配了 LoadBalancer 就有负载均衡了。L2 模式下 VIP 只落在**一个** speaker 节点上，
+所有流量先进那台机器，再由 Service 转发到各 Pod。单节点带宽就是这个服务的上限。
+
+查 VIP 当前在哪个节点，三种办法：
+
+```bash
+# 新版本 MetalLB 直接有 CRD
+kubectl get servicel2statuses.metallb.io -n metallb-system
+
+# 或者从 speaker 日志里找
+kubectl logs -n metallb-system <speaker-pod> | grep serviceAnnounced | grep <vip>
+
+# 或者用 ARP 反查
+arping <vip>          # 拿到 MAC
+arp -n | grep <mac>   # 反查出物理节点 IP
+```
+</Callout>
+
+## externalTrafficPolicy：源 IP 与均衡的取舍
+
+| 取值 | 源 IP | 均衡 | 代价 |
+| --- | --- | --- | --- |
+| `Cluster`（默认） | 被 SNAT 成节点 IP，后端看不到真实客户端 | 全集群 Pod 都参与 | 多一跳转发 |
+| `Local` | **保留真实客户端 IP** | 只转发给本节点的 Pod | 后端分布不均时流量倾斜 |
+
+`Local` 还有一个连带效果：**只有跑着后端 Pod 的节点才会宣告 VIP**。
+所以如果某个节点上没有该服务的 Pod，它就不参与承载——这既是特性也是坑，
+后端 Pod 分布不均时会造成明显的流量倾斜。
+
+<Callout type="trap" title="改成 Local 之后 VIP 突然不通了">
+如果 speaker 所在节点上恰好没有该服务的后端 Pod，它不会宣告这个 VIP。
+再加上另一个常见问题：节点带了 `node.kubernetes.io/exclude-from-external-load-balancers`
+标签时 speaker 也不宣告。两种情况都表现为"VIP 完全不通"，但和网络链路毫无关系。
+</Callout>
+
+## 走一遍完整路径
+
+左边是集群内访问 ClusterIP，右边是集群外经 LoadBalancer 进来。对照看两条路径的差别：
+
+<PacketPathExplorer scenario="service-clusterip" only={["service-clusterip", "lb-ingress"]} />
+
+## 排障顺序
+
+Service 不通时按这个顺序查，每一步都能排除一大块：
+
+```bash
+# 1. DNS 解析成功了吗（集群里一半的"网络故障"止步于此）
+kubectl exec -it client -- nslookup web.default
+
+# 2. Endpoint 里有 Pod 吗（就绪探针全挂 = Endpoint 为空 = 连接直接被拒）
+kubectl get endpointslices -l kubernetes.io/service-name=web
+
+# 3. selector 和 Pod 标签真的匹配吗
+kubectl get svc web -o jsonpath='{.spec.selector}'
+kubectl get pods --show-labels | grep web
+
+# 4. 规则装上了吗
+cilium-dbg service list | grep 10.96.132.41
+# 或 iptables 模式：iptables-save | grep web
+# 或 IPVS 模式：ipvsadm -Ln | grep -A3 10.96.132.41
+
+# 5. conntrack 是否撑不住（表现为新连接随机失败）
+conntrack -S | head
+```
+
+<Callout type="tip" title="Endpoint 为空是最高频的原因">
+`kubectl get endpointslices` 返回空，意味着没有任何 Pod 被认为就绪。
+这时候连接会**立刻被拒绝**（不是超时），错误信息是 connection refused。
+根因往往在 readinessProbe 配错，而不在网络。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="svc-1"
+  question="在后端 Pod 里 tcpdump 抓不到 ClusterIP 的包，但服务明显在正常工作。为什么？"
+  options={[
+    { text: 'DNAT 在客户端所在节点就完成了，包离开那台机器时目的地址已经是 Pod IP', correct: true },
+    { text: '抓包命令写错了', feedback: '即使写对也抓不到 —— VIP 根本没出现在这段路径上。' },
+    { text: 'ClusterIP 的流量走了独立的隧道', feedback: '没有这样的隧道，就是普通的 DNAT。' },
+    { text: 'Service 走的是 UDP，tcpdump 抓不到', feedback: 'tcpdump 抓 UDP 没问题，且这与 VIP 是否可见无关。' },
+  ]}
+  explain={<>Service 是一条分布式 DNAT 规则，转换发生在客户端一侧。想验证请求确实到了后端，应该按 Pod IP 抓，或者在客户端节点上看 service/conntrack 表。</>}
+/>
+
+<Quiz
+  id="svc-2"
+  question="需要客户端自己感知集群成员（比如连数据库主节点），应该用哪种 Service？"
+  options={[
+    { text: 'Headless Service，DNS 直接返回全部 Pod IP', correct: true },
+    { text: 'ClusterIP，让 VIP 自动负载均衡', feedback: 'VIP 会随机挑一个后端，客户端无法指定连哪个成员。' },
+    { text: 'NodePort', feedback: '解决的是集群外访问，不解决成员感知。' },
+    { text: 'LoadBalancer', feedback: '同上，而且它还多加了一层 VIP。' },
+  ]}
+  explain={<>Headless（clusterIP: None）不分配 VIP，把成员列表交给客户端自己处理。StatefulSet + Headless 是数据库、Kafka 这类有状态中间件的标准组合。</>}
+/>
+
+<Quiz
+  id="svc-3"
+  question="裸金属集群把某个 Service 的 externalTrafficPolicy 改成 Local 后，VIP 变得完全不通。最可能的原因？"
+  options={[
+    { text: '当前宣告 VIP 的 speaker 节点上没有该服务的后端 Pod，因此不再宣告', correct: true },
+    { text: 'Local 模式需要云厂商 LB 支持', feedback: 'MetalLB 支持 Local 模式，不依赖云厂商。' },
+    { text: '地址池用尽了', feedback: '地址池用尽表现为 Service 一直 pending，拿不到 EXTERNAL-IP。' },
+    { text: 'Local 模式必须配合 BGP', feedback: 'L2 模式也能用 Local，只是宣告节点的条件变严格了。' },
+  ]}
+  explain={<>Local 模式下只有承载后端 Pod 的节点才宣告 VIP。排查两处：后端 Pod 的分布，以及节点上有没有 exclude-from-external-load-balancers 标签。</>}
+/>
+
+## 这节课的落点
+
+- ClusterIP ping 不通是**正常**的：它不是网卡地址，只是一条 DNAT 规则的索引
+- DNAT 发生在**客户端所在节点**，所以后端抓不到 VIP
+- 四种类型：ClusterIP（集群内）、Headless（客户端自管）、NodePort（静态端口）、LoadBalancer（可路由 IP）
+- 裸金属的 LoadBalancer 靠 MetalLB：L2 模式是高可用，BGP 模式才是负载均衡
+- `externalTrafficPolicy: Local` 换来真实源 IP，代价是宣告节点受限、流量可能倾斜
+- 排障顺序：DNS → Endpoint → selector → 转发规则 → conntrack

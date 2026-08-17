@@ -1,0 +1,293 @@
+## 决定体验的是规则，不是节点
+
+换了更快的节点却觉得更卡，往往是因为**该直连的流量也绕出去了**：内网服务、国内站点、
+公司仓库全走一趟远路。规则配对了，慢的那部分才会消失。
+
+这一节以 **Mihomo**（原 Clash.Meta，Clash Verge Rev 内置的核心）的配置为例，
+拆开真正需要理解的四段：端口、DNS、代理组、规则。
+
+## 端口：三个还是一个
+
+```yaml
+port: 7890            # HTTP 代理端口
+socks-port: 7891      # SOCKS5 代理端口
+mixed-port: 7892      # 一个端口同时支持 HTTP 与 SOCKS5 ← 推荐只用这个
+allow-lan: false      # 是否允许局域网其它设备连过来
+bind-address: '*'
+mode: rule            # rule（按规则）/ global（全部走代理）/ direct（全部直连）
+log-level: info
+external-controller: 127.0.0.1:9090    # 管理 API，GUI 和排障面板靠它
+```
+
+`mixed-port` 就是 gost 里的 `auto` 模式：客户端配 HTTP 还是 SOCKS5 都能用，
+少一个要记的端口。**`allow-lan: true` 要谨慎**——等于在局域网里开了一个开放代理，
+至少配合 `authentication` 和防火墙使用。
+
+`mode` 这三个值在排障时很有用：怀疑规则写错时先切 `global` 试一下，
+能通就说明问题在规则而不在节点。
+
+## DNS：fake-ip 到底解决了什么
+
+```yaml
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:                # 这些域名不给假 IP，走真实解析
+    - '*.lan'
+    - '*.local'
+    - '*.internal'
+    - '*.svc.cluster.local'
+    - 'localhost.ptlogin2.qq.com'
+  nameserver:                    # 国内解析器，用于解析国内域名
+    - 223.5.5.5
+    - 119.29.29.29
+  fallback:                      # 境外解析器，走加密协议
+    - https://1.1.1.1/dns-query
+    - tls://8.8.8.8:853
+  nameserver-policy:             # 按域名指定解析器
+    '+.internal': 10.0.0.53
+    '+.cluster.local': 10.96.0.10
+```
+
+**fake-ip 的原理**：客户端查询域名时，立刻返回一个 `198.18.x.x` 的假地址（不做真实解析）。
+客户端拿着这个假 IP 发起连接，Mihomo 收到后反查出原始域名，再按域名规则决定走哪条链。
+
+它解决的是一个真实的两难：
+
+| 模式 | 问题 |
+| --- | --- |
+| 不用 fake-ip | 每次连接前要先等真实 DNS 解析，慢，而且解析结果可能是错的 |
+| **fake-ip** | 解析零延迟，且**决策依据是域名而不是 IP**，规则更准 |
+
+<Callout type="trap" title="fake-ip 会让基于 IP 的规则失效">
+既然连接时用的是假 IP，`IP-CIDR` 和 `GEOIP` 这类规则拿到的就是 `198.18.x.x`，匹配不上真实地理位置。
+
+Mihomo 的处理是：域名类规则优先匹配，匹配不上时才会去做真实解析再走 IP 规则。
+但你要显式配合两件事：
+
+- 需要按 IP 匹配却不希望触发解析的规则，加 **`no-resolve`**
+  （比如 `IP-CIDR,10.0.0.0/8,DIRECT,no-resolve`）
+- 内网域名、集群域名一定要进 **`fake-ip-filter`**，否则拿到假 IP 后压根连不上
+
+第二条是 K8s 环境里最常见的坑：开了 fake-ip 之后 `kubectl` 突然不好用了，
+因为 `*.cluster.local` 也被发了假地址。
+</Callout>
+
+## 代理组：三种最常用
+
+```yaml
+proxy-providers:               # 订阅：自动拉取节点列表
+  main:
+    type: http
+    url: "https://example.com/subscribe"
+    interval: 86400            # 每天更新
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+
+proxy-groups:
+  - name: 自动选择
+    type: url-test             # 按延迟自动选最快的
+    use: [main]
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50              # 差距小于 50ms 不切换，避免反复抖动
+
+  - name: 兜底
+    type: fallback             # 按顺序用，前面的挂了才切下一个
+    use: [main]
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+
+  - name: 代理
+    type: select               # 手动选，GUI 里点
+    proxies: [自动选择, 兜底, DIRECT]
+```
+
+| 类型 | 行为 | 适合 |
+| --- | --- | --- |
+| `url-test` | 选延迟最低的 | 日常，配 `tolerance` 防抖 |
+| `fallback` | 按顺序，前面不可用才切 | 有明确优先级（比如自建优先） |
+| `load-balance` | 多个节点分摊 | 需要分散连接 |
+| `select` | 手动指定 | 排障，或明确要走某个出口 |
+
+**`tolerance` 很值得配**：不加的话延迟每次测量抖动几毫秒就会切换节点，
+表现是"连接莫名中断"——长连接会在切换时被掐掉。
+
+## 规则：顺序就是一切
+
+```yaml
+rule-providers:
+  cn-domains:
+    type: http
+    behavior: domain
+    url: "https://.../direct.txt"
+    interval: 86400
+
+rules:
+  # 1. 局域网与内网：最先匹配，永远直连
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,internal,DIRECT
+  - DOMAIN-SUFFIX,cluster.local,DIRECT
+
+  # 2. 公司资产：明确直连，别让它绕出去
+  - DOMAIN-SUFFIX,corp.example.com,DIRECT
+
+  # 3. 技术站点：明确走代理
+  - DOMAIN-SUFFIX,github.com,代理
+  - DOMAIN-SUFFIX,githubusercontent.com,代理
+  - DOMAIN-SUFFIX,docker.io,代理
+  - DOMAIN-SUFFIX,k8s.io,代理
+  - DOMAIN-SUFFIX,nvidia.com,代理
+  - DOMAIN-KEYWORD,grafana,代理
+
+  # 4. 规则集：批量匹配
+  - RULE-SET,cn-domains,DIRECT
+
+  # 5. 国内 IP 直连（这一步会触发真实解析）
+  - GEOIP,CN,DIRECT
+
+  # 6. 其余的兜底
+  - MATCH,代理
+```
+
+**规则从上往下匹配，命中即停。** 所以顺序错了后面的规则永远不会生效——
+比如把 `GEOIP,CN,DIRECT` 放在最前面，那么解析到国内 CDN 的境外服务也会被判直连。
+
+几个常用类型：
+
+| 类型 | 匹配 | 例 |
+| --- | --- | --- |
+| `DOMAIN` | 精确域名 | `DOMAIN,api.github.com,代理` |
+| `DOMAIN-SUFFIX` | 域名后缀（含子域） | `DOMAIN-SUFFIX,github.com,代理` |
+| `DOMAIN-KEYWORD` | 域名包含关键字 | `DOMAIN-KEYWORD,grafana,代理` |
+| `IP-CIDR` | 目标 IP 段 | `IP-CIDR,10.0.0.0/8,DIRECT,no-resolve` |
+| `GEOIP` | IP 归属地 | `GEOIP,CN,DIRECT` |
+| `PROCESS-NAME` | 按进程名 | `PROCESS-NAME,ssh,DIRECT` |
+| `RULE-SET` | 引用规则集 | `RULE-SET,cn-domains,DIRECT` |
+| `MATCH` | 兜底，必须在最后 | `MATCH,代理` |
+
+<Callout type="tip" title="给工程师的规则骨架">
+先内网、再公司、再明确要代理的技术域名、再规则集、再 GEOIP、最后 MATCH。
+
+这个顺序的逻辑是**从最确定到最模糊**：IP 段是确定的，域名后缀次之，
+GEOIP 依赖解析结果所以最不确定。把确定的放前面，能显著减少误判和不必要的解析。
+</Callout>
+
+## TUN 模式：给不认代理的程序兜底
+
+上一节讲过，`ping`、`dig`、`ssh`、静态编译的二进制都不读代理环境变量。
+TUN 模式的解法是建一张虚拟网卡，把流量整体接走：
+
+```yaml
+tun:
+  enable: true
+  stack: mixed              # system / gvisor / mixed
+  auto-route: true          # 自动装路由，把默认路由指过来
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53                # 劫持所有 DNS 查询
+```
+
+| 方式 | 覆盖范围 | 代价 |
+| --- | --- | --- |
+| **系统代理** | 只覆盖读代理设置的程序 | 轻量，不需要权限 |
+| **TUN 模式** | **覆盖所有程序**，含 ICMP、DNS | 需要管理员权限；与其它 VPN 客户端容易抢路由 |
+
+<Callout type="warn" title="TUN 模式与 VPN 客户端会抢路由">
+TUN 的 `auto-route` 会改默认路由。同时开着公司的 VPN 客户端（或 Tailscale、WireGuard）时，
+两边都想接管默认路由，症状是**内网时好时坏、或者两个都不通**。
+
+处理办法：
+- 只让其中一个接管默认路由，另一个用明确的分流规则
+- 或者把公司内网段在 Mihomo 规则里显式 `DIRECT`，并确认 TUN 没有劫持这些网段的 DNS
+- 排查时用 `ip route show` / `route print` 看默认路由到底在谁手上
+</Callout>
+
+## Clash Verge Rev：GUI 侧的实用功能
+
+[Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) 是基于 Tauri 的桌面客户端，
+内置 Mihomo 内核，跨 Windows / macOS / Linux。对工程师有价值的几点：
+
+- **Merge 与 Script 增强层** —— 不用改订阅原文，用一份覆盖配置追加自己的规则。
+  订阅更新后自定义规则不会丢，这是最实用的功能
+- **可视化节点与规则编辑** + 配置语法提示
+- **系统代理守护** —— 被其它软件改掉后自动改回
+- **TUN 模式**开关
+- **WebDAV 配置备份与同步** —— 多台机器保持同一套规则
+- 发布分为 Stable / AutoBuild 通道，日常用 Stable
+
+## 排障：确认某个请求走了哪条链
+
+```bash
+# 1. 看核心日志（把 log-level 临时调到 debug）
+tail -f ~/.config/clash-verge/logs/*.log
+
+# 2. 通过管理 API 看实时连接：每条连接的 chains 字段就是它走的链路
+curl -s http://127.0.0.1:9090/connections | jq '.connections[] | {host, chains, rule}'
+
+# 3. 看某个域名会命中哪条规则（不实际发请求）
+curl -s "http://127.0.0.1:9090/proxies" | jq -r '.proxies | keys[]'
+```
+
+GUI 的"连接"面板显示的就是第 2 条的内容。判断顺序：
+
+1. **`rule` 字段** 告诉你命中了哪条规则 → 规则写错就在这里暴露
+2. **`chains` 字段** 告诉你实际走了哪个节点 → 代理组选择是否符合预期
+3. 两个都对但还是不通 → 问题在节点或出口侧，切 `global` 模式或换节点验证
+
+## 检查点
+
+<Quiz
+  id="cr-1"
+  question="开启 fake-ip 后，kubectl 访问集群突然失败。最可能漏了什么？"
+  options={[
+    { text: '没把 *.cluster.local 等内网域名加进 fake-ip-filter，它们也拿到了假 IP', correct: true },
+    { text: 'mixed-port 配错了', feedback: '端口错会导致所有代理都不通，不是只影响集群域名。' },
+    { text: '代理组选了不可用节点', feedback: '集群访问本该直连，与节点无关。' },
+    { text: 'GEOIP 数据库过期', feedback: '内网域名不依赖 GEOIP 判断。' },
+  ]}
+  explain={<>fake-ip 会给所有域名返回 198.18.x.x 的假地址。内网/集群域名必须进 fake-ip-filter 走真实解析，否则客户端拿着假 IP 根本连不到真实服务。同时内网段的 IP 规则要加 no-resolve。</>}
+/>
+
+<Quiz
+  id="cr-2"
+  question="rules 里把 GEOIP,CN,DIRECT 放在了所有规则最前面，会发生什么？"
+  options={[
+    { text: '解析到国内 CDN 的境外服务会被判直连，后面为它写的代理规则永远不生效', correct: true },
+    { text: '没影响，规则会自动排序', feedback: '规则严格按书写顺序匹配，命中即停，不会自动排序。' },
+    { text: '所有流量都会走代理', feedback: '恰恰相反，会有更多流量被判直连。' },
+    { text: '会导致配置无法加载', feedback: '配置是合法的，只是行为不符合预期。' },
+  ]}
+  explain={<>规则从上往下匹配、命中即停。GEOIP 依赖解析结果，是最模糊的判据，应该放在靠后位置。正确顺序是从确定到模糊：内网 IP 段 → 明确域名 → 规则集 → GEOIP → MATCH。</>}
+/>
+
+<Quiz
+  id="cr-3"
+  question="同时开着 Mihomo 的 TUN 模式和公司 VPN 客户端，内网时好时坏。怎么处理？"
+  options={[
+    { text: '只让一方接管默认路由，另一方用明确的分流规则；用 ip route show 确认路由归属', correct: true },
+    { text: '把两个都关掉重启', feedback: '能临时恢复，但下次一样会冲突。' },
+    { text: '改 mixed-port 端口号', feedback: '冲突在路由层，与代理端口无关。' },
+    { text: '把 allow-lan 打开', feedback: '这只影响局域网设备能否连过来。' },
+  ]}
+  explain={<>TUN 的 auto-route 会抢默认路由，和任何 VPN 客户端（含 Tailscale/WireGuard）天然冲突。解法是让一方接管默认路由，另一方通过规则精确分流，并确认 DNS 劫持没有把内网域名一起接走。</>}
+/>
+
+## 这节课的落点
+
+- 用 `mixed-port` 一个端口搞定 HTTP 与 SOCKS5；`allow-lan` 要配认证和防火墙
+- **fake-ip** 让解析零延迟且按域名决策，代价是 IP 类规则失效——
+  内网域名进 `fake-ip-filter`，IP 规则加 `no-resolve`
+- 代理组：`url-test` 配 `tolerance` 防抖，`fallback` 有优先级，`select` 排障用
+- **规则从上往下命中即停**，顺序按"从确定到模糊"：内网 → 公司 → 明确域名 → 规则集 → GEOIP → MATCH
+- TUN 模式覆盖所有程序（含 `ping`/`dig`/`ssh`），代价是需要权限且会与 VPN 客户端抢路由
+- Clash Verge Rev 的 Merge/Script 增强层能让自定义规则在订阅更新后不丢
+- 排障看两个字段：`rule`（规则对不对）与 `chains`（走了哪个节点）

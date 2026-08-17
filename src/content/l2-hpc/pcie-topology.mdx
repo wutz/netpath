@@ -1,0 +1,248 @@
+## PCIe 不是总线，是一张交换网
+
+名字里带"总线"（Bus）是历史包袱。PCI 时代确实是共享总线，PCIe 从第一代起就是**点对点的交换网络**——
+结构和一张以太网非常像：
+
+```
+              ┌──────────┐
+     CPU ─────│   Root   │  Root Complex：CPU 侧的入口，相当于网关
+              │ Complex  │
+              └────┬─────┘
+                   │  x16 链路（相当于一条网线）
+              ┌────▼─────┐
+              │ PCIe     │  Switch：相当于交换机
+              │ Switch   │
+              └──┬────┬──┘
+                 │    │
+              ┌──▼─┐┌─▼──┐
+              │GPU ││NIC │  Endpoint：相当于终端设备
+              └────┘└────┘
+```
+
+这个类比一旦建立，L0 学的那套思路就能直接套过来：**有链路就有带宽上限，有交换机就有拓扑远近，
+有协商就可能协商错。** 这一节要回答的就是这三件事。
+
+## 带宽账：每代每 lane 多少
+
+一条 lane 是一对差分线（收发各一对），所以 PCIe **天生全双工**。
+
+| 代际 | 每 lane 速率 | 编码 | 每 lane 有效（单向） | x8（单向） | **x16（单向）** |
+| --- | --- | --- | --- | --- | --- |
+| Gen3 | 8 GT/s | 128b/130b | ≈ 0.985 GB/s | ≈ 7.9 GB/s | **≈ 15.75 GB/s** |
+| Gen4 | 16 GT/s | 128b/130b | ≈ 1.97 GB/s | ≈ 15.8 GB/s | **≈ 31.5 GB/s** |
+| Gen5 | 32 GT/s | 128b/130b | ≈ 3.94 GB/s | ≈ 31.5 GB/s | **≈ 63 GB/s** |
+| Gen6 | 64 GT/s | PAM4 + FLIT | ≈ 8 GB/s | ≈ 64 GB/s | **≈ 128 GB/s** |
+
+两个规律记住就够：**每代翻倍、lane 数线性**。所以 Gen5 x8 ≈ Gen4 x16 ≈ 31.5 GB/s——
+这个等价关系在排查"为什么插上去只有一半带宽"时会反复用到。
+
+<Callout type="trap" title="单向还是双向：最常见的 2 倍误差">
+到处都能看到"Gen5 x16 = 128 GB/s"。这个数字是**双向聚合**（2 × 63），
+而同一份资料里的 Gen4 数字往往写的是**单向** 32 GB/s——两个口径混在一起比，就凭空差了一倍。
+
+这和 L0 里 Gbps 与 GB/s 的换算是同一类错误，而且更隐蔽。本站统一口径：
+**PCIe 一律写单向**，因为要和网卡的"每端口每方向"对齐；NVLink 官方只给双向聚合值，
+下一节会单独标出来。
+
+看到任何 PCIe 带宽数字，第一个问题永远是：**这是单向还是双向？**
+</Callout>
+
+## 关键换算：这张网卡插得下吗
+
+这是本节最有实用价值的一算。网卡带宽换成 GB/s，再看要占多少 lane：
+
+| 网卡 | 单向带宽 | 最低要求 | Gen4 x16 够吗 |
+| --- | --- | --- | --- |
+| 25 GbE | 3.1 GB/s | Gen3 x4 | 富余 |
+| 100 GbE | 12.5 GB/s | Gen3 x16 / Gen4 x8 | 够 |
+| 200 Gb（HDR） | 25 GB/s | Gen4 x16 / Gen5 x8 | **刚好** |
+| **400 Gb（NDR）** | **50 GB/s** | **Gen5 x16** | **不够（31.5 &lt; 50）** |
+| 800 Gb（XDR） | 100 GB/s | Gen6 x16 | 不够 |
+
+**一张 400G 网卡插在 Gen4 x16 槽位上，理论上限就只有 31.5 GB/s，约等于 250 Gb。**
+NCCL 测出来的 busbw 会稳定停在六成左右，而 `ibstat` 显示链路速率 400、
+`ib_send_bw` 点对点也能跑很高（单向短测打不满 PCIe），排查时极容易被绕进去。
+
+<Callout type="tip" title="L2 闯关里那个「只有一半」，这里是它的另一个可能来源">
+之前 <a href="/learn/l2-hpc/quest-slow-allreduce">AllReduce 只有理论值一半</a> 那一关，
+根因是 `NCCL_IB_HCA` 少列了卡。但同样的症状还有一个来源就在这里：
+**网卡插在了代际或 lane 数不够的槽位上。**
+
+区别方法：`NCCL_IB_HCA` 的问题在日志里能看到卡数不对；PCIe 的问题要看
+`lspci` 的协商结果。两个都要查，顺序上先看日志（快），再看槽位。
+</Callout>
+
+## 核对实际协商结果
+
+设备**能力**（Capability）和**当前状态**（Status）是两回事，只看前者会被骗：
+
+```bash
+# 找到网卡的 BDF 地址
+lspci | grep -i mellanox
+# 31:00.0 Ethernet controller: Mellanox Technologies MT2910 Family [ConnectX-7]
+
+# 对比能力与实际协商
+lspci -vv -s 31:00.0 | grep -E 'LnkCap|LnkSta'
+```
+
+```
+LnkCap: Port #0, Speed 32GT/s, Width x16, ...      ← 能力：Gen5 x16
+LnkSta: Speed 32GT/s, Width x16                    ← 实际：Gen5 x16 ✓
+```
+
+```
+LnkCap: Port #0, Speed 32GT/s, Width x16, ...      ← 能力：Gen5 x16
+LnkSta: Speed 16GT/s (downgraded), Width x8 (downgraded)   ← 实际掉到 Gen4 x8 ✗
+```
+
+`(downgraded)` 这个标记是白送的诊断信息。降速的常见原因：
+
+| 现象 | 常见原因 |
+| --- | --- |
+| Width 掉一半 | 插在了电气 x8 的物理 x16 槽位；或 bifurcation 配置把 x16 拆了 |
+| Speed 掉一代 | BIOS 里锁了代际；转接卡/延长线信号质量不够；主板走线过长 |
+| 时好时坏 | 卡没插到底、金手指氧化、机箱震动 |
+
+```bash
+# 看整机拓扑树，确认设备挂在哪个 switch 下
+lspci -tv
+
+# 看槽位与 NUMA 归属
+lspci -vv -s 31:00.0 | grep -E 'NUMA|Physical Slot'
+```
+
+## 拓扑：远近决定性能
+
+`nvidia-smi topo -m` 输出的那些缩写就是"距离"，从近到远：
+
+| 标记 | 含义 | 代价 |
+| --- | --- | --- |
+| `NV#` | 走 NVLink，`#` 是链路数 | 最快（下一节讲） |
+| `PIX` | 同一个 PCIe **Switch** 内 | 最优的 PCIe 路径 |
+| `PXB` | 跨多个 PCIe Switch | 略有增加 |
+| `PHB` | 经过 **Host Bridge**（Root Complex） | 要过 CPU 侧 |
+| `NODE` | 同一 NUMA 节点内跨 Host Bridge | 更远 |
+| `SYS` | **跨 NUMA / 跨 socket** | 最差，要过 CPU 互联（UPI/xGMI） |
+
+```bash
+nvidia-smi topo -m
+```
+
+规划含义很直接：**每张 GPU 应该有一张 `PIX` 关系的网卡**。这就是 rail-optimized 服务器
+在硬件设计上"一卡配一网卡、且挂在同一个 PCIe switch 下"的原因——
+L3 那节讲的是机间布线，这里是它在机内的前提。
+
+<Callout type="warn" title="跨 NUMA 的代价是真实的">
+`SYS` 意味着数据要跨 CPU socket 间的互联（Intel 的 UPI、AMD 的 xGMI）。
+后果有三个：带宽降低、延迟升高、而且**会和其它跨 NUMA 流量互相干扰**。
+
+所以 GPU 训练任务的进程绑核也要跟着拓扑走：让进程跑在与其 GPU 同 NUMA 的 CPU 上。
+不过要注意 NCCL 的场合有个例外——`nccl-tests` 的实践里 `mpirun -bind-to none`
+是常见配置，原因是过度绑核反而会干扰 NCCL 自己的线程调度。**绑核这件事要实测，别照抄。**
+</Callout>
+
+## ACS：GPUDirect 的隐形开关
+
+Access Control Services 是 PCIe 的一个安全特性：**强制 peer-to-peer 流量绕到 Root Complex
+去做检查**，而不是让两个 Endpoint 在 switch 里直接对话。
+
+对虚拟化是必要的（防止设备之间越权访问），但对 GPUDirect RDMA 是致命的：
+
+```
+ACS 开启：GPU ──► Switch ──► Root Complex ──► Switch ──► NIC   （绕远，且吃 CPU 侧带宽）
+ACS 关闭：GPU ──► Switch ──► NIC                              （P2P 直通）
+```
+
+症状是**静默退化**：功能全对，带宽掉一截，日志里什么都不报。
+
+```bash
+# 查有哪些设备开了 ACS（ACSCtl 里的 SrcValid+ 等标志）
+lspci -vvv | grep -i -A1 'Access Control Services'
+
+# 确认 nvidia-peermem 已加载（GPUDirect RDMA 的前提）
+lsmod | grep peermem
+```
+
+关 ACS 通常在 BIOS 里做，或者用启动参数。这和 IOMMU 是一组权衡：
+
+| 需求 | ACS | IOMMU |
+| --- | --- | --- |
+| 裸金属跑训练，要极致 P2P | 关 | 可关或按需 |
+| 要把设备直通给虚机 / SR-IOV | 需要开（隔离要求） | 必须开 |
+
+**这是一道安全与性能的取舍题，不是"越关越好"。** 多租户环境不要随便关。
+
+## 检查清单
+
+新机器到手，或者性能不对时按顺序过一遍：
+
+```bash
+# 1. 网卡协商到了预期的代际与宽度吗
+for d in $(lspci | grep -i mellanox | cut -d' ' -f1); do
+  echo "== $d"; lspci -vv -s $d | grep -E 'LnkCap:|LnkSta:'
+done
+
+# 2. GPU 与网卡的亲和关系是不是 PIX
+nvidia-smi topo -m
+
+# 3. 设备的 NUMA 归属
+lspci -vv | grep -E 'Physical Slot|NUMA node' | paste - -
+
+# 4. GPUDirect 的前提：peermem 模块
+lsmod | grep peermem
+
+# 5. 有没有设备开着 ACS
+lspci -vvv | grep -c 'Access Control Services'
+```
+
+五条命令，两分钟。**任何一条不对，后面测 NCCL 都是在测一个已知有问题的系统。**
+
+## 检查点
+
+<Quiz
+  id="pcie-1"
+  question="一张 400 Gb 网卡插在 PCIe Gen4 x16 槽位上，理论带宽上限约是多少？"
+  options={[
+    { text: '约 31.5 GB/s，相当于 250 Gb —— 喂不满这张卡', correct: true },
+    { text: '50 GB/s，槽位不影响网卡速率', feedback: '网卡的数据必须经 PCIe 进出主机，槽位就是硬上限。' },
+    { text: '63 GB/s', feedback: '那是 Gen5 x16 的值，Gen4 只有一半。' },
+    { text: '15.75 GB/s', feedback: '那是 Gen3 x16。' },
+  ]}
+  explain={<>400 Gb ÷ 8 = 50 GB/s，而 Gen4 x16 单向只有约 31.5 GB/s。这类配置的典型症状是 ibstat 显示 400、点对点短测也不错，但 NCCL busbw 稳定停在六成左右。400G 网卡要 Gen5 x16。</>}
+/>
+
+<Quiz
+  id="pcie-2"
+  question="lspci 显示某网卡 LnkCap 是 Speed 32GT/s Width x16，LnkSta 是 Speed 32GT/s Width x8 (downgraded)。说明什么？"
+  options={[
+    { text: '卡本身支持 x16，但当前只协商到 x8，带宽腰斩 —— 查槽位电气宽度或 bifurcation 配置', correct: true },
+    { text: '正常现象，Width 会动态调整', feedback: 'PCIe 不会因为负载低就降宽度，(downgraded) 标记就是异常信号。' },
+    { text: '网卡故障需要更换', feedback: '先查槽位和 BIOS，多数情况是插错槽位或 bifurcation 配置。' },
+    { text: '代际不对，需要换 Gen5 主板', feedback: 'Speed 已经是 32GT/s（Gen5），问题在 Width。' },
+  ]}
+  explain={<>LnkCap 是能力、LnkSta 是实际协商结果，两者不一致就是降级。Width 掉一半最常见的原因是物理 x16 但电气 x8 的槽位，或者 bifurcation 把 x16 拆成了两个 x8。</>}
+/>
+
+<Quiz
+  id="pcie-3"
+  question="为什么 GPUDirect RDMA 场景通常要求关闭 ACS？"
+  options={[
+    { text: 'ACS 会强制 P2P 流量绕到 Root Complex 检查，绕开了 switch 内的直通路径', correct: true },
+    { text: 'ACS 会加密流量，增加延迟', feedback: 'ACS 不做加密，它做的是访问控制检查。' },
+    { text: 'ACS 与 IOMMU 冲突', feedback: '两者常配合使用，SR-IOV 场景恰恰都需要。' },
+    { text: 'ACS 限制了 lane 数量', feedback: '它不影响链路宽度，影响的是转发路径。' },
+  ]}
+  explain={<>关键词是「静默退化」：功能全对、带宽掉一截、日志无报错。但这是安全与性能的取舍 —— 要把设备直通给虚机或用 SR-IOV 时 ACS 提供的隔离是必需的，多租户环境不要随便关。</>}
+/>
+
+## 这节课的落点
+
+- PCIe 是**点对点交换网**：Root Complex 是网关、Switch 是交换机、Endpoint 是终端
+- 带宽规律：每代翻倍、lane 线性；**Gen5 x8 ≈ Gen4 x16 ≈ 31.5 GB/s**
+- 看到 PCIe 带宽先问**单向还是双向**，这是最常见的 2 倍误差
+- **400G 网卡需要 Gen5 x16**；插在 Gen4 x16 上上限只有约 250 Gb
+- `LnkCap` 是能力、`LnkSta` 是实际，`(downgraded)` 是白送的诊断信息
+- 拓扑距离 `NV# < PIX < PXB < PHB < NODE < SYS`，每张 GPU 应配一张 `PIX` 的网卡
+- `SYS`（跨 NUMA）要付带宽、延迟和干扰三重代价
+- ACS 开着会让 P2P 绕道 Root Complex，**静默**吃掉 GPUDirect 的收益；但它与 SR-IOV 的隔离需求是取舍
+- 测 NCCL 之前先跑那五条检查命令

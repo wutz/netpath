@@ -1,0 +1,323 @@
+## 先做正确的诊断
+
+"打不开"是症状，不是原因。工程师能做的第一件有价值的事，是把它归到某一类：
+
+| 症状 | 表现 | 归类 |
+| --- | --- | --- |
+| 域名解析到了明显不对的地址 | `dig` 结果和权威 DNS 不一致 | **DNS 层面** |
+| TCP 连上了，TLS 握手时断 | `curl -v` 卡在握手后 `Connection reset` | **握手阶段被打断** |
+| SYN 发出去没人应 | `nc -zv` 超时，`traceroute` 在某跳后消失 | **地址不可达** |
+| 能连、能传，但极慢 | 吞吐只有几十 KB/s，重传率高 | **限速或丢包** |
+
+四类的处置方式完全不同，混在一起猜会浪费大量时间。
+
+## 一套诊断命令
+
+```bash
+# 1. DNS：换不同解析器对比，结果不一致就是解析层面的问题
+dig +short github.com @1.1.1.1
+dig +short github.com @8.8.8.8
+dig +short github.com                    # 本地/运营商 DNS
+# 用 DoH 拿一个可信参照
+curl -s 'https://cloudflare-dns.com/dns-query?name=github.com&type=A' \
+  -H 'accept: application/dns-json' | jq -r '.Answer[].data'
+
+# 2. TCP 可达性：先确认三次握手本身成不成
+nc -zv github.com 443
+# 在哪一跳消失
+traceroute -T -p 443 github.com
+
+# 3. TLS 握手：分辨是连不上还是握手被打断
+curl -vI --connect-timeout 5 https://github.com 2>&1 | tail -20
+openssl s_client -connect github.com:443 -servername github.com </dev/null 2>&1 | head -15
+
+# 4. 绕过 DNS 直接测某个 IP，用来验证"是 DNS 的问题还是 IP 的问题"
+curl -vI --resolve github.com:443:140.82.121.4 https://github.com
+
+# 5. 速度与稳定性
+curl -o /dev/null -w '%{speed_download}\n' https://speed.cloudflare.com/__down?bytes=10000000
+nstat -az | grep -iE 'retrans|timeout'
+```
+
+<Callout type="tip" title="第 4 条是最有价值的一条">
+`curl --resolve` 让你**跳过 DNS 直接指定 IP**。它把两个变量分开了：
+
+- `--resolve` 指定正确 IP 后能通 → 问题在 **DNS 解析**
+- 指定正确 IP 仍不通 → 问题在 **连接层**（地址不可达或握手被打断）
+
+一条命令把诊断范围砍掉一半。同样的思路适用于任何"域名相关"的疑难问题，
+不只是受限网络场景。
+</Callout>
+
+## 判断树
+
+```
+拉不下依赖 / 打不开文档
+   │
+   ├─ dig 各解析器结果不一致，或返回明显不对的地址
+   │     → DNS 层面：换加密 DNS（DoH/DoT），或让代理侧解析（socks5h）
+   │
+   ├─ nc -zv 超时、traceroute 在某跳后消失
+   │     → 地址层面：这个出口到该目标不可达，需要换出口
+   │
+   ├─ TCP 通但 TLS 握手阶段断开
+   │     → 握手阶段被打断：需要隧道把握手包裹在另一层里
+   │
+   └─ 都正常但极慢、重传高
+         → 限速或链路质量：换线路，或先确认不是自己这端的问题（L0 那套体检）
+```
+
+<Callout type="note" title="很多情况根本不需要隧道">
+在下结论之前先试镜像源——对开发者场景，这往往是**更快、更稳、也更省事**的答案：
+
+| 生态 | 镜像方案 |
+| --- | --- |
+| Go | `GOPROXY=https://goproxy.cn,direct` |
+| Python | `pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple` |
+| Node | `npm config set registry https://registry.npmmirror.com` |
+| Rust | `~/.cargo/config.toml` 里配 crates.io 镜像 |
+| 容器镜像 | 公司内部 Harbor / 镜像加速，或自建 pull-through cache |
+| 系统包 | 换 apt/yum 的镜像源 |
+
+镜像的好处是**没有额外链路、没有隧道可断、CI 里也能用**。
+只有镜像覆盖不到的场景（文档站点、issue 讨论、私有仓库、某些 SDK 下载）才需要往下走。
+</Callout>
+
+## 自建还是用现成服务
+
+| 维度 | 自建（VPS + 自己部署） | 订阅服务 |
+| --- | --- | --- |
+| 成本 | 一台小 VPS，按月固定 | 按月，通常更便宜 |
+| 可控性 | **完全可控**，出口 IP 固定 | 出口共享，IP 可能被目标站点风控 |
+| 稳定性 | 取决于你选的线路和维护 | 取决于服务方 |
+| 隐私 | 流量只经过自己的机器 | 流量经过第三方 |
+| 维护成本 | **要自己管**：证书续期、升级、监控 | 无 |
+| 适合 | 长期、要固定出口、要接 CI | 临时、个人、不想维护 |
+
+给工程师的实际建议：**如果需要在 CI 或服务器上稳定使用，自建**——
+因为你需要固定出口 IP 和可预期的可用性。个人临时用途没必要。
+
+### VPS 选择的几个要点
+
+- **地域**：香港延迟最低（大陆访问通常几十毫秒），美西便宜、机房和线路选择多，但延迟通常
+  在一百多到两百毫秒。做交互式操作（SSH、Web 控制台）地域的影响比带宽大得多
+- **流量与带宽**：看清是"月流量配额"还是"不限量但限速"。前者用超会直接停机，
+  拉几个大镜像就可能触顶
+- **回程线路**：**同一机房不同线路的体验能差好几倍**，这是最容易被价格掩盖的一项
+- **快照与重建**：选支持快照的，配置搞坏了能回滚；同时看清换 IP 的政策（IP 被封时能不能换）
+
+### 线路名词对照
+
+报价页上那几个缩写是真正决定体验的东西：
+
+| 标签 | 是什么 | 体验 |
+| --- | --- | --- |
+| **CN2 GIA** | 电信 CN2 的高优先级产品（AS4809） | 最好：低丢包、晚高峰不塌，也最贵 |
+| **CN2 GT** | 电信 CN2 的普通档 | 中等：比普通骨干好，晚高峰仍会拥塞 |
+| **163 / AS4134** | 电信普通骨干 | 最便宜，晚高峰丢包和抖动明显 |
+| **AS4837 / CU4837** | 联通骨干 | 性价比常见选择，质量介于两者之间 |
+| **Eyeball** | 面向**末端消费者网络**优化的线路（eyeball network 是行业术语，指承载大量家庭宽带用户的 ISP） | 到家宽用户的路径更短 |
+
+判断线路真假不靠商家宣传，看 `traceroute` 的骨干跳：**途经 `59.43.x.x` 说明走了 CN2，
+只见 `202.97.x.x` 则是普通骨干**（这个判据来自
+[haoel 的科学上网笔记](https://github.com/haoel/haoel.github.io)）。
+
+### 具体推荐
+
+下面这几家按**价格从高到低、稳定性也从高到低**排列 —— 这两件事在这个领域基本是正相关的：
+
+| 服务商 | 机房与线路 | 定位 |
+| --- | --- | --- |
+| [搬瓦工 bwh8.net](https://bwh8.net/) | US · E-Commerce VPS | 最贵也最稳。要长期挂服务、不想操心的选它 |
+| [DMIT dmit.io](https://www.dmit.io/) | US · Premium / Eyeball | 次之。线路分档细，按用途挑 |
+| [CubeCloud cubecloud.net](https://www.cubecloud.net/) | HK · CN2 GIA ／ US · CN2 GIA | 性价比档。**要低延迟就选香港那条** |
+| [CloudCone cloudcone.com](https://cloudcone.com/) | US | 最便宜，稳定性最弱。适合临时验证、随时可弃 |
+
+按用途对应：
+
+- **CI 或服务器上长期用**（拉依赖、跑构建）→ 取前两档。这类场景断一次就是流水线红一片，
+  稳定性的钱值得花
+- **个人日常看文档、查 issue** → 第三档足够，香港线路的交互体验明显更好
+- **临时验证一个想法、或者只是想练一遍部署** → 最后一档，用完就删
+
+<Callout type="tip" title="下单前先自己测一遍回程">
+**关键是回程（VPS → 大陆），不是去程。** 从自己电脑 `traceroute` 出去测的是去程，
+而中国大陆的国际链路去回程经常走完全不同的路径 —— 去程漂亮、回程拥塞是很常见的组合。
+
+所以要**在 VPS 上反向测**：
+
+```bash
+# 在 VPS 上装 mtr，往大陆三网各测一个地址
+mtr -r -c 20 202.96.209.133      # 电信（上海）
+mtr -r -c 20 210.22.84.3         # 联通（上海）
+mtr -r -c 20 211.136.112.50      # 移动（上海）
+
+# 看骨干跳里有没有 59.43（CN2）
+mtr -r -c 20 202.96.209.133 | grep -E '59\.43|202\.97'
+```
+
+看两件事：**丢包出现在哪一跳**，以及**晚高峰（20:00–23:00）的延迟涨多少**。
+白天测都好看，晚高峰才见真章 —— 至少跨一个晚高峰再决定要不要长租。
+
+多数商家有几天的退款窗口，先按月付测一轮再转年付，比一上来省 20% 划算。
+</Callout>
+
+<Callout type="warn" title="价格、库存与线路都会变">
+这个市场变动很快：机房线路会被降级、库存补货靠抢、同一款产品不同批次的实际线路可能不同。
+**上面的排序是长期口碑而不是当下承诺**，下单前一定用上面那套 `mtr` 自己验一遍。
+
+另外注意两件事：**不要用同一台机器承载重要业务和这类用途**（IP 被封会一起受影响），
+以及**账号别复用密码** —— 这类商家的安全水位参差不齐。
+</Callout>
+
+### 服务端的基础配置
+
+```bash
+# 1. BBR：长肥链路上收益最直接（L0 讲过原因）
+cat >> /etc/sysctl.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+sysctl -p
+sysctl net.ipv4.tcp_congestion_control      # 确认生效
+
+# 2. 域名 + 真实证书（自签会立刻暴露）
+certbot certonly --standalone -d proxy.example.com
+# 续期交给 cron / systemd timer
+
+# 3. 服务本体：用 gost 这类工具跑在 TLS/HTTP2 之上（见 gost 那一节）
+```
+
+三条纪律：**用真实域名和证书、加认证、只开必要端口**。
+上一节说过，不加认证的代理挂公网上几小时就会被扫到滥用。
+
+## 开发者场景：让各个工具走代理
+
+假设本地代理是 `127.0.0.1:1080`（SOCKS5）和 `127.0.0.1:8080`（HTTP）。
+
+```bash
+# 通用环境变量（记得大小写都设，NO_PROXY 写全）
+export http_proxy=http://127.0.0.1:8080  HTTP_PROXY=$http_proxy
+export https_proxy=$http_proxy           HTTPS_PROXY=$http_proxy
+export all_proxy=socks5h://127.0.0.1:1080
+export no_proxy="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.internal,.svc,.cluster.local"
+```
+
+一个方便的开关（思路同样出自上面那份笔记）：
+
+```bash
+proxy()   { export http_proxy=http://127.0.0.1:8080 https_proxy=$http_proxy; echo "proxy on"; }
+unproxy() { unset http_proxy https_proxy; echo "proxy off"; }
+with_proxy() { http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080 "$@"; }
+# 用法：with_proxy curl -I https://example.com
+```
+
+各工具的独立配置：
+
+```bash
+# Git（HTTPS 协议）
+git config --global http.proxy socks5h://127.0.0.1:1080
+# 只给某个域名走代理，避免影响内网仓库
+git config --global http.https://github.com/.proxy socks5h://127.0.0.1:1080
+```
+
+```sshconfig
+# Git（SSH 协议）—— ssh 不认环境变量，写进 ~/.ssh/config
+Host github.com
+  User git
+  ProxyCommand nc -x 127.0.0.1:1080 %h %p
+  # 或者 ProxyCommand socat - SOCKS4A:127.0.0.1:%h:%p,socksport=1080
+```
+
+```ini
+# Docker daemon 是系统服务，环境变量对它无效
+# /etc/systemd/system/docker.service.d/http-proxy.conf
+[Service]
+Environment="HTTP_PROXY=http://127.0.0.1:8080"
+Environment="HTTPS_PROXY=http://127.0.0.1:8080"
+Environment="NO_PROXY=localhost,127.0.0.1,.internal,10.0.0.0/8"
+```
+
+```bash
+systemctl daemon-reload && systemctl restart docker
+```
+
+```conf
+# apt
+# /etc/apt/apt.conf.d/95proxy
+Acquire::http::Proxy "http://127.0.0.1:8080";
+Acquire::https::Proxy "http://127.0.0.1:8080";
+```
+
+<Callout type="trap" title="容器里的 127.0.0.1 不是宿主机的 127.0.0.1">
+在容器或 Pod 里把代理配成 `127.0.0.1:8080` 一定不通——那是容器自己的 loopback。
+要用宿主机地址：Docker Desktop 用 `host.docker.internal`，
+Linux 上用 docker0 的网关地址（通常 `172.17.0.1`）或者 `--network host`。
+
+同理，`docker build` 时用的是 **daemon 的**网络与代理配置，不是你 shell 里的环境变量，
+要用 `--build-arg HTTP_PROXY=...` 传进去。这两件事每个人都会踩一次。
+</Callout>
+
+## 用途与边界
+
+<Callout type="warn" title="限定用途">
+这一阶段的内容面向**技术资料访问与问题排查**：拉依赖、看官方文档、读 issue 讨论、
+访问上游代码仓库。
+
+三条实际的纪律：
+
+- **遵守所在地法律法规与所在公司的网络与合规政策**，公司资产上的任何网络改动先走内部流程
+- **不要把它变成绕过公司安全管控的通道**：审计、DLP、零信任策略存在是有原因的，
+  绕过它们通常违反雇佣协议
+- **技术手段本身中立，用途不中立**。本站只讨论原理、配置与排障，不涉及其它用途
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="rn-1"
+  question="pip install 一直超时。用 curl --resolve 指定正确 IP 后能正常访问。问题在哪一层？"
+  options={[
+    { text: 'DNS 解析 —— 本地解析到的地址不对', correct: true },
+    { text: 'TLS 握手被打断', feedback: '若是握手问题，指定正确 IP 后仍然会断。' },
+    { text: '目标 IP 不可达', feedback: '指定 IP 后能通，说明这个 IP 是可达的。' },
+    { text: '链路限速', feedback: '限速表现为慢而不是超时，而且换 IP 不会立刻变好。' },
+  ]}
+  explain={<>--resolve 把 DNS 与连接两个变量分开了：指定 IP 后能通 = 解析层面的问题。对策是换加密 DNS（DoH/DoT）或用 socks5h 让代理侧解析。当然，pip 这个具体场景先换镜像源更省事。</>}
+/>
+
+<Quiz
+  id="rn-2"
+  question="在容器里把代理配成 http://127.0.0.1:8080，结果完全不通。为什么？"
+  options={[
+    { text: '127.0.0.1 在容器里指的是容器自身，不是宿主机', correct: true },
+    { text: '容器不支持 HTTP 代理', feedback: '支持，问题只在地址写错。' },
+    { text: '需要 root 权限', feedback: '与权限无关。' },
+    { text: '必须用 SOCKS5', feedback: '协议不是问题所在。' },
+  ]}
+  explain={<>每个容器有独立的网络命名空间和自己的 loopback。要用宿主机地址（Linux 上常见 172.17.0.1，Docker Desktop 用 host.docker.internal）或 --network host。另外 docker build 用的是 daemon 的代理配置，要靠 --build-arg 传。</>}
+/>
+
+<Quiz
+  id="rn-3"
+  question="团队 CI 需要长期稳定拉取境外依赖。最优先该做什么？"
+  options={[
+    { text: '搭内部镜像源或 pull-through 缓存，把依赖拉取变成内网请求', correct: true },
+    { text: '在每个 CI runner 上配代理', feedback: '可行但脆弱：隧道一断整条流水线红，而且每个 runner 都要维护。' },
+    { text: '让每个开发者本地下载后提交到仓库', feedback: '仓库会迅速膨胀，而且版本管理会失控。' },
+    { text: '给 CI 装 VPN 客户端', feedback: '同样是把稳定性押在一条隧道上。' },
+  ]}
+  explain={<>CI 要的是确定性。镜像源/缓存让依赖拉取变成内网请求，既快又不依赖任何隧道存活，还顺带解决了上游删包、限流的问题。代理只应作为镜像覆盖不到时的兜底。</>}
+/>
+
+## 这节课的落点
+
+- 先诊断再动手：分清 **DNS 层面 / 地址不可达 / 握手被打断 / 限速** 四类
+- `curl --resolve` 是性价比最高的一条命令，一步把 DNS 与连接问题分开
+- **开发者场景优先用镜像源**：Go/pip/npm/cargo/容器镜像都有成熟方案，比隧道更稳
+- 需要在 CI 或服务器上长期用才值得自建；个人临时用途不必
+- VPS 关注地域、流量口径与回程线路（看 `traceroute` 的骨干跳）
+- 服务端三件事：开 BBR、真实域名与证书、务必加认证
+- 环境变量只对认它的程序有效；`ssh`/`git over ssh`/Docker daemon/`apt` 各有各的配法
+- 容器里的 `127.0.0.1` 不是宿主机；`docker build` 用的是 daemon 的代理
+- 用途限定在技术资料访问，遵守当地法规与公司合规政策

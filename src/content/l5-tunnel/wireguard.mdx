@@ -1,0 +1,283 @@
+## 设计上做减法
+
+WireGuard 的所有特点都来自一个决定：**不给选择**。
+
+| 传统 VPN（IPsec / OpenVPN） | WireGuard |
+| --- | --- |
+| 一堆加密套件，需要协商 | **只有一套**：Curve25519 + ChaCha20-Poly1305 + BLAKE2s |
+| 复杂的握手与重协商 | 1-RTT 握手（Noise_IK） |
+| 几十万行代码 | 约 4000 行，在内核里 |
+| TCP 或 UDP，可配 | **只有 UDP** |
+| 有连接状态、有登录 | 无状态，公钥即身份 |
+
+代价是不灵活：套件被攻破就得整体升版本，没有算法降级余地。收益是**攻击面小到可以审计完**，
+而且性能能跑到接近线速——它就在内核里，不像 OpenVPN 要在用户态来回拷贝。
+
+还有一个安静的特性：**对未通过认证的包一律不回应**。所以对外扫端口扫不出 WireGuard，
+`nmap` 看到的就是一个没人应答的 UDP 端口。
+
+## Cryptokey Routing：公钥就是路由表
+
+这是理解 WireGuard 唯一需要真正想清楚的概念。它没有"用户"，只有一张对应表：
+
+```
+公钥 A  ←→  AllowedIPs 10.0.0.2/32, 192.168.50.0/24
+公钥 B  ←→  AllowedIPs 10.0.0.3/32
+```
+
+**`AllowedIPs` 有两个作用，方向相反：**
+
+| 方向 | 含义 |
+| --- | --- |
+| **出方向** | 目的地址落在这个范围里 → 用这个 peer 的公钥加密并发给它 |
+| **入方向** | 从这个 peer 解密出来的包，源地址必须落在这个范围里，否则丢弃 |
+
+也就是说它既是**路由表**又是**访问控制表**。这一条解释了 90% 的 WireGuard 故障：
+
+<Callout type="trap" title="AllowedIPs 不对称 = 单向通">
+一端写 `AllowedIPs = 10.0.0.0/24`，另一端只写 `AllowedIPs = 10.0.0.2/32`，
+结果是**去得了回不来**（或反之），而且**没有任何报错**——包在入方向校验时被静默丢掉。
+
+排查方法：两端各跑一次 `wg show`，把 `allowed ips` 抄下来对照。
+再看 `transfer` 那一行：如果一端只有 `sent` 在涨、`received` 是 0，方向就定位到了。
+</Callout>
+
+## 最小可用配置
+
+先生成密钥。私钥永不外传，只交换公钥：
+
+```bash
+umask 077
+wg genkey | tee privatekey | wg pubkey > publickey
+```
+
+服务端 `/etc/wireguard/wg0.conf`：
+
+```ini
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <服务端私钥>
+
+[Peer]
+PublicKey = <客户端公钥>
+AllowedIPs = 10.0.0.2/32
+```
+
+客户端 `/etc/wireguard/wg0.conf`：
+
+```ini
+[Interface]
+Address = 10.0.0.2/24
+PrivateKey = <客户端私钥>
+
+[Peer]
+PublicKey = <服务端公钥>
+Endpoint = vpn.example.com:51820
+AllowedIPs = 10.0.0.0/24
+PersistentKeepalive = 25
+```
+
+```bash
+wg-quick up wg0        # 起
+wg show                # 看状态
+wg-quick down wg0      # 停
+systemctl enable --now wg-quick@wg0    # 开机自启
+```
+
+注意两处不对称：
+
+- **只有服务端写 `ListenPort`**，客户端不需要（它主动出去，用随机源端口）
+- **只有客户端写 `Endpoint`**，服务端不需要——它靠收到的认证包**自动学习**对方地址。
+  这就是 WireGuard 的漫游能力：客户端从 WiFi 切到 4G，IP 变了，隧道不断。
+
+## PersistentKeepalive：NAT 后面的那一侧要配
+
+WireGuard 默认**完全静默**：没有流量时一个包都不发。这在 NAT 后面会出问题——
+NAT 表项超时后（通常 30 秒到几分钟），外面就再也进不来了。
+
+所以规则是：**在 NAT 后面、且需要被对方主动连接的那一端**，配 `PersistentKeepalive = 25`。
+25 秒是个经验值，比多数 NAT 的 UDP 超时短。
+
+服务端在公网上有固定地址，不需要配。
+
+## MTU：必须算的一笔账
+
+WireGuard 把原包塞进 UDP，外层开销是固定的：
+
+```
+IPv4 外层：20（IP）+ 8（UDP）+ 16（WG 头）+ 16（Poly1305 认证标签）= 60 字节
+IPv6 外层：40（IP）+ 8（UDP）+ 16（WG 头）+ 16（认证标签）      = 80 字节
+```
+
+所以物理 MTU 1500 时：
+
+- 只走 IPv4：`1500 − 60 = 1440`
+- 可能走 IPv6：`1500 − 80 = 1420` ← **`wg-quick` 的默认值就是按这个算的**
+
+1420 是个保守但安全的选择。如果外层路径本身 MTU 更小（PPPoE 拨号常见 1492），还要再减。
+
+<Callout type="warn" title="又是那个「小包通、大包卡」">
+MTU 配大了的症状和 L1 里 overlay 的 MTU 黑洞一模一样：ping 通、SSH 能登、
+`curl` 小接口正常，一传大文件或返回大 JSON 就**卡住**。
+
+验证方法同样是发不允许分片的大包：
+
+```bash
+# 隧道内测：1420 − 28 = 1392
+ping -M do -s 1392 10.0.0.1
+```
+
+不通就往下调，直到通为止，然后把这个值写进配置的 `MTU =`。
+</Callout>
+
+## wg-quick 替你做的事
+
+直接用 `wg` 命令只配隧道本身；`wg-quick` 是个 shell 脚本，额外做了这些：
+
+- 创建接口、配地址、设 MTU
+- **按 `AllowedIPs` 自动装路由** ← 最关键的一步
+- `DNS =` 时改 resolv.conf（通过 `resolvconf` 或 `systemd-resolved`）
+- 执行 `PreUp` / `PostUp` / `PreDown` / `PostDown` 钩子
+
+所以 `AllowedIPs = 0.0.0.0/0` 的效果是"**所有流量都进隧道**"——因为 wg-quick 会装一条
+默认路由（用 fwmark + 策略路由实现，避免把发给对端 Endpoint 自己的包也送进隧道，
+否则会形成死循环）。
+
+## 两个常用形态
+
+### 子网路由：访问对端整个内网
+
+服务端不只做隧道端点，还要转发：
+
+```ini
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <私钥>
+PostUp   = sysctl -w net.ipv4.ip_forward=1
+PostUp   = iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+```
+
+客户端把要访问的内网段加进 `AllowedIPs`：
+
+```ini
+AllowedIPs = 10.0.0.0/24, 192.168.50.0/24
+```
+
+<Callout type="trap" title="隧道通了但访问不了对端内网的其它机器">
+这时候检查三件事，顺序别乱：
+
+1. 客户端的 `AllowedIPs` 里**有没有那个内网段**（没有 = 包压根不进隧道）
+2. 服务端 `net.ipv4.ip_forward` 是不是 1（没开 = 收到了不转发）
+3. 有没有 `MASQUERADE`（没有 = 内网机器收到源地址是 10.0.0.x 的包，不知道往哪回）
+
+三件事各自都会造成"隧道显示正常但业务不通"，而 `wg show` 全都看不出来。
+</Callout>
+
+### 全流量出口
+
+客户端 `AllowedIPs = 0.0.0.0/0, ::/0`，服务端配置同上。
+此时所有出网流量都从服务端出去，别忘了给客户端配 `DNS =`，否则 DNS 还在用本地的。
+
+## 走一遍完整路径
+
+<PacketPathExplorer only={["wireguard"]} />
+
+## 排障：三个地方看完就够
+
+```bash
+wg show
+```
+
+```
+interface: wg0
+  public key: xxxxx
+  private key: (hidden)
+  listening port: 51820
+
+peer: yyyyy
+  endpoint: 203.0.113.5:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 43 seconds ago
+  transfer: 1.24 GiB received, 3.81 GiB sent
+  persistent keepalive: every 25 seconds
+```
+
+| 看哪一行 | 说明什么 |
+| --- | --- |
+| **latest handshake** | 没有这一行 = 从没握手成功（网络不通、端口被封、公钥配错） |
+| **transfer** | 只有一个方向在涨 = `AllowedIPs` 不对称或对端没回 |
+| **allowed ips** | 两端对照，这是最高频的配错项 |
+
+握手都建立不起来时，按顺序排除：
+
+```bash
+# 1. UDP 端口到底通不通（TCP 工具在这里没用）
+nc -zvu vpn.example.com 51820
+
+# 2. 服务端确认包收到了
+tcpdump -i eth0 -nn udp port 51820 -c 10
+
+# 3. 公钥有没有配错（最常见：把私钥当公钥贴上去了）
+wg show wg0 public-key
+```
+
+<Callout type="note" title="UDP 被整体阻断时 WireGuard 无解">
+WireGuard 只跑 UDP，也**不会自动降级到 TCP**。有些网络（酒店、部分企业出口）
+把 UDP 全封了，这时候唯一的办法是在外面再套一层 TCP 隧道
+（比如用 gost 的 `wss` 传输把 UDP 包背过去），或者改用本身就走 TCP 的方案。
+
+Tailscale 解决这个问题的方式是 DERP 中继 —— 下一节讲。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="wg-1"
+  question="WireGuard 里 AllowedIPs 的作用是什么？"
+  options={[
+    { text: '既决定出方向的包发给哪个 peer，也决定入方向允许该 peer 使用哪些源地址', correct: true },
+    { text: '只是路由表，指明目的地址走哪个 peer', feedback: '漏了入方向的校验作用 —— 这正是「单向通」故障的根源。' },
+    { text: '只是访问控制列表', feedback: '它同时也是出方向的路由依据。' },
+    { text: '给 peer 分配 IP 地址', feedback: '地址分配在 [Interface] 的 Address 里，AllowedIPs 不做分配。' },
+  ]}
+  explain={<>这就是 Cryptokey Routing：公钥是身份，AllowedIPs 同时充当路由表和 ACL。两端写得不对称就会出现去得了回不来，而且没有任何报错 —— 入方向的包被静默丢弃。</>}
+/>
+
+<Quiz
+  id="wg-2"
+  question="客户端在 NAT 后面，隧道建好后能主动访问服务端，但服务端过一会儿就无法主动连客户端。缺了什么？"
+  options={[
+    { text: '客户端侧的 PersistentKeepalive', correct: true },
+    { text: '服务端的 ListenPort', feedback: '服务端已经在监听了，否则一开始就连不上。' },
+    { text: '把 MTU 调小', feedback: 'MTU 问题表现为大包卡死，不是这个症状。' },
+    { text: '开启 ip_forward', feedback: '那影响的是能否访问对端内网的其它机器。' },
+  ]}
+  explain={<>WireGuard 默认静默，没流量就不发包，NAT 表项超时后外面进不来。在 NAT 后面且需要被主动连接的那一侧配 PersistentKeepalive = 25。公网固定地址的一侧不需要。</>}
+/>
+
+<Quiz
+  id="wg-3"
+  question="wg-quick 默认把 wg0 的 MTU 设成 1420 而不是 1440，为什么？"
+  options={[
+    { text: '按 IPv6 外层头（40+8+16+16=80 字节）保守计算，IPv4 只需减 60', correct: true },
+    { text: '因为 ChaCha20 需要额外 20 字节', feedback: '认证标签 16 字节已经算在开销里了，加密本身不改变长度。' },
+    { text: '为了兼容 PPPoE', feedback: 'PPPoE 的 1492 需要再往下调，不是 1420 的来历。' },
+    { text: '随便取的经验值', feedback: '这个数字是按外层头精确算出来的。' },
+  ]}
+  explain={<>IPv4 外层 20+8+16+16=60 → 1440；IPv6 外层 40+8+16+16=80 → 1420。wg-quick 取保守值以覆盖两种情况。若上游链路 MTU 本身小于 1500（如拨号 1492），还要继续下调，用 ping -M do 验证。</>}
+/>
+
+## 这节课的落点
+
+- 只有一套加密算法、只走 UDP、约 4000 行代码在内核里；未认证的包一律不回应
+- **Cryptokey Routing**：公钥是身份，`AllowedIPs` 同时是路由表和入方向 ACL
+- 两端 `AllowedIPs` 不对称 = 单向通且无报错，这是最高频的故障
+- 只有服务端写 `ListenPort`，只有客户端写 `Endpoint`（服务端自动学习，因此支持漫游）
+- NAT 后面需要被主动连接的一侧配 `PersistentKeepalive = 25`
+- MTU：IPv4 减 60、IPv6 减 80，`wg-quick` 默认 1420；症状同样是"小包通、大包卡"
+- 访问对端内网要三件套：客户端 `AllowedIPs` 含该网段 + 服务端 `ip_forward` + `MASQUERADE`
+- 排障只看三行：`latest handshake`、`transfer`、`allowed ips`
+- UDP 被整体封锁时 WireGuard 无解，需要外套 TCP 隧道

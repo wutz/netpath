@@ -1,0 +1,207 @@
+## 先分清三种"代理"
+
+同一个词在不同场景里指的是完全不同的东西：
+
+| 类型 | 谁配置它 | 典型用途 |
+| --- | --- | --- |
+| **正向代理** | **客户端**主动指定 | 客户端要访问的目标它自己去不了，或不想直接去 |
+| **反向代理** | **服务端**部署，客户端不知情 | Nginx、Ingress —— 客户端以为它就是服务器 |
+| **透明代理** | **网络**上强插，两端都不知情 | 网关上做统一分流，设备不用改配置 |
+
+L1 里讲的 Ingress 是反向代理，这一节讲的是**正向代理**。两者的方向完全相反：
+反向代理保护和分发服务端，正向代理代表客户端出门。
+
+## HTTP 代理：它看得见你的 URL
+
+普通的 HTTP 请求，请求行里只有路径：
+
+```http
+GET /index.html HTTP/1.1
+Host: example.com
+```
+
+走 HTTP 代理时，请求行变成**完整 URL**（absolute-form），因为代理得知道该替你连谁：
+
+```http
+GET http://example.com/index.html HTTP/1.1
+Host: example.com
+Proxy-Connection: keep-alive
+```
+
+**代理能看到完整 URL、能改请求头、能缓存、能按路径做策略**——这是它的能力也是它的边界：
+仅限明文 HTTP。
+
+## CONNECT：把代理降级成一根管子
+
+HTTPS 的内容是加密的，代理没法改写，于是有了 `CONNECT` 方法：
+
+```http
+CONNECT example.com:443 HTTP/1.1
+Host: example.com
+
+HTTP/1.1 200 Connection Established
+```
+
+这之后代理**不再理解里面的内容**，只在两个 socket 之间搬字节。TLS 握手是客户端和真实服务器直接完成的，
+代理看不到证书、看不到路径、看不到 body。
+
+<Callout type="note" title="代理日志里能看到什么">
+这解释了一个常见困惑：企业代理的日志里，HTTP 请求能看到完整 URL，
+HTTPS 请求却只有一行 `CONNECT example.com:443`。
+
+**能看到域名**（CONNECT 的目标里有），**看不到路径和内容**。
+想看内容只能做 TLS 中间人——那需要在客户端安装代理的根证书。
+</Callout>
+
+`CONNECT` 的目标可以是任意端口，不限于 443。所以 HTTP 代理其实是个**通用 TCP 隧道**——
+很多工具就靠这一点把 SSH、数据库连接也塞进 HTTP 代理里。
+
+## SOCKS5：不理解协议，只管转发
+
+SOCKS5 工作在更低的层次：它不解析应用层协议，只负责"帮我连到某个地址的某个端口"。
+
+一次连接分三步：
+
+```
+1. 客户端: 我支持这些认证方式 [无认证, 用户名密码]
+   代理:   用「无认证」
+
+2. （如需认证）用户名 + 密码
+
+3. 客户端: CONNECT 到 example.com:443
+           ↑ 地址类型可以是 IPv4 / IPv6 / 域名
+   代理:   连上了，源地址是 x.x.x.x
+```
+
+三个关键点：
+
+- **地址类型可以直接是域名**（ATYP=0x03），不需要客户端先解析
+- **支持 UDP**（UDP ASSOCIATE），HTTP 代理做不到
+- **不区分协议**，任何 TCP 应用都能走
+
+| 维度 | HTTP 代理 | SOCKS5 |
+| --- | --- | --- |
+| 理解应用协议 | 是（明文 HTTP） | 否 |
+| 支持任意 TCP | 靠 CONNECT | 原生 |
+| 支持 UDP | 否 | 是 |
+| 能改写内容 / 缓存 | 能（明文时） | 不能 |
+| 认证 | Proxy-Authorization | 内置用户名密码 |
+| 客户端支持面 | 极广（环境变量即可） | 需要程序自己支持 |
+
+## socks5 与 socks5h：一个字母的大坑
+
+这是配置里最容易出错、症状最迷惑的一处：**域名由谁来解析？**
+
+| 写法 | 谁解析域名 |
+| --- | --- |
+| `socks5://` | **本地**解析成 IP，再让代理连这个 IP |
+| `socks5h://` | 把**域名原样**交给代理，由代理侧解析 |
+
+curl 对应两个不同的参数：
+
+```bash
+# 本地解析（用本机 DNS）
+curl --socks5 localhost:1080 https://example.com
+
+# 代理侧解析（h = hostname）
+curl --socks5-hostname localhost:1080 https://example.com
+```
+
+<Callout type="trap" title="用 socks5 而不是 socks5h 时的典型故障">
+本机 DNS 解析出来的 IP 可能是错的、被污染的，或者是一个只在**代理那一侧**才有意义的内网地址。
+
+症状：**代理明明是通的，某些域名就是访问不了**，而 IP 直连却正常。
+换成 `socks5h` 立刻好——因为域名交给了能正确解析它的那一侧。
+
+规则很简单：**代理的出口在哪，域名就该在哪解析。** 除非你明确需要本地解析
+（比如访问只有本地 DNS 知道的内网域名）。
+</Callout>
+
+## 环境变量：约定而非标准
+
+大多数命令行工具认这套环境变量，但**它是约定，没有 RFC**，所以细节各家不同：
+
+```bash
+export HTTP_PROXY=http://127.0.0.1:8080
+export HTTPS_PROXY=http://127.0.0.1:8080     # 注意：值通常仍是 http://
+export ALL_PROXY=socks5h://127.0.0.1:1080
+export NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,.internal,.cluster.local
+```
+
+四个反复踩到的坑：
+
+- **`HTTPS_PROXY` 的值一般还是 `http://`**——它表示"访问 https 时用哪个代理"，
+  而不是"用 https 连代理"。
+- **大小写都要设**。curl 只看小写的 `http_proxy`，其它工具偏好大写。稳妥做法是两套都设。
+- **`NO_PROXY` 的语法各家不一致**：有的支持 CIDR，有的只支持后缀匹配，
+  有的要求写 `.example.com` 才能匹配子域。K8s 环境里一定要包含
+  `10.0.0.0/8`、`.svc`、`.cluster.local`，否则集群内部请求也会绕出去。
+- **改了环境变量对已运行的进程无效**。systemd 服务要改 unit 的 `Environment=`，
+  Docker daemon 要改 `/etc/systemd/system/docker.service.d/http-proxy.conf`。
+
+## 压根不认代理的那些程序
+
+环境变量只对"自己去读它"的程序有效。下面这些完全不理：
+
+| 程序 | 为什么 | 怎么办 |
+| --- | --- | --- |
+| `ping` / `traceroute` | ICMP，不是 TCP | 没有代理概念，改测 `curl` |
+| `dig` / `nslookup` | UDP 53 | 用 DoH/DoT，或让代理侧解析 |
+| `ssh` | 自己一套配置 | `ProxyCommand nc -x host:port %h %p` |
+| `git` over ssh | 走的是 ssh | 同上，配在 `~/.ssh/config` |
+| `apt` / `yum` | 自己的配置文件 | `/etc/apt/apt.conf.d/95proxy` |
+| Docker daemon | 是系统服务 | 改 systemd drop-in 后重启 |
+| 静态编译的二进制 | 可能没实现 | `proxychains`，或上 TUN 模式 |
+
+兜底手段有两个层次：
+
+- **`proxychains` / `tsocks`** —— 用 `LD_PRELOAD` 劫持 socket 调用，对动态链接的程序有效
+- **TUN 模式** —— 建一张虚拟网卡把流量整体接走，**对所有程序有效**，也是客户端软件里
+  "TUN / 虚拟网卡"选项存在的原因（后面 Mihomo 那节会讲）
+
+## 检查点
+
+<Quiz
+  id="pb-1"
+  question="企业代理的访问日志里，为什么 HTTPS 请求只能看到域名而看不到 URL 路径？"
+  options={[
+    { text: '因为 HTTPS 走的是 CONNECT，代理建好隧道后只搬字节，TLS 在客户端与真实服务器之间完成', correct: true },
+    { text: '因为代理故意不记录，保护隐私', feedback: '不是策略问题，是技术上拿不到。' },
+    { text: '因为 HTTPS 不支持代理', feedback: 'HTTPS 完全可以走代理，靠的就是 CONNECT 方法。' },
+    { text: '因为路径被压缩了', feedback: '与压缩无关，代理根本没有解密能力。' },
+  ]}
+  explain={<>CONNECT 让代理退化成一根 TCP 管道。域名之所以可见，是因为它明文写在 CONNECT 请求行里。想看到内容必须做 TLS 中间人，那要求客户端信任代理的根证书。</>}
+/>
+
+<Quiz
+  id="pb-2"
+  question="配了 SOCKS5 代理，IP 直连正常，但某些域名死活访问不了。最该先改什么？"
+  options={[
+    { text: '把 socks5:// 改成 socks5h://，让域名在代理侧解析', correct: true },
+    { text: '换一个代理端口', feedback: '端口能连上就说明代理本身没问题。' },
+    { text: '关掉 IPv6', feedback: '可能相关，但这个症状最典型的原因是 DNS 解析位置。' },
+    { text: '增大超时时间', feedback: '解析到错误的 IP 时，等再久也连不上。' },
+  ]}
+  explain={<>socks5:// 在本地解析域名，拿到的 IP 可能是错的或只在本地网络有意义。socks5h:// 把域名原样交给代理侧解析。口诀：出口在哪，域名就在哪解析。</>}
+/>
+
+<Quiz
+  id="pb-3"
+  question="在 K8s 节点上设置 HTTP_PROXY 后，集群内部请求开始报错。最可能漏了什么？"
+  options={[
+    { text: 'NO_PROXY 没有包含 Service CIDR、Pod CIDR 与 .svc / .cluster.local', correct: true },
+    { text: 'HTTPS_PROXY 写成了 http://', feedback: '这恰恰是正确写法，表示访问 https 时用这个 http 代理。' },
+    { text: '代理不支持 CONNECT', feedback: '那会导致所有 HTTPS 都不通，而不是只影响集群内部。' },
+    { text: 'kubelet 不支持代理', feedback: '它支持，问题在于把本该直连的地址也送去了代理。' },
+  ]}
+  explain={<>集群内部通信必须直连。NO_PROXY 至少要包含 127.0.0.1、节点网段、Pod CIDR、Service CIDR、.svc、.cluster.local。另外注意各工具对 NO_PROXY 的 CIDR 支持不一致，必要时两种写法都加上。</>}
+/>
+
+## 这节课的落点
+
+- 正向代理代表客户端出门，反向代理代表服务端接客，透明代理两端都不知情
+- HTTP 代理能看到明文 URL；HTTPS 走 `CONNECT`，代理只剩搬字节的能力（域名可见、内容不可见）
+- SOCKS5 不理解应用协议，支持任意 TCP 与 UDP，但需要程序自己支持
+- `socks5` 本地解析、`socks5h` 代理侧解析 —— **出口在哪，域名就在哪解析**
+- 代理环境变量是约定不是标准：大小写都设、`NO_PROXY` 写全、改完要重启服务
+- `ping`/`dig`/`ssh`/`apt`/Docker daemon 都不认环境变量，各有各的配法；兜底靠 `proxychains` 或 TUN

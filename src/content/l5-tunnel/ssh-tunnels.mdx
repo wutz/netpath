@@ -1,0 +1,305 @@
+## 一句话记法
+
+三个参数，`-L`、`-R`、`-D`，记混是常态。有一个特别好用的口诀：
+
+> **左边那一侧开新端口。**
+
+- `ssh -L 本地端口:目标:端口` —— 新端口开在**本地**（Local）
+- `ssh -R 远端端口:目标:端口` —— 新端口开在**远端**（Remote）
+- `ssh -D 本地端口` —— 新端口开在**本地**，而且是个 SOCKS5 代理
+
+再配一个顺序记法：`ssh -L local:remote`、`ssh -R remote:local`——
+参数首字母和第一个地址的归属永远一致。
+
+下面这张图把所有形态放在一起，看完再往下读会顺很多：
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1100,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-tunnels-cheat-sheet-rev3.png"
+  alt="SSH 端口转发全形态速查图"
+  caption="SSH 端口转发速查图：本地转发、远程转发、动态转发及其变体。"
+  source="Ivan Velichko · iximiuz Labs, A Practical Guide to SSH Tunnels"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+<Callout type="note" title="本节的图与实验拓扑出处">
+本节的示意图与实验拓扑均引自 Ivan Velichko 的
+[A Practical Guide to SSH Tunnels](https://labs.iximiuz.com/tutorials/ssh-tunnels)（iximiuz Labs），
+图片版权归原作者所有。那篇教程配了可以直接上手的在线 playground，
+**强烈建议照着跑一遍**——本节侧重把它整理成中文的排障心智模型，动手环节以原文为准。
+</Callout>
+
+约定一套贯穿全节的拓扑（同样来自原文）：
+
+| 主机 | 地址 | 说明 |
+| --- | --- | --- |
+| `local` | 家里 `192.168.0.0/24` + 公网 `203.0.113.0/24` | 你的工作机 |
+| `remote` | `203.0.113.30`，同时在 `172.16.0.0/24` | 公网跳板 / 网关，`ssh remote` 可达 |
+| `private` | `172.16.0.40` | 只在 VPC 内部可达 |
+| `internal` | `192.168.0.10` | 只在家里网段可达 |
+
+## 本地转发 -L：把远端服务搬到本地
+
+最常用的一个。远端有个服务只监听 `localhost`，你在本地开一个端口去访问它：
+
+```bash
+ssh -f -N -L 8080:localhost:80 203.0.113.30
+curl localhost:8080
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-local-port-forwarding.png"
+  alt="SSH 本地端口转发示意图"
+  caption="-L：监听端口开在本地，流量在 SSH 服务器那一侧出隧道。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+这里的 `localhost:80` 是**在 remote 上解析**的——它指的是 remote 自己的 80 端口。
+这一点是理解后面所有变体的关键：**冒号后面那个地址，永远由 sshd 那一侧解析。**
+
+`-f -N` 是长期挂隧道的标配：
+
+- `-N` 不执行远程命令，只做转发
+- `-f` 转到后台
+
+### 经跳板机访问第三台机器
+
+把目标地址从 `localhost` 换成一个 remote 能访问到的地址，就变成了经跳板访问内网：
+
+```bash
+ssh -f -N -L 8081:172.16.0.40:80 203.0.113.30
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-local-port-forwarding-bastion.png"
+  alt="经跳板机的 SSH 本地端口转发示意图"
+  caption="目标换成第三台机器的地址，remote 就成了跳板。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+这就是"用跳板机连数据库"的标准做法：本地连 `localhost:8081`，实际打到 VPC 里的 RDS。
+
+### -J 加 -L：访问第三台机器**自己的** loopback
+
+上面那招有个盲区：如果目标服务只监听在 `private` 自己的 `127.0.0.1` 上呢？
+remote 也连不上它。这时候要用 `-J`（ProxyJump）把 SSH 会话**终结在 private 上**：
+
+```bash
+ssh -f -N -J 203.0.113.30 -L 8082:localhost:9000 172.16.0.40
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-local-port-forwarding-jump-host.png"
+  alt="ProxyJump 配合本地端口转发示意图"
+  caption="-J 让会话终结在 private 上，于是 -L 里的 localhost 指的是 private 自己。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+差别就在这里：**`-J` 的跳板只负责中转字节，SSH 会话本身建立在最终主机上**，
+所以 `-L` 里的 `localhost` 解析成 `private` 自己。
+
+## 远程转发 -R：把本地服务暴露到远端
+
+方向反过来：你本地跑着一个服务，想让远端（或经由远端的其他人）访问：
+
+```bash
+ssh -f -N -R 0.0.0.0:8080:localhost:80 203.0.113.30
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-remote-port-forwarding.png"
+  alt="SSH 远程端口转发示意图"
+  caption="-R：监听端口开在远端网关上，流量回到本机出隧道。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+<Callout type="trap" title="-R 默认只绑 loopback，写了 0.0.0.0 也没用">
+这是 `-R` 最常见的挫败点：命令执行成功、没有任何报错，但别的机器就是连不上那个端口。
+
+原因是 sshd 默认只允许远程转发绑到它自己的 `127.0.0.1`。要绑 `0.0.0.0` 必须在
+**服务端** `/etc/ssh/sshd_config` 里打开：
+
+```
+GatewayPorts yes
+```
+
+改完 `systemctl reload sshd`。在服务端用 `ss -lnt | grep 8080` 确认监听地址到底是
+`127.0.0.1:8080` 还是 `0.0.0.0:8080`——一眼就能分辨是不是踩了这个坑。
+</Callout>
+
+同样，把源地址从 `localhost` 换成家里另一台设备，就能把内网设备暴露出去：
+
+```bash
+ssh -f -N -R 0.0.0.0:8081:192.168.0.10:80 203.0.113.30
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-remote-port-forwarding-private-net.png"
+  alt="用远程端口转发暴露家庭内网设备示意图"
+  caption="-R 的源地址换成内网设备，家里的机器也能经公网网关被访问。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+这就是最朴素的"内网穿透"：不需要公网 IP，只需要一台能 ssh 上去的公网机器。
+后面 gost 那节会讲更适合长期跑的做法。
+
+## 动态转发 -D：本机变成 SOCKS5 代理
+
+前面几种都要**事先知道目标地址**。`-D` 不需要——它在本地开一个 SOCKS5 代理，
+目标地址由每个请求自己带：
+
+```bash
+ssh -f -N -D 1080 203.0.113.30
+curl --socks5-hostname localhost:1080 172.16.0.40:80
+curl --socks5-hostname localhost:1080 172.16.0.50:80   # 同一条隧道，不同目标
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-dynamic-local-port-forwarding-rev2.png"
+  alt="SSH 动态端口转发示意图"
+  caption="-D：本机成为 SOCKS5 代理，出口在 SSH 服务器一侧，目标不固定。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+注意客户端**必须会说 SOCKS5**（所以 curl 要用 `--socks5-hostname`），
+这一点在上一节讲过。浏览器可以直接配 SOCKS5 代理，命令行工具靠 `ALL_PROXY` 或 `proxychains`。
+
+看一遍完整路径，注意出口 IP 和 DNS 解析都发生在服务器那一侧：
+
+<PacketPathExplorer only={["ssh-socks"]} />
+
+### 动态远程转发：让 sshd 成为代理
+
+`-R` 不带目标地址时，SOCKS5 代理开在**远端**——需要 OpenSSH 7.6 以上的客户端：
+
+```bash
+ssh -f -N -R 0.0.0.0:1080 203.0.113.30
+# 从 VPC 里的机器访问，出口在你的工作机这一侧
+curl --socks5-hostname 172.16.0.30:1080 192.168.0.10:80
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-dynamic-remote-port-forwarding.png"
+  alt="SSH 动态远程端口转发示意图"
+  caption="不带目标地址的 -R：sshd 成为 SOCKS5 代理，出口在客户端一侧。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+同样受 `GatewayPorts` 约束。这个形态很少用，但在"让云上的机器临时借用你本地网络"时很好使。
+
+## 汇总表
+
+| 命令 | 新端口开在 | 出口在 | 目标是否固定 |
+| --- | --- | --- | --- |
+| `ssh -L 8080:目标:端口` | 本地 | SSH 服务器侧 | 固定 |
+| `ssh -J 跳板 -L 8080:localhost:端口 最终主机` | 本地 | 最终主机自己 | 固定 |
+| `ssh -R 8080:目标:端口` | 远端 | 客户端侧 | 固定 |
+| `ssh -D 1080` | 本地 | SSH 服务器侧 | **不固定** |
+| `ssh -R 1080`（无目标） | 远端 | 客户端侧 | **不固定** |
+
+## 让隧道活得久一点
+
+`-f -N` 只解决了"挂后台"，没解决"断了自动回来"。三层做法，按需要选：
+
+```bash
+# 1. 保活：客户端定期发心跳，防止中间设备回收会话
+ssh -f -N -L 8080:localhost:80 remote \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes
+```
+
+`ExitOnForwardFailure=yes` 很重要：**端口绑定失败时让 ssh 直接退出**，
+而不是留一个连着但没转发的假隧道——否则你会对着一个"进程还在"的隧道排查半天。
+
+```bash
+# 2. 自动重连
+autossh -M 0 -f -N -L 8080:localhost:80 remote \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3
+```
+
+```ini
+# 3. 做成 systemd 服务，开机自启 + 失败重启
+[Unit]
+Description=SSH tunnel to remote:80
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -L 8080:localhost:80 remote \
+  -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+<Callout type="warn" title="服务端侧的安全边界">
+SSH 转发是很强的能力：一个能 ssh 上跳板机的账号，默认就能把跳板机当代理访问它所在的整个网络。
+生产环境的跳板机应该收紧：
+
+```
+# /etc/ssh/sshd_config
+Match User tunnel-only
+    AllowTcpForwarding local        # 只允许 -L，禁掉 -R
+    PermitOpen 172.16.0.40:5432     # 白名单：只能转发到这个目标
+    PermitTTY no
+    X11Forwarding no
+    ForceCommand /usr/sbin/nologin
+```
+
+给隧道用途单独建账号、只放通必要的目标，比事后审计有用得多。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="st-1"
+  question="ssh -R 0.0.0.0:8080:localhost:80 gateway 执行成功，但从别的机器连 gateway:8080 不通。最可能的原因？"
+  options={[
+    { text: 'sshd 没开 GatewayPorts，远程转发只绑在 gateway 自己的 127.0.0.1 上', correct: true },
+    { text: '本地 80 端口没有服务在跑', feedback: '那会表现为连上后立刻断开或报错，而不是完全连不上监听端口。' },
+    { text: '需要用 -L 而不是 -R', feedback: '方向是对的：本地服务暴露到远端就是 -R。' },
+    { text: '防火墙一定拦了', feedback: '有可能，但先在服务端用 ss -lnt 看监听地址，GatewayPorts 是更常见的原因。' },
+  ]}
+  explain={<>在服务端敲 <code>ss -lnt | grep 8080</code>：显示 127.0.0.1:8080 就是这个坑。改 sshd_config 加 GatewayPorts yes 并 reload。这一条同样适用于不带目标地址的动态远程转发。</>}
+/>
+
+<Quiz
+  id="st-2"
+  question="要访问 private 主机上一个只监听 127.0.0.1:9000 的服务，而 private 只能经 bastion 到达。正确的命令是？"
+  options={[
+    { text: 'ssh -J bastion -L 8082:localhost:9000 private', correct: true },
+    { text: 'ssh -L 8082:private:9000 bastion', feedback: '这样 bastion 会去连 private:9000，但那个服务只监听 private 的 loopback，bastion 连不上。' },
+    { text: 'ssh -R 8082:localhost:9000 bastion', feedback: '方向反了，-R 是把本地服务暴露出去。' },
+    { text: 'ssh -D 1080 private', feedback: '动态转发能用，但前提是你已经能直连 private，题目里不能。' },
+  ]}
+  explain={<>关键是 -L 里冒号后面的地址由「SSH 会话终结在哪台机器」决定。-J 让会话终结在 private 上，localhost 才等于 private 自己。这是访问远端 loopback 服务的标准写法。</>}
+/>
+
+<Quiz
+  id="st-3"
+  question="长期挂着的 ssh 隧道，为什么建议加 ExitOnForwardFailure=yes？"
+  options={[
+    { text: '端口绑定失败时让 ssh 直接退出，避免留下一个连着但不转发的假隧道', correct: true },
+    { text: '能提升转发性能', feedback: '它只影响失败时的行为，与性能无关。' },
+    { text: '能自动重连', feedback: '自动重连要靠 autossh 或 systemd 的 Restart。' },
+    { text: '能绕过 GatewayPorts 限制', feedback: '绕不过，那是服务端策略。' },
+  ]}
+  explain={<>默认行为下端口被占用、GatewayPorts 未开这类失败不会让 ssh 退出，进程照样在跑。配合 systemd 的 Restart=always，退出反而是好事 —— 它会被重新拉起并再试一次。</>}
+/>
+
+## 这节课的落点
+
+- 口诀：**左边那一侧开新端口**；`-L local:remote`、`-R remote:local`
+- `-L`/`-R` 里冒号后面的地址由 **sshd 那一侧**解析，这是所有变体的关键
+- 只监听 loopback 的远端服务要用 `-J` 把会话终结在目标机上
+- `-R` 默认只绑 loopback，绑 `0.0.0.0` 需要服务端 `GatewayPorts yes`
+- `-D` 是本地 SOCKS5，出口和 DNS 都在服务器侧；客户端必须会说 SOCKS5
+- 长期隧道三件套：`ServerAliveInterval`、`ExitOnForwardFailure=yes`、systemd `Restart=always`
+- 跳板机上给隧道账号收紧 `AllowTcpForwarding` 与 `PermitOpen`

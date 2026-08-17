@@ -1,0 +1,141 @@
+## K8s 其实没有实现网络
+
+这是理解容器网络最重要的一句话：**Kubernetes 本身不提供网络实现，它只规定了一份必须满足的约束**，
+剩下的交给 CNI 插件。所以"K8s 网络怎么工作"这个问题没有统一答案，取决于你装了哪个 CNI。
+
+但约束是统一的，而且只有四条。把这四条记住，各家 CNI 的取舍就都能看懂了。
+
+## 四条铁律
+
+1. **每个 Pod 有自己独立的 IP**，不和宿主机共享端口空间
+2. **Pod 之间可以直接用这个 IP 互通，中间不做 NAT**
+3. **节点上的进程（比如 kubelet）能直接访问本节点的 Pod**
+4. **Pod 自己看到的 IP，和别人看到它的 IP 是同一个**
+
+第二条和第四条是真正的分水岭。它们直接**排除了 Docker 时代的端口映射方案**：
+一旦做了 NAT，对端看到的源地址就变成了节点 IP，第四条立刻违反。
+
+<Callout type="note" title="为什么这条约束这么重要">
+分布式系统里到处都是"把自己的地址注册到注册中心"这种模式 —— Ceph 的 OSD、Kafka 的 broker、
+各种 RPC 框架都这么干。如果 Pod 看到的自己和别人看到的它不一致，注册进去的地址就是错的。
+免 NAT 不是为了性能，是为了**让应用不需要感知自己跑在容器里**。
+</Callout>
+
+## 三套地址，谁都不能重叠
+
+这是新集群规划时最容易埋雷的地方：
+
+| 地址空间 | 分配给谁 | 谁来管 | 能不能改 |
+| --- | --- | --- | --- |
+| **节点网段** | 物理机 / 虚机 | 机房网络组 | 改动代价大 |
+| **Pod CIDR** | 每个 Pod 一个 IP | CNI（如 Cilium 的 IPAM） | 只能**追加**新段 |
+| **Service CIDR** | ClusterIP 这类虚拟地址 | kube-apiserver 启动参数 | **基本改不了** |
+
+三者互相重叠会出现极其难查的问题：包被路由到错误的地方，而且报错信息毫无指向性。
+规划时还要额外确认**不能和机房里其它网段冲突**，包括 VPN 段和对端机房段。
+
+### Pod CIDR 的容量账
+
+Pod CIDR 不是"够用就行"，它按节点切块分配。以 Cilium 的 cluster-pool 模式为例，
+每个节点从大池子里领一小段（比如 `/24`）：
+
+```
+Pod CIDR = 10.244.0.0/16      → 可切出 256 个 /24
+每节点一段 /24                 → 每节点最多 254 个 Pod
+                              → 集群最多 256 个节点
+```
+
+**节点数上限被地址段写死了。** 一旦用尽，新节点上的 Pod 会一直 `ContainerCreating`，
+而错误信息藏在 CNI 日志里，第一次遇到的人通常要查很久。
+
+<Callout type="trap" title="Pod CIDR 用尽了只能追加，不能改">
+Cilium 的处理方式是在 <code>ipam.operator.clusterPoolIPv4PodCIDRList</code>
+里**新增**一个地址段，然后重启 operator：
+
+```bash
+kubectl rollout restart deployment/cilium-operator -n kube-system
+```
+
+**不能修改已有的地址段** —— 已分配出去的 Pod IP 还在用。所以规划时宁可划大：
+`/16` 和 `/12` 的成本一样是零，但事后补救的成本很高。
+</Callout>
+
+## 东西向与南北向
+
+两个方向的流量由完全不同的组件负责，排障时先分清是哪个方向：
+
+```
+                    ┌─────────── 南北向 ───────────┐
+                    │                              │
+   集群外客户端 ──► LoadBalancer / Ingress ──► Service ──► Pod
+                                                    │
+                    Pod ◄──── 东西向（CNI） ────► Pod
+```
+
+| 需求 | 由谁满足 | 典型实现 |
+| --- | --- | --- |
+| Pod 到 Pod 互通 | **CNI** | Cilium、Kube-OVN |
+| 一组 Pod 的稳定访问入口 | **Service** | kube-proxy 或 eBPF 替换 |
+| 集群外访问（L4） | **LoadBalancer** | MetalLB（裸金属）、云 LB |
+| 集群外访问（L7） | **Ingress / Gateway** | Ingress Nginx、Istio |
+| 服务发现 | **DNS** | CoreDNS |
+| Pod 间访问控制 | **NetworkPolicy** | Cilium |
+| Pod 直连物理网 | **次级 CNI** | Multus / Spiderpool + MacVLAN / SR-IOV |
+
+这张表的用法是**反向查**：拿到一个需求，先确定它该由哪一层解决，
+再去看那一层的配置和日志。绝大部分"K8s 网络问题"排查走偏，都是因为在错误的层里找原因。
+
+<Callout type="tip" title="次级 CNI 是什么时候需要的">
+默认 CNI 给的那张网卡走的是软件转发路径，对普通业务足够。但两类场景需要 Pod 直连物理网：
+
+- **AI 训练**：要用 RDMA 网卡做 GPU 之间的高速通信（L2 会详细讲）
+- **虚拟机**：KubeVirt 里的虚机需要二层网络语义，通常挂 Kube-OVN 作为次级 CNI
+
+这时候给 Pod 插第二张网卡，业务流量走默认 CNI，高性能流量走次级网卡。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="km-1"
+  question="K8s 网络模型为什么明确要求 Pod 之间通信不做 NAT？"
+  options={[
+    { text: '为了让应用看到的自己和别人看到的它一致，注册到注册中心的地址才是对的', correct: true },
+    { text: '为了提升转发性能', feedback: '免 NAT 确实少一步处理，但这不是这条约束的目的 —— 语义一致性才是。' },
+    { text: '因为 NAT 在 Linux 上不可用', feedback: 'NAT 完全可用，Service 的实现本身就在用 DNAT。' },
+    { text: '为了节省 IP 地址', feedback: '恰恰相反，每个 Pod 独立 IP 比端口映射更耗地址。' },
+  ]}
+  explain={<>大量分布式中间件会把「自己的地址」注册出去。如果做了 NAT，Pod 自报的地址和外界看到的地址不一致，注册信息就是错的。免 NAT 的本质目的是让应用不必感知自己在容器里。</>}
+/>
+
+<Quiz
+  id="km-2"
+  question="集群规划时 Pod CIDR 给了 /22，每节点分配 /24。这个集群最多能有几个节点？"
+  options={[
+    { text: '4 个', correct: true },
+    { text: '22 个', feedback: '/22 是前缀长度，不是数量。' },
+    { text: '256 个', feedback: '那是 /16 切 /24 的结果。' },
+    { text: '不受限制，会自动扩容', feedback: 'Pod CIDR 不会自动扩，用尽后新节点的 Pod 会卡在 ContainerCreating。' },
+  ]}
+  explain={<>/22 到 /24 差 2 位，只能切出 4 段。这就是「Pod CIDR 划小了以后加不了节点」的具体算法。补救办法是追加新地址段并重启 CNI operator，但已有段不能改。</>}
+/>
+
+<Quiz
+  id="km-3"
+  question="下面哪些需求应该由 CNI 而不是 Service 来满足？（多选）"
+  options={[
+    { text: '让不同节点上的两个 Pod 用 Pod IP 直接互通', correct: true },
+    { text: '限制某个命名空间的 Pod 不能访问另一个命名空间', correct: true },
+    { text: '给一组 Pod 提供一个稳定的访问入口', feedback: '这是 Service 的职责。' },
+    { text: '把集群外的 HTTPS 流量按域名路由到不同服务', feedback: '这是 Ingress / Gateway 的职责。' },
+  ]}
+  explain={<>CNI 负责「地址与可达性」以及基于身份的访问控制（NetworkPolicy 通常由 CNI 实现）；Service 负责「一组 Pod 的稳定入口」；Ingress 负责 L7 路由。分清层次能让排障少绕很多弯路。</>}
+/>
+
+## 这节课的落点
+
+- K8s 不实现网络，只规定四条约束：独立 IP、免 NAT 互通、节点可达、IP 视角一致
+- 免 NAT 是为了**语义一致**，不是为了性能
+- 三套地址（节点网、Pod CIDR、Service CIDR）互不重叠，且都要避开机房其它网段
+- Pod CIDR 的大小直接锁死节点数上限，只能追加不能修改，规划时宁可划大
+- 拿到需求先判断该由哪一层解决：CNI / Service / Ingress / DNS / NetworkPolicy / 次级 CNI

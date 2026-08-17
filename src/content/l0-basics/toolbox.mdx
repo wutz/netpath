@@ -1,0 +1,200 @@
+## 按层次排队，不要随机试
+
+工具多不是好事，**顺序固定**才是。四层从下往上，每层挑一条命令，走完基本就定位了：
+
+```
+第 1 层  接口与链路   → 网线通不通、速率对不对、有没有硬件错误
+第 2 层  连接与队列   → 连接状态、谁在排队、窗口多大
+第 3 层  协议栈计数   → 重传、丢弃、conntrack、监听队列
+第 4 层  抓包         → 前三层给不出结论时才用
+```
+
+抓包放最后不是因为它没用，而是因为它**信息量太大**。前三层通常已经能收敛到某一段，
+带着假设去抓包，效率比一上来就抓高一个数量级。
+
+## 第 1 层：接口与链路
+
+```bash
+# 一眼看全：状态、MTU、收发计数、错误与丢弃
+ip -s link show bond0
+
+# 协商结果：速率、双工、自协商
+ethtool bond0 | grep -E 'Speed|Duplex|Link detected'
+
+# 网卡自己的详细计数器（各厂家字段名不同，用 grep 捞关键词）
+ethtool -S bond0 | grep -iE 'err|drop|discard|missed|pause'
+
+# 队列深度与中断合并的当前设置
+ethtool -g bond0
+ethtool -c bond0
+ethtool -l bond0        # 有几个收发队列（RSS）
+```
+
+`ethtool -S` 是这一层最有价值的命令。三类关键词的含义：
+
+| 关键词 | 含义 |
+| --- | --- |
+| `rx_missed` / `rx_no_buffer` | 网卡想放但 ring 里没位置 —— CPU 侧跟不上 |
+| `rx_crc_errors` / `rx_frame_errors` | 物理层问题 —— 光模块、光纤、端口 |
+| `pause` / `pfc` | 流控帧计数 —— 在 RoCE 场景下极其重要 |
+
+<Callout type="tip" title="MTU 端到端一致性的验证命令">
+```bash
+# -M do 禁止分片，-s 8972 = 9000 − 28 字节头部
+ping -M do -s 8972 10.10.1.103
+```
+通了才说明整条路径的巨帧都对。症状很有迷惑性：**小包能通、ping 能通、大文件传输卡死**。
+这条命令能省下你半天时间。
+</Callout>
+
+## 第 2 层：连接与队列
+
+```bash
+# 某个对端的连接明细：cwnd、rtt、重传、发送速率
+ss -tim dst 10.10.1.103
+
+# LISTEN socket 的 accept 队列积压与上限
+ss -lnt
+
+# 按状态统计，快速发现 TIME_WAIT / CLOSE_WAIT 堆积
+ss -s
+
+# 谁占着这个端口
+ss -tlnp | grep :8080
+```
+
+三个高频判断：
+
+- **`Send-Q` 高** → 发不出去，问题在对端或路径
+- **`Recv-Q` 高**（ESTAB 连接上）→ 应用读得慢，问题在本机应用
+- **`Recv-Q` 顶到 `Send-Q`**（LISTEN 行上）→ accept 队列满了
+
+## 第 3 层：协议栈计数器
+
+```bash
+# 只显示自上次调用以来有变化的计数器 —— 这是它最好用的地方
+nstat
+
+# 显示全部（含为 0 的），配合 grep 用
+nstat -az | grep -iE 'retrans|drop|listen|overflow|ecn'
+
+# 按秒采样看趋势
+sar -n DEV 1 5      # 每网卡的收发包与字节
+sar -n ETCP 1 5     # TCP 重传与错误
+sar -n SOCK 1 5     # socket 数量
+```
+
+<Callout type="note" title="nstat 比 netstat -s 好用在哪">
+`nstat` 默认只打印**有变化**的计数器，等于自带了一次差分。
+排障时先跑一次清零，再复现问题，第二次的输出就只剩下和这次故障相关的项。
+`netstat -s` 每次都把上千行全打出来，得自己找差异。
+</Callout>
+
+```bash
+# conntrack 是容器环境的高频嫌疑
+conntrack -S             # 每 CPU 的 drop / insert_failed
+sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max
+```
+
+`insert_failed` 或 `drop` 在涨 = conntrack 表撑不住，表现为新连接随机失败。
+
+```bash
+# 软中断侧：第 2 列 dropped，第 3 列 time_squeeze
+cat /proc/net/softnet_stat
+
+# 中断落在哪些 CPU 上
+cat /proc/interrupts | grep -i mlx
+mpstat -P ALL 1
+```
+
+## 第 4 层：抓包
+
+带着假设抓，而不是抓完再想。
+
+```bash
+# 只抓这个对端这个端口，限 200 个包，落盘
+tcpdump -i bond0 -nn -c 200 -w /tmp/a.pcap \
+  'host 10.10.1.103 and tcp port 8080'
+
+# 只看握手与异常包（SYN / FIN / RST）
+tcpdump -i bond0 -nn 'tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0'
+
+# overlay 隧道流量（VXLAN 8472 / Geneve 6081）
+tcpdump -i bond0 -nn 'udp port 8472 or udp port 6081'
+
+# RoCEv2 流量
+tcpdump -i bond0 -nn 'udp port 4791' -c 20
+```
+
+几条纪律：
+
+- **一定要加过滤条件**。生产机上 `tcpdump -i any` 能瞬间产生几 GB 文件并显著影响性能。
+- **一定要限量**：`-c` 限包数、`-W`/`-C` 做滚动切分。
+- **落盘再分析**：`-w` 存文件，用 Wireshark 慢慢看，不要在终端里肉眼滚屏。
+- 只关心包头就加 `-s 96`，能大幅减小文件。
+
+## 压测工具：选对了才有意义
+
+| 工具 | 测什么 | 注意 |
+| --- | --- | --- |
+| `iperf3` | TCP/UDP 吞吐 | 默认测大块流，测不出 PPS 瓶颈 |
+| `iperf3 -u -l 64 -b 0` | 小包 PPS | 这才是打 PPS 的姿势 |
+| `qperf` / `sockperf` | 延迟（含 RDMA） | 关注 P99 而不是平均 |
+| `ib_send_bw` / `ib_write_lat` | RDMA 带宽与延迟 | L2 会专门讲 |
+
+<Callout type="warn" title="单条流测不出集群带宽">
+`iperf3` 单条流受单核和窗口限制，25G 以上的网卡经常测不满。加 `-P 8` 开多流，
+再把结果和 `ethtool -S` 的计数对照，才知道是链路上限还是单流上限。
+</Callout>
+
+## 60 秒网络体检清单
+
+拿到一台陌生机器，按顺序敲：
+
+```bash
+ip -s link show                       # 1. 哪些网卡在用，有没有错误/丢弃
+ethtool <dev> | grep Speed            # 2. 速率协商对不对
+ethtool -S <dev> | grep -iE 'err|drop|missed|pause'   # 3. 网卡级异常
+ss -s                                 # 4. 连接总量与状态分布
+nstat                                 # 5. 自上次以来变化的计数器
+cat /proc/net/softnet_stat            # 6. 软中断有没有丢包/预算耗尽
+mpstat -P ALL 1 3                     # 7. %soft 是否集中在单核
+ip route; ip neigh                    # 8. 路由与 ARP 是否正常
+```
+
+八条命令，一分钟。**跑完还没有线索，才轮到抓包。**
+
+## 检查点
+
+<Quiz
+  id="tb-1"
+  question="要判断「丢包发生在网卡还是协议栈」，最直接的一组命令是？"
+  options={[
+    { text: 'ethtool -S 看网卡计数，配合 /proc/net/softnet_stat 看软中断丢弃', correct: true },
+    { text: 'ping 加 tcpdump', feedback: 'ping 能确认可达性，抓包能看现象，但都不直接给出丢在哪一层的计数。' },
+    { text: 'iperf3 打满带宽看结果', feedback: '这测的是上限，不能定位丢包层级。' },
+    { text: 'top 看 CPU 占用', feedback: '能提示 CPU 瓶颈，但不能区分丢包位置。' },
+  ]}
+  explain={<>分层计数器是定位丢包的唯一可靠手段：网卡侧看 ethtool -S 的 rx_missed / rx_errors，软中断侧看 softnet_stat 第 2、3 列，协议栈侧看 nstat 的各类 drop。</>}
+/>
+
+<Quiz
+  id="tb-2"
+  question="生产机上排查间歇性连接失败，下面哪种抓包方式是可接受的？"
+  options={[
+    { text: "tcpdump -i bond0 -nn -c 500 -s 96 -w /tmp/a.pcap 'host 10.10.1.103 and tcp port 8080'", correct: true },
+    { text: 'tcpdump -i any -w /tmp/all.pcap', feedback: '无过滤、无限量、抓全部接口，在生产机上极易打满磁盘并影响性能。' },
+    { text: 'tcpdump -i bond0 直接在终端滚屏看', feedback: '肉眼滚屏抓不住间歇性问题，而且不落盘就没法回溯。' },
+    { text: '先不抓包，直接重启网络服务', feedback: '重启会毁掉现场，间歇性问题就更难复现了。' },
+  ]}
+  explain={<>四要素：过滤条件、包数限制、只抓包头（-s 96）、落盘。间歇性问题还可以配合 -W/-C 做滚动抓包，让它长时间跑着等复现。</>}
+/>
+
+## 这节课的落点
+
+- 固定顺序：接口 → 连接 → 协议栈 → 抓包，抓包永远放最后
+- `ethtool -S` 三类关键词：`missed/no_buffer`（CPU 跟不上）、`crc/frame`（物理层）、`pause/pfc`（流控）
+- `ss -tim` 看单连接，`ss -lnt` 看 accept 队列，`ss -s` 看全局分布
+- `nstat` 只打印有变化的计数器，天然适合"清零 → 复现 → 再看"
+- 抓包四要素：过滤、限量、只抓包头、落盘
+- 记住 60 秒体检的八条命令，比记住一百个参数有用
