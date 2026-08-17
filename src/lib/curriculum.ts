@@ -339,8 +339,8 @@ export const tracks: Track[] = [
       {
         id: 'l1-service',
         title: 'Service 与南北流量',
-        hint: '一个不存在的 IP 怎么工作、流量从集群外怎么进来、DNS 与策略各在哪一层生效。',
-        lessons: ['service', 'kube-proxy-ebpf', 'ingress-egress', 'dns-policy'],
+        hint: '一个不存在的 IP 怎么工作、VIP 怎么让物理网络知道、L7 入口与 DNS 策略各在哪一层生效。',
+        lessons: ['service', 'kube-proxy-ebpf', 'metallb', 'ingress-egress', 'dns-policy'],
       },
       {
         id: 'l1-extend',
@@ -436,6 +436,37 @@ export const tracks: Track[] = [
           '交互推演：一个请求从客户端到 Pod 的完整跳数',
         ],
         refs: [REF_TKNG, repo('network/metallb/README.md')],
+      },
+      {
+        id: 'metallb',
+        title: 'MetalLB：裸金属集群的 LoadBalancer',
+        summary: '云上一行 type: LoadBalancer 就有 VIP，裸金属得自己实现。两种宣告方式，选错了要么不通、要么只有高可用没有负载均衡。',
+        kind: 'concept',
+        status: 'planned',
+        minutes: 35,
+        objectives: [
+          '解释 L2 模式下 VIP 是怎么被宣告与抢占的，以及为什么它只是高可用',
+          '说清 BGP 模式的对等配置与 ECMP 分担，并据此在两种模式之间选择',
+          '排查 VIP 不通时知道该看哪个 CRD、哪份日志、抓什么包',
+        ],
+        outline: [
+          'Service 那节留下的问题：VIP 怎么让物理网络知道它的存在',
+          'ARP 与 gARP：无请求应答式宣告，以及切换时怎么让全网更新缓存',
+          'L2 模式：单节点承载全部流量，speaker 选主与故障接管',
+          'BGP 基础：AS 号、对等会话、路由宣告',
+          'BGP 模式：多节点宣告同一个 /32，靠 ECMP 真正分担',
+          '两种模式对照：带宽上限、切换速度、对网络组的要求',
+          '与 CNI 的配合：Cilium BGP 把 Pod CIDR 一起宣告出去',
+          '地址池规划：从机房要一段可路由地址，且不能和节点网重叠',
+          '排障四条路：servicel2statuses、speaker 日志、arping 反查、抓 ARP 包',
+          '两个高频坑：externalTrafficPolicy 与 exclude-from-external-load-balancers 标签',
+        ],
+        refs: [
+          repo('network/metallb/README.md'),
+          repo('network/metallb/default-pool.yaml'),
+          repo('network/cilium/README.md'),
+          REF_TKNG,
+        ],
       },
       {
         id: 'kube-proxy-ebpf',
@@ -996,12 +1027,6 @@ export const tracks: Track[] = [
         lessons: ['sriov-macvlan', 'ebpf-xdp', 'dpdk'],
       },
       {
-        id: 'l4-route',
-        title: '让外界找到你的服务',
-        hint: 'VIP 是怎么被宣告出去的 —— L1 里 MetalLB 那两种模式在这里讲透。',
-        lessons: ['bgp-arp'],
-      },
-      {
         id: 'l4-domain',
         title: 'GPU 与存储专项',
         hint: '把 L2 的 RDMA 知识往上接：显存直通、远端盘、集合通信库，以及卸载到卡上的趋势。',
@@ -1083,28 +1108,6 @@ export const tracks: Track[] = [
           '与 XDP、RDMA 的对比',
         ],
         refs: [REF_SYSPERF],
-      },
-      {
-        id: 'bgp-arp',
-        title: 'BGP 与 gARP：VIP 怎么被外界找到',
-        summary: 'MetalLB 的两种模式对应两种网络语言。选错了要么不通，要么切换很慢。',
-        kind: 'concept',
-        status: 'planned',
-        minutes: 35,
-        objectives: [
-          '解释 L2 模式下 VIP 是怎么被宣告和抢占的',
-          '说清 BGP 模式的对等配置与 ECMP 负载分担',
-          '排查 VIP 不通时该抓什么包、看什么日志',
-        ],
-        outline: [
-          'ARP 与 gARP：无请求应答式宣告',
-          'L2 模式：单节点承载 VIP，故障切换靠重新宣告',
-          'BGP 基础：AS、对等、路由宣告',
-          'BGP 模式：ECMP 把同一个 VIP 分散到多节点',
-          '与 CNI 的配合：Pod CIDR 也可以宣告出去',
-          '排障：servicel2status、speaker 日志、arping 与抓包',
-        ],
-        refs: [repo('network/metallb/README.md'), repo('network/cilium/README.md')],
       },
       {
         id: 'gpudirect',
@@ -1596,7 +1599,8 @@ export const PREREQ: Record<string, string[]> = {
   'l1-k8s/cni': ['l1-k8s/k8s-model', 'l0-basics/switching-routing'],
   'l1-k8s/service': ['l1-k8s/k8s-model'],
   'l1-k8s/kube-proxy-ebpf': ['l1-k8s/service'],
-  'l1-k8s/ingress-egress': ['l1-k8s/service'],
+  'l1-k8s/metallb': ['l1-k8s/service', 'l0-basics/switching-routing'],
+  'l1-k8s/ingress-egress': ['l1-k8s/service', 'l1-k8s/metallb'],
   'l1-k8s/quest-pod-unreachable': ['l1-k8s/cni', 'l1-k8s/service', 'l1-k8s/dns-policy'],
 
   // L2：机内 → 原理 → 动手 → 集合通信
@@ -1618,7 +1622,6 @@ export const PREREQ: Record<string, string[]> = {
   'l4-advanced/sriov-macvlan': ['l1-k8s/cni'],
   'l4-advanced/ebpf-xdp': ['l1-k8s/cni', 'l0-basics/kernel-stack'],
   'l4-advanced/dpdk': ['l0-basics/kernel-stack'],
-  'l4-advanced/bgp-arp': ['l1-k8s/service', 'l0-basics/switching-routing'],
   'l4-advanced/gpudirect': ['l2-hpc/pcie-topology', 'l2-hpc/why-rdma'],
   'l4-advanced/nvme-of': ['l2-hpc/why-rdma'],
   'l4-advanced/mpi': ['l2-hpc/nccl'],

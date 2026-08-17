@@ -10,13 +10,13 @@
 | 阶段 | 主题 | 说明 |
 | --- | --- | --- |
 | **L0** | 网络基础 | 一次 curl 的全过程与术语表、带宽/PPS/延迟三指标、二三层转发、报文收发路径、TCP 行为、内核栈调优、观测工具箱 |
-| **L1** | 容器网络 | netns/veth、K8s 网络模型、CNI 数据平面、Service、kube-proxy 与 eBPF、Ingress、DNS/策略、次级 CNI |
+| **L1** | 容器网络 | K8s 网络模型、netns/veth、CNI 数据平面、Service、kube-proxy 与 eBPF、**MetalLB**、Ingress、DNS/策略、次级 CNI |
 | **L2** | 高性能网络 | PCIe 拓扑与带宽账、NVLink/NVSwitch、RDMA 原理、InfiniBand、RoCEv2 与无损以太网、Fat-Tree/Rail 拓扑、perftest、K8s RDMA、NCCL |
 | **L3** | 网络规划 | 需求拆解、以太网 Spine-Leaf 端口账、地址与 VLAN 规划、计算网 Rail 布线账、IB/RoCE 选型 |
-| **L4** | 进阶专题 | SR-IOV/MacVLAN、eBPF/XDP、DPDK、BGP 与 gARP、GPUDirect RDMA、NVMe-oF、MPI、DPU、可观测性、值班手册 |
+| **L4** | 进阶专题 | SR-IOV/MacVLAN、eBPF/XDP、DPDK、GPUDirect RDMA、NVMe-oF、MPI、DPU、可观测性、值班手册 |
 | **L5** | 代理与隧道 | HTTP/SOCKS5 代理、SSH 端口转发、gost、WireGuard、Tailscale、Pritunl、受限网络诊断、流量特征、Mihomo 分流规则、透明网关 |
 
-共 6 个阶段、**22 个小组**、**54 节课**（约 29 小时），其中 **25 节已有正文**，
+共 6 个阶段、**21 个小组**、**54 节课**（约 29 小时），其中 **25 节已有正文**，
 其余为定稿大纲（课程页会渲染大纲占位）。动手环节 15 个：9 个实验 + 4 个命令行闯关 + 2 个规划计算器。
 
 **学习顺序由分组定义**：每个阶段拆成 3～4 个小组，组内按依赖顺序排列，首页按小组展示而不是平铺全部课程。
@@ -101,10 +101,10 @@ netpath/
 │   │   └── lesson-context.ts       # 当前课程 key，供交互组件写进度
 │   ├── content/                # 课程正文
 │   │   ├── l0-basics/          # 8 节（7 节有正文）
-│   │   ├── l1-k8s/             # 9 节（3 节有正文）
+│   │   ├── l1-k8s/             # 10 节（3 节有正文）
 │   │   ├── l2-hpc/             # 10 节（5 节有正文）
 │   │   ├── l3-planning/        # 5 节（2 节有正文）
-│   │   ├── l4-advanced/        # 10 节（1 节有正文）
+│   │   ├── l4-advanced/        # 9 节（1 节有正文）
 │   │   └── l5-tunnel/          # 12 节（7 节有正文）
 │   ├── routes/
 │   │   ├── __root.tsx
@@ -202,7 +202,7 @@ MTU 必须端到端一致，任何一跳不一致都会导致大包被丢弃。
 
 ## 后续可做
 
-- 补齐剩余 29 节正文（优先 L1 的 netns/veth 实验与 L0 的内核栈调优 —— 它们在新手路线的延长线上）
+- 补齐剩余 29 节正文（优先 L1 的 MetalLB 与 netns/veth 实验 —— MetalLB 现在夹在 Service 与 Ingress 之间，是核心路径上的缺口）
 - 再加三个闯关：Pod 之间不通、MTU 黑洞、隧道断点定位
 - 拓扑图交互组件：拖动节点数看 leaf/spine 布线图变化
 - 深色模式（Shiki 已按双主题编译，接一个切换即可）

@@ -83,6 +83,10 @@ MetalLB 从预留的地址池里分配一个 IP，然后用两种方式把它宣
 | **L2** | 某个 speaker 用 gARP 声称"这个 IP 归我" | 单节点承载全部流量，**只是高可用，不是负载均衡** |
 | **BGP** | 多个节点把同一个 `/32` 宣告给上游路由器 | ECMP 真正分担流量 |
 
+> 这里只讲到"有这两种模式"。gARP 的宣告与抢占细节、BGP 的对等配置与 ECMP、
+> 以及地址池规划和完整排障流程，见下一组的
+> [MetalLB：裸金属集群的 LoadBalancer](/learn/l1-k8s/metallb)。
+
 ```yaml
 # 地址池要从机房网络组要一段空闲的可路由地址
 apiVersion: metallb.io/v1beta1
