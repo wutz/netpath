@@ -1,0 +1,260 @@
+## 一句话：让内核可编程
+
+改内核行为的传统办法只有两条：改内核源码重编译，或者写内核模块。
+前者不现实，后者一崩就是整机宕。
+
+eBPF 提供了第三条路：**把一小段程序加载进内核、挂在某个钩子上，
+由验证器保证它不会崩、不会死循环。**
+
+| | 内核模块 | eBPF |
+| --- | --- | --- |
+| 崩了会怎样 | **内核 panic** | 加载时就被拒绝 |
+| 能不能死循环 | 能 | **验证器禁止** |
+| 加载 | 要匹配内核版本 | CO-RE 后可跨版本 |
+| 能力范围 | 无限制 | 受限（这是特性不是缺陷） |
+
+L1 讲的 Cilium、L1 的 kube-proxy 替换、下面要讲的 XDP，底层都是它。
+
+## 三个组成部分
+
+```
+程序（program）  挂在某个钩子上，事件触发时执行
+map              内核与用户态之间共享数据的地方（哈希表、数组、LRU…）
+验证器（verifier）加载时静态分析：有界循环、内存访问合法、指令数上限
+```
+
+**map 是理解 eBPF 的关键**：程序本身不能随意分配内存、不能保存状态，
+所有需要"记住"的东西都放在 map 里，用户态程序通过 map 读写它。
+
+```bash
+# 系统里加载了哪些 eBPF 程序
+bpftool prog show
+# 有哪些 map
+bpftool map show
+# dump 某个 map 的内容
+bpftool map dump id 42
+```
+
+<Callout type="note" title="验证器拒绝加载不是 bug">
+新手写 eBPF 最常见的挫败是"验证器不让过"。它检查的是：
+
+- **循环必须有界**（新内核支持有界循环，老内核完全禁止循环）
+- **每次内存访问前必须做边界检查**——包括读包内容
+- 指令数与栈深度有上限
+- 指针不能随意算术
+
+这些限制换来的是**内核里跑不受信代码的安全性**。
+写不过去通常意味着代码需要重构成"先检查再访问"的形式，而不是绕过验证器。
+</Callout>
+
+## 网络路径上的钩子
+
+按包在路径上出现的先后：
+
+```
+网卡 → [XDP] → 驱动 → [tc ingress] → 协议栈 → [socket ops] → 应用
+                                                     ↑
+应用 → [cgroup/sock] → 协议栈 → [tc egress] → 驱动 → 网卡
+```
+
+| 钩子 | 位置 | 能做什么 | 特点 |
+| --- | --- | --- | --- |
+| **XDP** | **驱动收包最早处** | 丢弃、重定向、改包 | **最快**，此时还没有 `skb` |
+| **tc（ingress/egress）** | 协议栈前后 | 完整的包处理与重定向 | 有 `skb`，功能最全 |
+| **socket / cgroup** | socket 层 | 改地址、限速、按 cgroup 策略 | Cilium 的 kube-proxy 替换在这里 |
+
+**位置越早越快，但可用信息越少**——这是选钩子的核心取舍。
+
+## XDP：为什么能做到线速
+
+XDP 的程序在**驱动收到包、还没分配 `sk_buff` 之前**就执行。省掉的正是最贵的那一步：
+
+```
+常规路径：  DMA → 分配 skb → 协议栈 → netfilter → 判断丢弃
+XDP：      DMA → eBPF 判断 → 丢弃        ← skb 都没建
+```
+
+`sk_buff` 的分配与初始化在小包场景下是主要开销之一。跳过它，
+**丢包能力可以接近线速**——这就是 XDP 被用来扛 DDoS 的原因。
+
+XDP 程序返回一个动作：
+
+| 返回值 | 含义 |
+| --- | --- |
+| `XDP_DROP` | 丢弃（最快，DDoS 防护的核心） |
+| `XDP_PASS` | 交给协议栈正常处理 |
+| `XDP_TX` | **从原网卡发回去**（做反射、简单负载均衡） |
+| `XDP_REDIRECT` | 转发到别的网卡或 CPU |
+| `XDP_ABORTED` | 出错，会触发 tracepoint |
+
+### 三种运行模式
+
+| 模式 | 在哪跑 | 性能 | 要求 |
+| --- | --- | --- | --- |
+| **Native** | 驱动里 | 高 | **驱动要支持** |
+| **Offloaded** | **网卡硬件上** | 最高 | 特定智能网卡 |
+| **Generic** | 协议栈里（兜底） | **低，仅供测试** | 无 |
+
+```bash
+# 看网卡挂了什么 XDP 程序、什么模式
+ip link show dev bond0 | grep -o 'xdp.*'
+bpftool net show
+
+# 加载与卸载
+ip link set dev bond0 xdp obj filter.o sec xdp
+ip link set dev bond0 xdp off
+```
+
+<Callout type="warn" title="Generic 模式的性能数据没有参考价值">
+驱动不支持 native XDP 时会自动回落到 generic 模式，此时程序在协议栈里跑，
+**`skb` 已经分配了**——XDP 最主要的性能优势荡然无存。
+
+所以测性能前一定确认模式：
+
+```bash
+ip -d link show dev bond0 | grep -E 'xdp|prog'
+```
+
+看到 `xdpgeneric` 就说明在兜底模式，测出来的数字不能用来评估 XDP 的真实能力。
+</Callout>
+
+## 典型应用
+
+### ① DDoS 过滤
+
+在 XDP 层按源 IP、包特征直接丢弃，**在协议栈之前**：
+
+```
+攻击流量 → 网卡 → XDP 判断 → XDP_DROP
+                              ↑ CPU 只花了极小代价
+正常流量 → XDP_PASS → 协议栈 → 应用
+```
+
+对比 iptables：iptables 在 netfilter 里过滤，此时 `skb` 已建、
+已经过了一部分协议栈处理，**代价高一个量级**。
+
+### ② 负载均衡
+
+`XDP_TX` / `XDP_REDIRECT` 可以在网卡层做四层转发，不进协议栈。
+大型互联网公司的四层 LB 很多是这么实现的。
+
+### ③ 容器网络数据平面
+
+Cilium 用 tc 和 socket 钩子替换掉 iptables 与 conntrack
+（[kube-proxy 那节](/learn/l1-k8s/kube-proxy-ebpf) 讲过）。收益不只是快：
+
+- 查找是哈希 map，不随 Service 数线性退化
+- socket 层改地址，**整条路径不需要 conntrack**
+- 策略基于**身份**而不是 IP
+
+### ④ 可观测性
+
+这是 eBPF 影响最广的一类用途：**在不改应用、不重启服务的前提下拿到内核视角的数据**。
+
+```bash
+# 常用工具（bcc / bpftrace）
+tcplife            # 每条 TCP 连接的生命周期与字节数
+tcpretrans         # 实时看重传发生在哪条连接
+tcpconnlat         # 连接建立延迟分布
+execsnoop          # 谁在起进程
+```
+
+```bash
+# bpftrace 单行：统计 TCP 重传的目标地址
+bpftrace -e 'kprobe:tcp_retransmit_skb { @[ntop(arg0)] = count(); }'
+```
+
+L0 讲的那套计数器告诉你"有多少重传"，eBPF 工具能告诉你**"是哪条连接、什么时候、为什么"**。
+
+## eBPF / XDP / DPDK 怎么选
+
+三者常被放在一起比，但定位完全不同：
+
+| | eBPF（tc/socket） | XDP | DPDK |
+| --- | --- | --- | --- |
+| 位置 | 内核内 | 驱动最早处 | **用户态，绕开内核** |
+| 网卡是否被独占 | 否 | 否 | **是** |
+| 常规工具还能用吗 | **能** | 能 | **全部失效** |
+| 适合 | 策略、LB、可观测 | **高速丢弃与转发** | 极致 PPS、专用设备 |
+| 运维复杂度 | 低 | 中 | **高** |
+
+**选择顺序建议**：先看 eBPF/XDP 能不能满足——因为它们不夺走网卡、
+不破坏现有工具链。只有确认过不去才上 DPDK（[下一节](/learn/l4-advanced/dpdk)）。
+
+<Callout type="tip" title="一个务实的判断">
+如果你的需求是"过滤"、"转发"、"看清楚发生了什么"，**eBPF/XDP 几乎总是更好的起点**。
+
+DPDK 的价值在于"每个包都要做复杂的用户态处理，且要跑到极致 PPS"，
+比如做网关、NFV 设备。为了少量性能提升就上 DPDK，
+换来的是整机变成专用设备——这笔账很少划算。
+</Callout>
+
+## 调试手段
+
+eBPF 程序在内核里跑，不能用常规调试器：
+
+```bash
+# 程序里 bpf_printk() 的输出
+cat /sys/kernel/debug/tracing/trace_pipe
+
+# 程序与 map 的状态
+bpftool prog show
+bpftool prog dump xlated id 42      # 看验证器处理后的指令
+bpftool map dump name my_map
+
+# Cilium 场景的高层视角
+cilium-dbg monitor --type drop
+cilium-dbg bpf lb list
+```
+
+`bpftool prog dump xlated` 在排查"为什么验证器拒绝"时特别有用——
+它显示的是内核实际看到的指令序列。
+
+## 检查点
+
+<Quiz
+  id="ex-1"
+  question="XDP 为什么能做到接近线速的丢包？"
+  options={[
+    { text: '它在驱动收包最早处执行，此时还没有分配 sk_buff，省掉了最贵的一步', correct: true },
+    { text: '因为它跑在用户态', feedback: '那是 DPDK 的模型，XDP 在内核驱动层。' },
+    { text: '因为它用了专用硬件', feedback: 'offload 模式才用硬件，native 模式在普通网卡上也很快。' },
+    { text: '因为它绕过了网卡', feedback: '包仍然要经过网卡，只是处理位置提前了。' },
+  ]}
+  explain={<>sk_buff 的分配与初始化在小包场景下是主要开销之一。iptables 在 netfilter 里过滤时 skb 早已建好，所以代价高一个量级 —— 这就是 XDP 适合扛 DDoS 的原因。</>}
+/>
+
+<Quiz
+  id="ex-2"
+  question="测试 XDP 性能前，为什么一定要确认运行模式？"
+  options={[
+    { text: 'generic 模式在协议栈里跑、skb 已分配，性能优势荡然无存，数据没有参考价值', correct: true },
+    { text: '因为不同模式的 API 不同', feedback: 'API 一致，差别在执行位置。' },
+    { text: '因为 generic 模式不支持 XDP_DROP', feedback: '动作都支持，只是性能不同。' },
+    { text: '因为 offload 模式需要额外授权', feedback: '它需要特定网卡，但这不是必须确认模式的原因。' },
+  ]}
+  explain={<>驱动不支持 native XDP 时会自动回落 generic。用 <code>ip -d link show dev</code> 看到 xdpgeneric 就说明在兜底模式。这类「静默回落导致测试数据失真」的模式，和 NCCL 回退 TCP 是同一类陷阱。</>}
+/>
+
+<Quiz
+  id="ex-3"
+  question="需求是「过滤掉某些源 IP 的流量并看清楚丢了多少」。最合适的起点是？"
+  options={[
+    { text: 'eBPF/XDP —— 不夺走网卡、常规工具仍可用、能同时做过滤与观测', correct: true },
+    { text: 'DPDK', feedback: '它会独占网卡并让常规工具全部失效，为这个需求付出的代价太大。' },
+    { text: '改内核模块', feedback: '崩了就是内核 panic，而且要匹配内核版本。' },
+    { text: '在应用层过滤', feedback: '包已经过了整个协议栈，过滤的代价最高。' },
+  ]}
+  explain={<>选择顺序：先看 eBPF/XDP 能否满足，因为它们不破坏现有工具链与运维方式。只有「每个包都要复杂用户态处理且要极致 PPS」才值得上 DPDK。</>}
+/>
+
+## 这节课的落点
+
+- eBPF 让内核可编程，**验证器保证不崩不死循环**——这是它相对内核模块的根本差异
+- 三部分：程序、**map（所有状态都放这里）**、验证器
+- 网络钩子按位置：**XDP（最早最快）→ tc（功能最全）→ socket/cgroup（改地址、按 cgroup 策略）**
+- XDP 快在**还没分配 `sk_buff`**；五个返回动作里 `XDP_DROP` 是 DDoS 防护核心
+- **generic 模式的性能数据没有参考价值**，测试前先确认不是 `xdpgeneric`
+- 四类应用：DDoS 过滤、四层 LB、容器网络数据平面、**可观测性**
+- 可观测性是影响最广的一类：不改应用就能拿到"哪条连接在重传"这种内核视角
+- 选型顺序：**先 eBPF/XDP，确认不够再上 DPDK**——后者会独占网卡并让常规工具失效

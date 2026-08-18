@@ -1,0 +1,253 @@
+## 一个反直觉的事实
+
+在 AI 训练里，`mpirun` 启动的任务、日志里满是 MPI 的字样——但**真正搬运梯度的往往不是 MPI**。
+
+```
+mpirun -np 16 ... all_reduce_perf ...
+  ↑ MPI 负责：在 16 个位置把进程拉起来、分配 rank、传递环境变量
+    实际通信：NCCL 走 RDMA 直接在 GPU 之间搬数据
+```
+
+搞清这个分工，就能理解为什么调 MPI 参数对带宽没影响，
+以及为什么会出现"两套通信库抢同一条路"的报错。
+
+## MPI 的三个基本概念
+
+| 概念 | 含义 |
+| --- | --- |
+| **rank** | 进程编号，从 0 开始。`-np 16` 就是 16 个 rank |
+| **communicator** | 一组 rank 的集合，集合通信在它上面进行 |
+| **集合操作** | `MPI_Allreduce`、`MPI_Bcast`、`MPI_Alltoall` 等 |
+
+传统 HPC（气象、CFD、分子动力学）里，这些集合操作**由 MPI 自己实现**，
+数据在 CPU 内存之间搬。AI 训练不同：数据在显存里，且有 NVLink 这条更快的路，
+所以由 NCCL 接管。
+
+## 分层结构
+
+```
+应用（PyTorch / nccl-tests）
+   ├── NCCL          ← GPU 之间的集合通信，走 NVLink / RDMA
+   └── MPI           ← 进程启动、rank 分配、环境传递
+        └── UCX      ← MPI 的传输层，负责选网卡与协议
+             └── verbs / TCP
+```
+
+**UCX** 是这里容易被忽略的一层：它是 OpenMPI 现在默认的传输框架，
+负责"用哪张网卡、走 RDMA 还是 TCP"。所以调网络相关的 MPI 问题，
+经常要调的是 UCX 的参数。
+
+```bash
+# 让 UCX 用指定网卡
+-x UCX_NET_DEVICES=bond1
+# 排查时打开日志
+-x UCX_LOG_LEVEL=info
+```
+
+## mpirun 的关键参数
+
+```bash
+mpirun -np 16 \
+  -bind-to none \
+  -x LD_LIBRARY_PATH \
+  -x NCCL_IB_HCA=mlx5 \
+  -x NCCL_SOCKET_IFNAME=bond1 \
+  -x UCX_NET_DEVICES=bond1 \
+  ./all_reduce_perf -b 8 -e 8G -f 2 -g 1
+```
+
+| 参数 | 作用 | 注意 |
+| --- | --- | --- |
+| `-np <n>` | 总 rank 数 | **= 节点数 × 每节点 GPU 数** |
+| `-bind-to none` | **不做 CPU 绑定** | 见下面的说明 |
+| `-x VAR` | 把环境变量传给所有 rank | **不传就只有 launcher 有** |
+| `-mca <k> <v>` | 调 OpenMPI 内部组件 | 用来禁用冲突组件 |
+
+<Callout type="warn" title="-x 不传，环境变量就到不了计算节点">
+这是最高频的一个坑：你在 launcher 上 `export NCCL_IB_HCA=mlx5`，
+然后 `mpirun` 起 16 个进程——**其中 15 个在别的节点上，它们没有这个变量**。
+
+结果是各 rank 行为不一致：有的走 RDMA、有的回退 TCP，
+表现为**带宽莫名偏低且不稳定**。
+
+所有 NCCL / UCX 变量都要显式 `-x` 传过去。核对方法：
+
+```bash
+mpirun -np 16 -x NCCL_IB_HCA env | grep NCCL_IB_HCA | sort -u
+# 应该看到 16 行相同的输出
+```
+</Callout>
+
+### 为什么是 `-bind-to none`
+
+一般 HPC 场景会绑核提升缓存命中，但 [nccl-tests 的实践配置](/learn/l2-hpc/nccl)
+里统一用 `-bind-to none`，理由是：
+
+**过度绑核会干扰 NCCL 自己的线程调度。** NCCL 会起自己的通信线程，
+它对 CPU 的使用模式和 MPI 计算进程不同。MPI 把进程死绑在某个核上，
+反而限制了 NCCL 的调度空间。
+
+不过这不是绝对的——**绑核这件事必须实测**，不同机型、不同负载结论可能相反。
+默认从 `-bind-to none` 开始，需要时再试其它策略。
+
+## hcoll 与 NCCL 抢路
+
+这是 AI 场景里最典型的一类 MPI 问题。
+
+**hcoll** 是 Mellanox 提供的集合通信加速库，它会被 OpenMPI 自动启用。
+问题在于：**nccl-tests 里 MPI 只做启动器，集合通信全部由 NCCL 完成**，
+hcoll 在这里没有用武之地，却可能在初始化阶段与 NCCL 争抢设备资源。
+
+症状是初始化阶段报错或卡住，日志里能看到 hcoll 相关的信息。
+
+```bash
+# 方式一：mca 参数（5090 系列的常见写法）
+mpirun ... -mca coll_hcoll_enable 0 ...
+
+# 方式二：环境变量（B200/B300 的常见写法）
+mpirun ... -x OMPI_MCA_coll_hcoll_enable=0 ...
+
+# 排查时打开 hcoll 日志看它在干什么
+mpirun ... -x OMPI_MCA_coll_hcoll_verbose=100 ...
+```
+
+<Callout type="tip" title="判断该不该禁 hcoll 的标准">
+问一个问题：**这个任务的集合通信是谁做的？**
+
+| 场景 | 集合通信由谁做 | hcoll |
+| --- | --- | --- |
+| nccl-tests、PyTorch DDP | **NCCL** | **可以禁用** |
+| 传统 HPC 应用（CPU 计算） | **MPI 自己** | 保留，它能加速 |
+
+不确定时先不动它；只有遇到初始化冲突或异常报错才禁用。
+"看到就禁"是不对的——传统 HPC 场景 hcoll 是有价值的。
+</Callout>
+
+## 扩展节点数：两处必须同改
+
+```bash
+# numNodes 与 -np 是一组，改一个不改另一个是高频错误
+sed -e 's/numNodes: 2/numNodes: 4/' \
+    -e 's/-np 16/-np 32/' \
+    nccl-tests-b200.yaml > nccl-tests-4node.yaml
+diff nccl-tests-b200.yaml nccl-tests-4node.yaml
+```
+
+只改 `numNodes` 不改 `-np`：调度了 4 个节点，但只起 16 个进程，
+**有一半 GPU 闲着**，busbw 看起来"莫名偏低"。
+
+只改 `-np` 不改 `numNodes`：进程数超过可用 GPU，启动就失败。
+
+## K8s 里的 MPI 作业
+
+传统 HPC 用 Slurm，K8s 侧对应的是 MPIJob / Kubeflow Trainer：
+
+```yaml
+# 结构大意
+launcher:                    # 1 个，只跑 mpirun，不占 GPU
+  replicas: 1
+node:                        # N 个，实际计算
+  replicas: 1                # 由 numNodes 展开
+  resources:
+    nvidia.com/gpu: 8
+    rdma/hca: 1
+```
+
+几个实践要点：
+
+| 要点 | 原因 |
+| --- | --- |
+| `runLauncherAsNode: false` | **launcher 不占 GPU**，它只负责启动 |
+| SSH 免密（`sshAuthMountPath`） | mpirun 靠 SSH 拉起远端进程 |
+| `readinessProbe` 探 2222 | 等 sshd 就绪，否则 mpirun 连不上 |
+| `dshm`（`emptyDir: Memory`） | **NCCL 需要共享内存**，默认 64MB 不够 |
+| `IPC_LOCK` | RDMA 注册内存要锁内存 |
+| `successPolicy: launcher` | launcher 退出即判定作业结束 |
+
+<Callout type="trap" title="/dev/shm 太小是很隐蔽的一个坑">
+容器默认 `/dev/shm` 只有 64MB。NCCL 在同节点多卡通信时会用共享内存，
+不够时表现为**初始化失败或性能异常**，报错信息还不一定指向 shm。
+
+```yaml
+volumes:
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 16Gi
+volumeMounts:
+  - name: dshm
+    mountPath: /dev/shm
+```
+
+```bash
+# 验证
+kubectl exec -it <pod> -- df -h /dev/shm
+```
+</Callout>
+
+## 排障顺序
+
+```
+MPI 作业跑不起来或性能异常
+   │
+   ├─ 1. 进程数对吗              -np = 节点数 × 每节点 GPU 数
+   ├─ 2. 环境变量传过去了吗       mpirun -x VAR env | grep VAR | sort -u
+   ├─ 3. SSH 通吗（K8s 场景）     sshd 是否就绪、密钥是否挂载
+   ├─ 4. /dev/shm 够大吗          df -h /dev/shm
+   ├─ 5. hcoll 冲突吗             日志里有没有 hcoll 报错 → 禁用试试
+   ├─ 6. UCX 选对网卡了吗         -x UCX_NET_DEVICES / UCX_LOG_LEVEL=info
+   └─ 7. NCCL 走 RDMA 了吗        日志找 NET/IB（这才是带宽的决定因素）
+```
+
+**第 7 步才是性能问题的关键**——前六步解决的是"能不能跑"，
+带宽好不好由 NCCL 那一侧决定（[NCCL 那节](/learn/l2-hpc/nccl) 讲过）。
+
+## 检查点
+
+<Quiz
+  id="mp-1"
+  question="nccl-tests 里 MPI 的实际职责是什么？"
+  options={[
+    { text: '进程启动器：拉起进程、分配 rank、传递环境变量；集合通信由 NCCL 完成', correct: true },
+    { text: '负责所有集合通信', feedback: '那是传统 HPC 应用的模式；AI 场景数据在显存里，由 NCCL 接管。' },
+    { text: '负责 GPU 之间的数据搬运', feedback: '搬运走 NVLink 或 RDMA，由 NCCL 调度。' },
+    { text: '负责网络拥塞控制', feedback: '拥塞控制在网络层（PFC/ECN 或 IB credit）。' },
+  ]}
+  explain={<>搞清这个分工才能理解：调 MPI 参数对带宽没影响，而 hcoll 之所以可以禁用，正是因为集合通信本来就不经过它。</>}
+/>
+
+<Quiz
+  id="mp-2"
+  question="在 launcher 上 export 了 NCCL_IB_HCA 但没加 -x，会发生什么？"
+  options={[
+    { text: '只有 launcher 有这个变量，其它节点的 rank 拿不到，各 rank 行为不一致导致带宽异常', correct: true },
+    { text: 'mpirun 会报错退出', feedback: '不会报错，这正是它难查的原因。' },
+    { text: '所有 rank 自动继承', feedback: '跨节点的进程不会继承 launcher 的环境变量。' },
+    { text: '只影响 launcher 自己', feedback: 'launcher 通常不参与计算，真正受影响的是各计算节点。' },
+  ]}
+  explain={<>核对方法：<code>mpirun -np 16 -x NCCL_IB_HCA env | grep NCCL_IB_HCA | sort -u</code>，应该看到 16 行相同输出。所有 NCCL/UCX 变量都要显式 -x 传。</>}
+/>
+
+<Quiz
+  id="mp-3"
+  question="什么情况下应该禁用 hcoll？"
+  options={[
+    { text: '集合通信由 NCCL 完成（如 nccl-tests、PyTorch DDP）且遇到初始化冲突时', correct: true },
+    { text: '任何使用 MPI 的场景都应该禁用', feedback: '传统 HPC 应用里 hcoll 能加速集合通信，禁用是损失。' },
+    { text: '只要用了 RDMA 就禁用', feedback: '与是否用 RDMA 无关，与谁做集合通信有关。' },
+    { text: '性能不达标时都试着禁用', feedback: '带宽问题的决定因素在 NCCL 那一侧，不是 hcoll。' },
+  ]}
+  explain={<>判断标准是「集合通信由谁做」：NCCL 做的场景 hcoll 没有用武之地，冲突时可禁；传统 HPC 应用里它有价值。不确定时先不动。</>}
+/>
+
+## 这节课的落点
+
+- AI 训练里 **MPI 通常只是启动器**，集合通信由 NCCL 完成
+- 分层：应用 → NCCL（GPU 通信）／ MPI（启动）→ **UCX（传输层，选网卡）** → verbs/TCP
+- **`-x` 不传，环境变量到不了计算节点**，各 rank 行为不一致导致带宽异常
+- `-bind-to none` 是 nccl-tests 的常见配置，因为过度绑核会干扰 NCCL 线程调度；
+  **绑核必须实测**
+- **hcoll 禁不禁看"集合通信由谁做"**：NCCL 做的可禁，传统 HPC 应用别禁
+- 扩节点要**同时改 `numNodes` 与 `-np`**
+- K8s 侧要点：launcher 不占 GPU、SSH 免密、探针等 sshd、**`/dev/shm` 要调大**、`IPC_LOCK`
+- 排障前六步解决"能不能跑"，**第七步（NCCL 是否走 RDMA）才决定带宽**

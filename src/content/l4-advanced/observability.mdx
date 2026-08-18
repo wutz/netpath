@@ -1,0 +1,266 @@
+## 把"网络好不好"变成数字
+
+前面所有课都在教怎么用命令查问题。但命令是**被动的**——你得先知道有问题才会去敲。
+这一节讲怎么让问题**主动找到你**。
+
+核心思路只有一句：**每一层都有计数器，把它们变成时间序列，给关键的几个配告警。**
+
+## 分四层采集
+
+和 L0 的排障顺序一致，监控也按这四层组织：
+
+| 层 | 采集什么 | 来源 |
+| --- | --- | --- |
+| **接口与链路** | 速率、错误、丢弃、流控帧 | `ethtool -S`、`/sys/class/net` |
+| **协议栈** | 重传、超时、队列溢出、conntrack | `nstat`、`/proc/net/*` |
+| **容器网络** | 策略拒绝、Service 转发、DNS | CNI 的指标端点 |
+| **高性能网络** | PFC/ECN、BER、NVLink、busbw | `perfquery`、DCGM |
+
+## 第一层：接口与链路
+
+`node_exporter` 默认就采集了大部分，但**网卡厂商特有的计数器要额外开**：
+
+```bash
+# 这些是 ethtool -S 里的，默认不采集
+node_exporter --collector.ethtool
+```
+
+必须监控的几个（L0 讲过它们的含义）：
+
+| 指标 | 告警条件 | 说明 |
+| --- | --- | --- |
+| `rx_missed` / `rx_no_buffer` | **持续增长** | CPU 侧跟不上，查队列数与亲和性 |
+| `rx_crc_errors` / `rx_frame_errors` | **任何增长** | 物理层问题，查光模块与线缆 |
+| 链路速率 | **不等于预期值** | 协商降级 |
+| `tx_pause` / `rx_pause` | RoCE 场景**持续增长** | 无损配置有问题 |
+
+<Callout type="tip" title="速率降级要监控「不等于预期」而不是「低于阈值」">
+一个实践经验：不要写"速率低于 100G 告警"，而要写"**速率 ≠ 期望值**告警"。
+
+原因是降级往往是对半的（400 → 200、100 → 25），阈值写死了容易漏。
+把每个网卡的期望速率作为元数据打进标签，然后比对——
+这样 400G 口协商成 200G 也能立刻发现。
+
+这类降级是静默故障，[PCIe](/learn/l2-hpc/pcie-topology) 与
+[perftest](/learn/l2-hpc/perftest) 两节反复提到它。
+</Callout>
+
+## 第二层：协议栈
+
+```bash
+# nstat 的指标可以直接喂给采集器
+nstat -az | grep -iE 'retrans|drop|listen|overflow|timeout'
+```
+
+| 指标 | 告警条件 | 含义 |
+| --- | --- | --- |
+| **重传率**（`TcpRetransSegs` / `TcpOutSegs`） | **持续超过 0.1%** | 路径丢包 |
+| `TcpExtTCPTimeouts` | 明显增长 | **每次至少 200ms**，P99 尖刺来源 |
+| `TcpExtListenOverflows` | **任何增长** | accept 队列满，应用消费不过来 |
+| `softnet_stat` 第 2、3 列 | 增长 | 软中断丢包 / 预算耗尽 |
+| conntrack 用量 | **超过 80%** | 接近上限，新连接会随机失败 |
+
+```promql
+# 重传率（这条值得直接抄）
+rate(node_netstat_Tcp_RetransSegs[5m]) / rate(node_netstat_Tcp_OutSegs[5m]) > 0.001
+
+# conntrack 水位
+node_nf_conntrack_entries / node_nf_conntrack_entries_limit > 0.8
+```
+
+## 第三层：容器网络
+
+这一层的特殊性在于**很多丢包只在宿主机侧可见**（L1 反复强调过）。
+
+```bash
+# Cilium 的指标端点
+curl -s http://localhost:9962/metrics | grep -E 'drop|policy|forward'
+```
+
+| 指标 | 为什么重要 |
+| --- | --- |
+| **策略拒绝计数** | 策略改动后的第一现场，Pod 内部看不到 |
+| Service 转发错误 | Endpoint 为空、后端不可达 |
+| **CoreDNS 请求量与延迟** | 集群里一半的"网络故障"是 DNS |
+| CoreDNS 上游转发失败 | 外部解析全部变慢的根因 |
+| conntrack（iptables/IPVS 模式） | 见上一层 |
+
+流量可见性工具能补上"哪个 Pod 到哪个 Pod 被拒了"这种具体信息：
+
+```bash
+# 实时看被丢弃的流，带原因与身份
+hubble observe --verdict DROPPED --last 50
+hubble observe --from-pod default/frontend --to-pod default/api
+```
+
+<Callout type="note" title="策略拒绝要按「变更时间」看，不是按绝对值">
+策略拒绝计数天然不为零——正常拦截也算。所以告警不能写"拒绝数大于 0"。
+
+有效的做法是**关注变化率与变更时间的关联**：
+
+```promql
+# 拒绝速率突增（相对前一小时）
+rate(cilium_drop_count_total{reason="Policy denied"}[5m])
+  > 3 * rate(cilium_drop_count_total{reason="Policy denied"}[5m] offset 1h)
+```
+
+再配合"策略变更事件"作为标注线，就能一眼看出
+"这波拒绝是不是刚才那次策略改动引起的"。
+</Callout>
+
+## 第四层：高性能网络
+
+这一层的指标最容易被忽略，但它的故障**全都是静默的**——
+功能正常、只是变慢，业务侧要很久才发现。
+
+| 指标 | 来源 | 告警条件 |
+| --- | --- | --- |
+| **PFC 帧计数** | `ethtool -S` | 持续增长 = 靠踩刹车硬撑 |
+| **ECN 标记** | `nstat`、交换机 | 有是正常的，**失控增长**不正常 |
+| **BER / 符号错误** | `perfquery -a` | **缓慢恶化 = 线缆将坏** |
+| 链路状态与速率 | `ibstat` | 任何非 Active/预期速率 |
+| **NVLink 链路数** | `nvidia-smi topo -m` | **与预期不一致 = 掉链** |
+| **busbw 基线** | 定期跑 NCCL 测试 | 相比基线下降超过 5% |
+
+```bash
+# DCGM 提供 GPU 与 NVLink 的指标（生产用它而不是人工巡检）
+# DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL
+# DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL
+```
+
+<Callout type="warn" title="busbw 基线是这一层最有价值的一个指标">
+[NCCL 那节](/learn/l2-hpc/nccl) 说过：busbw 是唯一能一次性覆盖
+网卡、PCIe、NVLink、链路速率、rail 布线、拥塞控制与参数配置的端到端指标。
+
+把它做成**定期任务 + 趋势图**：
+
+```bash
+# 每周跑一次，记录峰值 busbw
+date +%F,$(kubectl logs <launcher> | awk '/Avg bus bandwidth/{print $NF}') \
+  >> /var/log/busbw-baseline.csv
+```
+
+有基线才能发现"上周 385、这周 340"。没基线只能等业务抱怨训练变慢——
+而那时已经浪费了几周的算力。
+</Callout>
+
+## 抓包工程化
+
+抓包不能只靠人在故障时手工敲。间歇性问题需要**提前部署、等它复现**：
+
+```bash
+# 滚动抓包：每个文件 100MB，保留 10 个，自动覆盖
+tcpdump -i bond0 -nn -s 96 -W 10 -C 100 -w /var/log/pcap/trace \
+  'host 10.0.20.10 and tcp port 8080'
+```
+
+四条纪律（L0 讲过，这里是工程化版本）：
+
+| 纪律 | 工程化做法 |
+| --- | --- |
+| 加过滤条件 | 写进脚本，别临时想 |
+| 限量 | `-W` / `-C` 滚动切分，不会打满磁盘 |
+| 只抓包头 | `-s 96` |
+| 落盘 | 固定目录 + 磁盘水位监控 |
+
+**再加一条**：抓包本身要有资源上限。生产机上跑无限制的 `tcpdump`
+是自己制造故障——用 `systemd` 的 `MemoryMax` / `CPUQuota` 兜一下。
+
+## 看板设计：三层结构
+
+看板的价值在于**排除的顺序**，而不是把所有指标堆在一起：
+
+```
+第一屏：是不是网络的问题？
+  ├─ 各层丢包总览（网卡 / 软中断 / 协议栈 / CNI）
+  ├─ 重传率趋势
+  └─ 关键服务的 P99 延迟
+
+第二屏：在哪一层？
+  ├─ 按节点的 rx_missed / softnet drop
+  ├─ conntrack 水位
+  └─ CNI 的 drop 分类（策略 / 转发 / 其它）
+
+第三屏：高性能网络专项
+  ├─ PFC / ECN 趋势
+  ├─ 链路速率一致性（有几个口不等于预期）
+  ├─ NVLink 链路数一致性
+  └─ busbw 基线趋势
+```
+
+**第一屏要能在 30 秒内回答"要不要继续查网络"**。
+很多"网络故障"其实是应用问题，第一屏就该把它排除掉。
+
+## 告警清单
+
+只列真正值得半夜叫人的：
+
+| 告警 | 条件 | 严重度 |
+| --- | --- | --- |
+| 链路 down 或速率不符 | 立即 | 高 |
+| `rx_crc_errors` 增长 | 持续 5 分钟 | 高（硬件将坏） |
+| 重传率 | 超过 1% 持续 5 分钟 | 高 |
+| conntrack 水位 | 超过 90% | 高 |
+| `ListenOverflows` 增长 | 持续 | 中 |
+| PFC 帧持续增长 | RoCE 场景 | 中 |
+| BER 缓慢恶化 | 周趋势 | **低但要跟**（预防性换线） |
+| busbw 低于基线 5% | 周对比 | 中 |
+| 重传率 0.1%–1% | 持续 | 低（记录，不叫人） |
+
+<Callout type="tip" title="分清「叫人」与「记录」">
+上面表里最后一行是刻意的：重传率 0.1% 是**警戒线**而不是**故障线**。
+把警戒线配成半夜告警，几周之后就没人看告警了。
+
+判断标准：**这个告警响了，接手的人现在能做什么？**
+如果答案是"明天再看"，那它就不该是高优先级。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="ob-1"
+  question="为什么链路速率的告警应该写「不等于预期值」而不是「低于某个阈值」？"
+  options={[
+    { text: '降级往往是对半的（400→200、100→25），写死阈值容易漏掉高速口的降级', correct: true },
+    { text: '因为阈值告警不支持网络指标', feedback: '技术上完全支持，问题在于覆盖不全。' },
+    { text: '因为速率会正常波动', feedback: '协商速率是固定值，不会波动。' },
+    { text: '为了减少告警数量', feedback: '目的是覆盖更全，不是减少数量。' },
+  ]}
+  explain={<>把每个网卡的期望速率作为元数据打进标签再比对，这样 400G 协商成 200G 也能发现。速率降级是典型的静默故障 —— ibstat 显示正常、业务能跑，只是慢。</>}
+/>
+
+<Quiz
+  id="ob-2"
+  question="策略拒绝计数的告警该怎么配？"
+  options={[
+    { text: '看变化率并与策略变更时间关联，因为正常拦截也会产生计数', correct: true },
+    { text: '大于 0 就告警', feedback: '正常拦截也算计数，会产生大量噪音。' },
+    { text: '不需要监控', feedback: '这是策略改动后的第一现场，Pod 内部完全看不到。' },
+    { text: '只在 Pod 内部采集', feedback: '策略丢包发生在宿主机数据平面，Pod 内无痕迹。' },
+  ]}
+  explain={<>关注变化率突增，并把「策略变更事件」作为标注线，就能一眼看出这波拒绝是不是刚才那次改动引起的。这是 L1《DNS 与策略》里「宿主机侧才看得到 drop」的监控版本。</>}
+/>
+
+<Quiz
+  id="ob-3"
+  question="高性能网络这一层，最值得做成定期基线的指标是什么？"
+  options={[
+    { text: 'busbw —— 它一次性覆盖网卡、PCIe、NVLink、链路速率、rail 布线与参数配置', correct: true },
+    { text: 'PFC 帧计数', feedback: '重要，但只覆盖无损配置这一个方面。' },
+    { text: '链路速率', feedback: '重要，但只覆盖物理层。' },
+    { text: 'GPU 利用率', feedback: '那是计算侧指标，不反映网络健康。' },
+  ]}
+  explain={<>这一层的故障几乎都是静默退化：NVLink 掉链、BER 恶化、维护后插错槽位，都只让 busbw 掉几个百分点。有基线才能发现「上周 385、这周 340」。</>}
+/>
+
+## 这节课的落点
+
+- 监控按 L0 的排障顺序分四层：**接口链路 → 协议栈 → 容器网络 → 高性能网络**
+- 链路速率告警写"**不等于预期**"而不是"低于阈值"，降级常是对半的
+- 协议栈必看：**重传率 0.1% 警戒 / 1% 告警**、`TCPTimeouts`、`ListenOverflows`、conntrack 水位
+- 容器网络的丢包**只在宿主机侧可见**；策略拒绝要**看变化率并关联变更时间**
+- 高性能网络的故障全是静默的：PFC、ECN、**BER 缓慢恶化**、NVLink 链路数
+- **busbw 基线是这一层最有价值的指标**，做成定期任务 + 趋势图
+- 抓包要工程化：过滤、`-W`/`-C` 滚动、`-s 96`、固定落盘 + 资源上限
+- 看板三层结构，**第一屏 30 秒回答"要不要继续查网络"**
+- 告警要分清**叫人与记录**：警戒线配成半夜告警，几周后就没人看了

@@ -1404,7 +1404,7 @@ export const tracks: Track[] = [
         title: 'eBPF 与 XDP：把逻辑塞进内核路径',
         summary: '从 Cilium 到网络可观测性，eBPF 已经是容器网络的默认答案。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '说出 eBPF 程序可以挂在网络路径的哪些钩子上',
@@ -1426,7 +1426,7 @@ export const tracks: Track[] = [
         title: 'DPDK：用户态轮询与大页内存',
         summary: '把网卡从内核手里抢过来自己轮询，换来极低延迟和整核的 CPU 占用。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '解释轮询模式驱动为什么比中断快',
@@ -1448,7 +1448,7 @@ export const tracks: Track[] = [
         title: 'GPUDirect RDMA 与 GPUDirect Storage',
         summary: '让网卡直接读写显存，把 CPU 和主存彻底从数据路径上摘掉。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '画出开启与未开启 GPUDirect RDMA 时的数据路径差异',
@@ -1470,7 +1470,7 @@ export const tracks: Track[] = [
         title: 'NVMe-oF：把 NVMe 协议搬到网络上',
         summary: '远端盘做到接近本地盘的延迟，靠的是不做协议转换。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '区分 NVMe/RDMA、NVMe/TCP、NVMe/FC 三种传输',
@@ -1492,7 +1492,7 @@ export const tracks: Track[] = [
         title: 'MPI 与集合通信：谁在真正搬数据',
         summary: 'MPI 在 AI 训练里常常只是个启动器，真正的通信由 NCCL 完成。搞清分工才能调对。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '说清 MPI 与 NCCL 在 AI 训练里的分工',
@@ -1514,7 +1514,7 @@ export const tracks: Track[] = [
         title: 'DPU 与 Spectrum-X：把网络卸载到卡上',
         summary: '交换机和网卡开始跑自己的操作系统。这对运维意味着多了一层要管的东西。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 25,
         objectives: [
           '说出 DPU 能卸载哪些工作以及收益来源',
@@ -1536,7 +1536,7 @@ export const tracks: Track[] = [
         title: '网络可观测性：指标、流日志与抓包',
         summary: '把"网络好不好"变成可以画在看板上、能告警的具体数字。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '列出必须采集的网络指标及其告警阈值',
@@ -1558,7 +1558,7 @@ export const tracks: Track[] = [
         title: '网络值班手册：SOP 与容量复盘',
         summary: '把前面所有知识固化成别人也能照着执行的流程，这才是工程师的产出物。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 25,
         objectives: [
           '写出一份别人能照着执行的网络故障处置 SOP',

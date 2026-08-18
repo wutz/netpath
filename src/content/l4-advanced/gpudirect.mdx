@@ -1,0 +1,244 @@
+## 省掉的那一趟
+
+[为什么需要 RDMA](/learn/l2-hpc/why-rdma) 讲的是把 CPU 从数据路径上摘掉。
+GPUDirect 更进一步：**把主存也摘掉**。
+
+```
+没开 GPUDirect RDMA：
+  显存 → (PCIe) → 主存 → (PCIe) → 网卡 → 网络
+         ↑ 多跑一趟，占 PCIe 带宽、占主存带宽、增加延迟
+
+开了 GPUDirect RDMA：
+  显存 → (PCIe peer-to-peer) → 网卡 → 网络
+```
+
+数据只过 PCIe 一次，主存和 CPU 完全不参与。收益是**延迟下降、
+PCIe 有效带宽翻倍、主存带宽被释放出来**。
+
+## 三个 GPUDirect
+
+名字很像，解决的问题不同：
+
+| 名称 | 路径 | 用在哪 |
+| --- | --- | --- |
+| **GPUDirect P2P** | GPU ↔ GPU（同机，走 PCIe 或 NVLink） | 机内多卡通信 |
+| **GPUDirect RDMA** | GPU ↔ 网卡 | **跨机通信，NCCL 用它** |
+| **GPUDirect Storage（GDS）** | GPU ↔ NVMe | 数据加载、检查点 |
+
+三者的共同点是**都靠 PCIe peer-to-peer**：两个 PCIe 设备直接对话，不经过 CPU 与主存。
+
+## 生效的四个前提
+
+这一节最实用的部分。**任何一条不满足，都会静默退化**——功能正常，只是慢。
+
+### ① nvidia-peermem 模块
+
+它负责把显存暴露给 RDMA 子系统，让网卡能拿到显存的物理地址：
+
+```bash
+lsmod | grep peermem
+# 没有就加载
+modprobe nvidia-peermem
+# 持久化
+echo nvidia-peermem >> /etc/modules-load.d/nvidia-peermem.conf
+```
+
+**没加载时 NCCL 会正常工作，只是走主存中转**——日志里那行
+`GPU Direct RDMA Enabled` 就不会出现。
+
+### ② PCIe 拓扑：GPU 与网卡要够近
+
+[PCIe 那节](/learn/l2-hpc/pcie-topology) 的五级距离在这里直接决定性能：
+
+```bash
+nvidia-smi topo -m
+```
+
+| 关系 | P2P 可行性 |
+| --- | --- |
+| `PIX`（同一个 PCIe switch） | **最优**，peer-to-peer 直通 |
+| `PXB`（跨多个 switch） | 可行，略慢 |
+| `PHB`（经 Host Bridge） | 要绕到 Root Complex 附近 |
+| `NODE` / `SYS`（**跨 NUMA**） | **很差**，要跨 CPU 互联 |
+
+规划含义：**每张 GPU 配一张 `PIX` 关系的网卡**。这也是 rail-optimized 服务器
+在硬件设计上"一卡配一网卡、挂同一个 PCIe switch"的原因。
+
+### ③ ACS 必须关闭
+
+Access Control Services 会**强制 peer-to-peer 流量绕到 Root Complex 做检查**，
+正好把 P2P 直通路径破坏掉：
+
+```bash
+# 查哪些设备开了 ACS
+lspci -vvv | grep -i -A1 'Access Control Services'
+```
+
+```
+ACS 开：GPU → Switch → Root Complex → Switch → NIC    （绕远，吃 CPU 侧带宽）
+ACS 关：GPU → Switch → NIC                            （直通）
+```
+
+关 ACS 通常在 BIOS 里做。但这是**安全与性能的取舍**：
+
+| 需求 | ACS |
+| --- | --- |
+| 裸金属跑训练，要极致 P2P | 关 |
+| 设备直通给虚机 / SR-IOV 多租户 | **必须开**（隔离要求） |
+
+多租户环境不要随便关。
+
+### ④ IOMMU 设置要匹配
+
+IOMMU（Intel VT-d / AMD-Vi）与 P2P 的关系比较微妙：
+
+- 裸金属训练场景常见做法是 `iommu=pt`（passthrough 模式），兼顾兼容性与性能
+- 完全关闭 IOMMU 也能跑，但失去了内存隔离保护
+- 虚拟化场景必须开 IOMMU
+
+**这一项要跟着厂商的部署文档走**，别自己拍。
+
+<Callout type="trap" title="四个前提的共同症状：静默退化">
+这是 GPUDirect 最难查的地方。四条里任何一条不满足：
+
+- ✅ 程序跑得通
+- ✅ 结果完全正确
+- ✅ 日志里没有任何错误
+- ❌ **只是慢，而且慢得不明显（可能只掉 20–30%）**
+
+所以必须**主动验证**而不是等报错。三条命令：
+
+```bash
+lsmod | grep peermem                            # 前提 ①
+nvidia-smi topo -m                              # 前提 ②
+lspci -vvv | grep -c 'Access Control Services'  # 前提 ③
+```
+
+以及最直接的一条——看 NCCL 日志里有没有这行：
+
+```bash
+kubectl logs <launcher> | grep -i 'GPU Direct RDMA'
+# NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 0 'mlx5_0'
+```
+
+**没有这一行，就是没开。**
+</Callout>
+
+## 验证是否真的生效
+
+按可信度从高到低：
+
+```bash
+# ① NCCL 日志（最直接）
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET ./all_reduce_perf ... 2>&1 \
+  | grep -i 'GPU Direct RDMA'
+
+# ② 对比 busbw：开与不开的差距
+#    没开时数据要经主存中转，PCIe 上跑两趟，带宽明显偏低
+
+# ③ 看 PCIe 上的实际流量（有 P2P 时主存侧流量应显著更低）
+nvidia-smi dmon -s pucvmet -c 5
+
+# ④ 用 perftest 的 GPU 版本（编译时带 CUDA 支持）
+ib_write_bw -x 3 -d mlx5_0 --use_cuda=0 -F --report_gbits <peer>
+```
+
+第 ④ 条是最干净的对照实验：`--use_cuda=0` 表示用 0 号 GPU 的显存作为缓冲区。
+和不带这个参数（用主存）的结果对比，就能看出 P2P 是否生效。
+
+## GPUDirect Storage：数据加载那一侧
+
+训练不只有通信，还有**读数据**。传统路径同样多一趟：
+
+```
+传统：  NVMe → 主存（page cache）→ 显存
+GDS：   NVMe → 显存（直接 DMA）
+```
+
+收益在大批量数据加载与检查点读写时明显。前提也类似：驱动支持、
+NVMe 与 GPU 的 PCIe 拓扑要近、文件系统与库要支持（cuFile API）。
+
+```bash
+# 检查 GDS 状态
+gdscheck -p
+```
+
+实践上要注意：**GDS 的收益高度依赖 I/O 模式**。
+大块顺序读收益明显，小文件随机读可能还不如走 page cache——
+因为绕过了内核缓存，重复读不再命中缓存。
+
+<Callout type="note" title="它和存储侧的账要一起算">
+GDS 让显存直接吃 NVMe 的带宽，那么瓶颈就转移到了存储侧：
+本地盘的带宽、或者[存储网](/learn/l3-planning/fabric-plan) 的带宽。
+
+参考架构里存储网单独成一张 IB 网、且要求单节点 I/O 超过 40 GB/s，
+就是为了喂得动这条路径。**开了 GDS 但存储跟不上，等于没开。**
+</Callout>
+
+## 排障顺序
+
+```
+busbw 偏低，怀疑 GPUDirect 没生效
+   │
+   ├─ 1. NCCL 日志有 'GPU Direct RDMA Enabled' 吗
+   │        没有 → 查 nvidia-peermem 是否加载
+   │
+   ├─ 2. nvidia-smi topo -m：GPU 与它用的网卡是 PIX 吗
+   │        是 SYS → 跨 NUMA，检查网卡插槽与进程绑核
+   │
+   ├─ 3. ACS 是否开着
+   │        开着 → BIOS 里关（多租户场景要权衡）
+   │
+   ├─ 4. IOMMU 模式是否符合厂商文档
+   │
+   └─ 5. 用 ib_write_bw --use_cuda 做对照实验
+```
+
+## 检查点
+
+<Quiz
+  id="gd-1"
+  question="GPUDirect RDMA 没有生效时，最典型的表现是什么？"
+  options={[
+    { text: '静默退化：程序跑通、结果正确、无任何报错，只是带宽偏低', correct: true },
+    { text: '程序启动失败', feedback: '不会失败，它会自动走主存中转这条退化路径。' },
+    { text: 'NCCL 报错退出', feedback: '不报错，这正是它难查的原因。' },
+    { text: '显存不足', feedback: '与显存容量无关。' },
+  ]}
+  explain={<>必须主动验证而不是等报错。最直接的一条是看 NCCL 日志里有没有 GPU Direct RDMA Enabled —— 没有这行就是没开。这和 NVLink 掉链、PCIe 降速属于同一类静默故障。</>}
+/>
+
+<Quiz
+  id="gd-2"
+  question="为什么 ACS 开启会破坏 GPUDirect RDMA 的收益？"
+  options={[
+    { text: '它强制 peer-to-peer 流量绕到 Root Complex 做检查，直通路径被破坏', correct: true },
+    { text: '它会加密流量', feedback: 'ACS 做访问控制检查，不做加密。' },
+    { text: '它限制了 PCIe lane 数', feedback: '它不影响链路宽度，影响的是转发路径。' },
+    { text: '它会禁用 nvidia-peermem', feedback: '两者是独立的机制。' },
+  ]}
+  explain={<>这是安全与性能的取舍：裸金属训练可以关，但设备直通给虚机或 SR-IOV 多租户场景必须开 —— 那时 ACS 提供的隔离是必需的。多租户环境不要随便关。</>}
+/>
+
+<Quiz
+  id="gd-3"
+  question="开启 GDS 后发现小文件随机读性能反而下降。最合理的解释？"
+  options={[
+    { text: 'GDS 绕过了内核 page cache，重复读不再命中缓存，小随机读因此吃亏', correct: true },
+    { text: 'GDS 只支持顺序读', feedback: '技术上支持随机读，只是收益取决于 I/O 模式。' },
+    { text: 'GPU 显存不够', feedback: '与显存容量无关。' },
+    { text: '需要更大的 PCIe 带宽', feedback: '小随机读的瓶颈不是带宽。' },
+  ]}
+  explain={<>GDS 的收益高度依赖 I/O 模式：大块顺序读收益明显，小文件随机读可能不如走 page cache。另外开了 GDS 后瓶颈会转移到存储侧 —— 存储跟不上等于没开。</>}
+/>
+
+## 这节课的落点
+
+- GPUDirect RDMA 把**主存也从数据路径上摘掉**：显存 ↔ 网卡直接 PCIe P2P
+- 三个 GPUDirect：**P2P**（GPU↔GPU）、**RDMA**（GPU↔网卡）、**Storage/GDS**（GPU↔NVMe）
+- 四个前提：**nvidia-peermem 模块、PCIe 拓扑够近（PIX）、ACS 关闭、IOMMU 模式匹配**
+- **共同症状是静默退化**：跑通、正确、无报错，只是慢——必须主动验证
+- 最直接的验证：NCCL 日志里的 **`GPU Direct RDMA Enabled`**；最干净的对照：
+  `ib_write_bw --use_cuda`
+- ACS 是安全与性能的取舍，**多租户/虚拟化场景必须开**
+- GDS 的收益依赖 I/O 模式；开了之后**瓶颈转移到存储侧**，存储跟不上等于没开

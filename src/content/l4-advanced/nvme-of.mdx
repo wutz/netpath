@@ -1,0 +1,243 @@
+## 让远端盘像本地盘
+
+本地 NVMe 盘的延迟在**几十微秒**量级。传统的网络块存储（iSCSI）要一百多微秒到毫秒——
+差距不在网络，而在**协议转换**。
+
+```
+iSCSI：    应用 → 块层 → SCSI 层 → iSCSI 封装 → TCP → 网络 → 反向拆一遍
+NVMe-oF：  应用 → 块层 → NVMe 命令 → 直接放到网络上 → 对端直接执行
+                          ↑ 没有 SCSI 这一层转换
+```
+
+**NVMe-oF 的核心思想是"不做协议转换"**：本地 NVMe 用什么命令集，
+网络上就传什么命令集，两端都是 NVMe。
+
+## 队列模型才是关键
+
+NVMe 相对 SCSI 的根本改进不是命令集，是**队列模型**：
+
+| | SCSI / SAS | NVMe |
+| --- | --- | --- |
+| 队列数 | 1 个 | **最多 64K 个** |
+| 每队列深度 | 32–256 | **64K** |
+| 锁竞争 | 单队列成为瓶颈 | **每个 CPU 核一个队列，无锁** |
+
+多队列的意义在多核服务器上很直接：**每个核有自己的提交/完成队列，
+不需要跨核同步**。这个模型原样搬到网络上，就是 NVMe-oF——
+所以它天生适合高并发。
+
+## 三种 fabric
+
+| 传输 | 延迟 | 需要什么 | 适合 |
+| --- | --- | --- | --- |
+| **NVMe/RDMA**（RoCE 或 IB） | **最低** | 无损网络、RDMA 网卡 | 高性能存储，与 L2 那套要求一致 |
+| **NVMe/TCP** | 中 | **普通以太网即可** | **落地最容易**，通用场景 |
+| **NVMe/FC** | 低 | 光纤通道网络 | 已有 FC 投资的传统存储环境 |
+
+选择逻辑和 [IB vs RoCE](/learn/l3-planning/ib-vs-roce) 那节一样：
+
+- **有无损网络与 RDMA 能力** → NVMe/RDMA，性能最好
+- **只有普通以太网、也没人调 PFC/ECN** → **NVMe/TCP**，先跑起来
+- 已有 FC SAN → NVMe/FC 复用现有投资
+
+<Callout type="tip" title="NVMe/TCP 比想象中好用">
+很多人默认"要上 NVMe-oF 就得先建无损网络"，于是项目卡在网络改造上。
+
+实际上 **NVMe/TCP 在普通以太网上就能跑**，延迟虽然高于 RDMA，
+但仍然明显优于 iSCSI（因为省掉了 SCSI 转换层）。
+
+务实的路径是：**先用 NVMe/TCP 把业务跑起来**，
+确认瓶颈真的在网络延迟上，再考虑改造成 RDMA。
+这和 L2 里"团队没人会调 PFC 就先用高带宽 TCP"是同一个判断。
+</Callout>
+
+## 基本概念
+
+| 概念 | 含义 | 类比 |
+| --- | --- | --- |
+| **NQN** | NVMe Qualified Name，唯一标识 | iSCSI 的 IQN |
+| **subsystem** | 服务端暴露的一组资源 | iSCSI 的 target |
+| **namespace** | 一个可访问的块设备 | LUN |
+| **controller** | 一次连接建立的会话 | — |
+
+NQN 长这样：
+
+```
+nqn.2014-08.org.nvmexpress:uuid:12345678-1234-1234-1234-123456789abc
+nqn.2026-01.com.example:storage-01
+```
+
+## 客户端实操
+
+```bash
+# 装工具
+dnf install -y nvme-cli        # 或 apt install nvme-cli
+
+# ① 发现目标（TCP）
+nvme discover -t tcp -a 10.0.20.10 -s 4420
+
+# RDMA 场景把 -t 换成 rdma
+nvme discover -t rdma -a 10.0.20.10 -s 4420
+```
+
+```
+Discovery Log Number of Records 1
+=====Discovery Log Entry 0======
+trtype:  tcp
+adrfam:  ipv4
+subnqn:  nqn.2026-01.com.example:storage-01
+traddr:  10.0.20.10
+trsvcid: 4420
+```
+
+```bash
+# ② 连接
+nvme connect -t tcp -a 10.0.20.10 -s 4420 \
+  -n nqn.2026-01.com.example:storage-01
+
+# ③ 确认设备出现了
+nvme list
+lsblk | grep nvme
+```
+
+```
+Node          SN        Model                  Namespace  Usage
+/dev/nvme1n1  ...       Linux                  1          3.84 TB
+```
+
+**到这里 `/dev/nvme1n1` 就是一个普通块设备**，可以格式化、挂载、给数据库用——
+上层完全不知道它在网络对面。
+
+```bash
+# ④ 断开
+nvme disconnect -n nqn.2026-01.com.example:storage-01
+
+# 开机自动连接
+nvme connect-all -t tcp -a 10.0.20.10 -s 4420
+systemctl enable nvme-autoconnect.service    # 发行版名称可能不同
+```
+
+## 多路径：别只连一条
+
+生产环境要走两条独立路径，否则单条链路故障就丢盘：
+
+```bash
+# 连两个不同的地址（两张网卡、两个交换机）
+nvme connect -t tcp -a 10.0.20.10 -s 4420 -n <nqn>
+nvme connect -t tcp -a 10.0.21.10 -s 4420 -n <nqn>
+
+# 查看多路径状态
+nvme list-subsys
+```
+
+```
+nvme-subsys1 - NQN=nqn.2026-01.com.example:storage-01
+\
+ +- nvme1 tcp traddr=10.0.20.10 trsvcid=4420 live optimized
+ +- nvme2 tcp traddr=10.0.21.10 trsvcid=4420 live optimized
+```
+
+两条都是 `live` 才算冗余生效。
+
+| 多路径实现 | 说明 |
+| --- | --- |
+| **NVMe 原生多路径**（ANA） | 内核 `nvme_core.multipath=Y`，**推荐** |
+| device-mapper multipath | 传统方案，与 SCSI 时代一致 |
+
+<Callout type="warn" title="两条路径要真的独立">
+常见的假冗余：两条路径走同一张物理网卡的两个 IP、或者经过同一台交换机。
+这种配置在软件层面看是双路径，**物理上仍是单点**。
+
+真正的独立要求：
+- 不同的物理网卡
+- 不同的交换机（[以太网规划](/learn/l3-planning/ethernet-plan) 里的双上行）
+- 最好是不同的存储控制器
+
+验证方法很朴素：**拔一根线，看业务还在不在**。
+</Callout>
+
+## 网络侧的要求
+
+NVMe-oF 对网络的要求比普通业务高，而且这些要求 L0–L3 都讲过：
+
+| 要求 | 为什么 | 参考 |
+| --- | --- | --- |
+| **低延迟** | 每个 I/O 都要一个往返 | [三个指标](/learn/l0-basics/metrics-units) |
+| **不丢包**（RDMA 场景） | go-back-N 会让带宽雪崩 | [RoCE](/learn/l2-hpc/roce) |
+| **MTU 一致** | 大块 I/O 会打满 MTU | [二层与三层](/learn/l0-basics/switching-routing) |
+| **存储网独立** | 恢复流量不能影响业务 | [以太网规划](/learn/l3-planning/ethernet-plan) |
+| **1:1 无收敛**（存储侧） | 多客户端同时读写 | [规划那节](/learn/l3-planning/fabric-plan) |
+
+```bash
+# 排查时的常规动作
+ping -M do -s 8972 10.0.20.10       # MTU 端到端一致性
+nstat -az | grep -i retrans          # TCP 场景看重传
+ethtool -S bond0 | grep -i pause     # RDMA 场景看 PFC
+```
+
+## 和其它存储方案的对照
+
+| 方案 | 延迟 | 适合 |
+| --- | --- | --- |
+| 本地 NVMe | 几十 μs | 单机、无需共享 |
+| **NVMe/RDMA** | **接近本地** | 需要共享的高性能场景 |
+| NVMe/TCP | 中 | 通用共享块存储 |
+| iSCSI | 高 | 兼容性优先的遗留环境 |
+| Ceph RBD | 更高（多副本 + 分布式） | 要弹性扩展与自愈 |
+
+**关键取舍**：NVMe-oF 提供的是**低延迟的共享块设备**，
+但它本身不提供分布式冗余——数据保护要靠后端存储阵列或上层方案。
+Ceph 这类分布式存储牺牲延迟换来的是弹性与自愈能力。
+
+想深入存储侧可以看 [Storpath](https://storpath.wutz.dev/)，
+这里只讲网络这一面。
+
+## 检查点
+
+<Quiz
+  id="nof-1"
+  question="NVMe-oF 相比 iSCSI 延迟明显更低，主要原因是什么？"
+  options={[
+    { text: '不做协议转换 —— 两端都是 NVMe 命令集，省掉了 SCSI 转换层', correct: true },
+    { text: '因为它只能跑在 RDMA 上', feedback: 'NVMe/TCP 在普通以太网上也比 iSCSI 快，说明差距不只来自传输层。' },
+    { text: '因为它用了更大的 MTU', feedback: 'MTU 与协议选择无关。' },
+    { text: '因为它不做校验', feedback: '两者都有完整性保护。' },
+  ]}
+  explain={<>核心是「不做协议转换」加上 NVMe 的多队列模型（每核一个队列、无锁）。这也是为什么 NVMe/TCP 即使在普通以太网上也明显优于 iSCSI。</>}
+/>
+
+<Quiz
+  id="nof-2"
+  question="团队想上 NVMe-oF 但没有无损网络，也没人会调 PFC/ECN。合理的做法是？"
+  options={[
+    { text: '先用 NVMe/TCP 在普通以太网上跑起来，确认瓶颈真在网络延迟再考虑改造', correct: true },
+    { text: '必须先建无损网络才能上 NVMe-oF', feedback: 'NVMe/TCP 不需要无损网络。' },
+    { text: '退回 iSCSI', feedback: '放弃了 NVMe-oF 在协议层的收益，没必要。' },
+    { text: '用 FC', feedback: '除非已有 FC 投资，否则新建 FC 成本更高。' },
+  ]}
+  explain={<>这与 L2 里「团队没人会调 PFC 就先用高带宽 TCP」是同一个判断：先让业务跑起来并拿到真实数据，再决定是否付出无损网络的运维成本。</>}
+/>
+
+<Quiz
+  id="nof-3"
+  question="nvme list-subsys 显示两条路径都 live，但拔掉一根网线后业务中断。最可能的原因？"
+  options={[
+    { text: '两条路径物理上不独立 —— 走了同一张网卡或同一台交换机', correct: true },
+    { text: '多路径没启用', feedback: '两条都显示 live 说明多路径是生效的。' },
+    { text: 'NQN 配置错误', feedback: 'NQN 错会导致连不上，而不是连上后无冗余。' },
+    { text: 'MTU 不一致', feedback: 'MTU 问题表现为大 I/O 失败，不是冗余失效。' },
+  ]}
+  explain={<>软件层面的双路径不等于物理冗余。真正独立要求不同网卡、不同交换机、最好不同存储控制器。验证方法很朴素：拔一根线看业务在不在。</>}
+/>
+
+## 这节课的落点
+
+- NVMe-oF 的核心是**不做协议转换**：两端都是 NVMe 命令集，省掉 SCSI 转换层
+- 根本优势来自**多队列模型**：每核一个队列、无锁，天生适合高并发
+- 三种 fabric：**RDMA（最快）、TCP（最易落地）、FC（复用已有投资）**
+- **NVMe/TCP 值得先试**：普通以太网就能跑，仍明显优于 iSCSI
+- 四个概念：NQN、subsystem、namespace、controller；操作就是 `discover` → `connect` → `nvme list`
+- 连上后就是普通块设备，上层完全无感
+- 生产必须**多路径且物理独立**：不同网卡、不同交换机；验证靠**拔线**
+- 网络侧要求（低延迟、不丢包、MTU 一致、存储网独立、1:1）在 L0–L3 都讲过
+- NVMe-oF 给的是**低延迟共享块设备**，冗余要靠后端或上层，与 Ceph 的取舍不同
