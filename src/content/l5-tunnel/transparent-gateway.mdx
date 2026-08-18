@@ -1,0 +1,320 @@
+## 为什么要在网关上做
+
+前面几节的方案都要求**客户端自己配代理**。但有一类设备做不到：
+
+- 打印机、摄像头、智能家电——根本没有代理设置
+- 老服务器上的程序——不读环境变量，也不能改代码
+- 一整个网段的机器——挨个配不现实
+- 容器与 CI runner——每次重建都要重新配
+
+透明网关的思路是：**在流量必经的那一跳上做拦截和分流，两端都不知情。**
+这就是 L5 第一节讲的三种代理里的第三种。
+
+## 前提：目标地址要能恢复
+
+透明代理有一个绕不开的技术前提。做 DNAT 把流量改道到本地代理后，
+**代理得知道用户原本想连谁**——否则不知道往哪转发。
+
+```
+客户端 → 想连 93.184.216.34:443
+   ↓ iptables REDIRECT 改成 127.0.0.1:7892
+本地代理收到连接 → 目的地址已经被改写了，原始目标去哪了？
+```
+
+Linux 的解法是 `SO_ORIGINAL_DST`：内核在 conntrack 里记着原始目的地址，
+代理用一个 socket 选项就能取回来。**所以透明代理必须依赖 conntrack**——
+这也是它和普通代理的一个本质区别。
+
+| 模式 | 原始目标从哪来 |
+| --- | --- |
+| HTTP 代理 | 请求行里的完整 URL |
+| SOCKS5 | 握手时客户端明确告诉代理 |
+| **透明代理** | **内核 conntrack + `SO_ORIGINAL_DST`** |
+
+<Callout type="note" title="REDIRECT 与 TPROXY 的区别">
+两种实现方式，各有取舍：
+
+| | REDIRECT（nat 表） | TPROXY（mangle 表） |
+| --- | --- | --- |
+| 支持 TCP | ✅ | ✅ |
+| **支持 UDP** | ❌ | **✅** |
+| 保留原始目的地址 | 靠 `SO_ORIGINAL_DST` | 原生保留 |
+| 配置复杂度 | **低** | 高（要配策略路由） |
+| 依赖 conntrack | 是 | 是 |
+
+**先用 REDIRECT**，它够简单也够用。只有需要转发 UDP（比如 QUIC、游戏、DNS）
+才值得上 TPROXY 那套策略路由配置。
+</Callout>
+
+## 核心规则：先放行私网，再重定向其余
+
+这是整节最关键的一段配置。顺序错了会造成内网互访也被送进代理：
+
+```bash
+# 建一条自定义链
+iptables -t nat -N PROXY
+
+# ① 私网地址一律直连 —— 必须放在最前面
+iptables -t nat -A PROXY -d 0.0.0.0/8      -j RETURN
+iptables -t nat -A PROXY -d 10.0.0.0/8     -j RETURN
+iptables -t nat -A PROXY -d 127.0.0.0/8    -j RETURN
+iptables -t nat -A PROXY -d 169.254.0.0/16 -j RETURN
+iptables -t nat -A PROXY -d 172.16.0.0/12  -j RETURN
+iptables -t nat -A PROXY -d 192.168.0.0/16 -j RETURN
+iptables -t nat -A PROXY -d 224.0.0.0/4    -j RETURN
+iptables -t nat -A PROXY -d 240.0.0.0/4    -j RETURN
+
+# ② 代理服务器自己的地址也要放行，否则会形成环路
+iptables -t nat -A PROXY -d <代理服务器公网IP> -j RETURN
+
+# ③ 其余 TCP 流量重定向到本地代理端口
+iptables -t nat -A PROXY -p tcp -j REDIRECT --to-ports 7892
+
+# 挂到 PREROUTING（转发别人的流量）与 OUTPUT（本机自己的流量）
+iptables -t nat -A PREROUTING -p tcp -j PROXY
+iptables -t nat -A OUTPUT     -p tcp -j PROXY
+```
+
+<Callout type="trap" title="漏掉第 ② 步会形成死循环">
+代理进程自己要连出去，如果它的出站流量也被 `OUTPUT` 链重定向回本地端口，
+就会**自己连自己**，无限循环。
+
+三种常见处理，任选其一：
+
+```bash
+# a. 放行代理服务器的目的地址（上面的做法）
+iptables -t nat -A PROXY -d <代理服务器IP> -j RETURN
+
+# b. 按运行代理的用户放行（更干净）
+iptables -t nat -A OUTPUT -m owner --uid-owner proxyuser -j RETURN
+
+# c. 按 fwmark 放行（代理给自己的包打标）
+iptables -t nat -A OUTPUT -m mark --mark 0xff -j RETURN
+```
+
+症状很好认：**CPU 飙高、连接数暴涨、代理日志刷屏**。
+第一次配透明网关基本都会遇到。
+</Callout>
+
+## DNS 也要一起处理
+
+只转发 TCP 是不够的。客户端的 DNS 查询如果还走本地运营商，
+拿到的解析结果可能不对，或者与代理侧的分流规则不一致
+（[代理基础](/learn/l5-tunnel/proxy-basics) 里 `socks5` 与 `socks5h` 讲的是同一个问题）。
+
+```bash
+# 把客户端的 DNS 查询劫持到本地 DNS（Mihomo 的 fake-ip 监听端口）
+iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 1053
+iptables -t nat -A PREROUTING -p tcp --dport 53 -j REDIRECT --to-ports 1053
+```
+
+配合 [Mihomo 的 fake-ip 模式](/learn/l5-tunnel/clash-rules)：客户端拿到 `198.18.x.x` 假地址，
+连接时代理反查出域名，**按域名规则分流**——比按 IP 分流准确得多。
+
+## 规则持久化
+
+`iptables` 规则重启就没。三种做法：
+
+```bash
+# ① 保存与恢复（Debian/Ubuntu）
+iptables-save > /etc/iptables/rules.v4
+# 装 iptables-persistent 后开机自动恢复
+
+# ② 放进 if-pre-up 钩子
+cat > /etc/network/if-pre-up.d/iptables <<'EOF'
+#!/bin/sh
+/sbin/iptables-restore < /etc/iptables/rules.v4
+EOF
+chmod +x /etc/network/if-pre-up.d/iptables
+
+# ③ 交给代理软件自己管（Mihomo 的 TUN 模式 auto-route）
+```
+
+第三种最省事：**TUN 模式让代理自己建虚拟网卡并接管路由**，
+不用手写 iptables。代价是需要更高权限，且[与其它 VPN 抢路由](/learn/l5-tunnel/clash-rules)。
+
+## 形态一：家庭旁路由
+
+不动主路由，加一台设备（树莓派、小主机）作为"可选网关"：
+
+```
+          ┌─────────────┐
+   设备 ──┤ 主路由       ├── 光猫 ── 外网
+          │ 192.168.1.1 │
+          └──────┬──────┘
+                 │
+          ┌──────▼──────────┐
+          │ 旁路由            │
+          │ 192.168.1.2      │  ← 跑代理 + iptables 规则
+          └──────────────────┘
+
+需要走代理的设备：把网关和 DNS 指向 192.168.1.2
+不需要的设备：保持指向 192.168.1.1
+```
+
+配置要点：
+
+```bash
+# 旁路由上必须开转发
+sysctl -w net.ipv4.ip_forward=1
+
+# 让回程流量能出去（如果代理不接管全部出站）
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+```
+
+**旁路由的最大优点是可回退**：出问题时把设备网关改回主路由就恢复了，
+不影响全家上网。这是它比"直接刷主路由固件"更实用的原因。
+
+<Callout type="warn" title="旁路由的两个隐患">
+**① 它是新的单点。** 所有指向它的设备，在它挂掉时全部断网——
+而且症状是"能连 WiFi 但打不开任何网页"，家里人不会自己排查。
+
+**② 转发路径变长。** 流量走 `设备 → 旁路由 → 主路由 → 外网`，
+在主路由与旁路由之间多跑一趟。千兆网内影响不大，但旁路由的性能
+（尤其是小主机的 CPU）会成为整体吞吐的上限。
+
+缓解：只把**需要的设备**指过去，而不是在主路由上把全网默认网关改成旁路由。
+</Callout>
+
+## 形态二：云上 NAT 实例
+
+同样的思路搬到云上，给整个私有子网做统一出口：
+
+```
+VPC 172.20.0.0/16
+├── 公有子网 172.20.1.0/24
+│     └── NAT 实例（有公网 IP）← 跑代理 + 转发
+│           路由表：0.0.0.0/0 → 互联网网关
+└── 私有子网 172.20.2.0/24
+      └── 业务实例（无公网 IP）
+            路由表：0.0.0.0/0 → NAT 实例
+```
+
+NAT 实例上要做的事和旁路由一样：
+
+```bash
+sysctl -w net.ipv4.ip_forward=1
+iptables -t filter -A FORWARD -j ACCEPT
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+```
+
+**云上还有一个额外步骤**：多数云厂商的网卡默认开启"源/目的地址检查"，
+它会丢弃源地址不是本机的包——而转发流量恰好就是这种。
+**必须先关掉这个检查**，否则转发怎么都不通。
+
+<Callout type="tip" title="用一个类比记住 MASQUERADE">
+把 NAT 实例想成公司的收发室：
+
+- 员工（私有子网实例）寄信不写自己的工位号，写收发室地址
+- 回信到收发室，收发室按登记本（conntrack）转给对应的人
+
+`ip_forward` 是"允许收发室帮忙转寄"，`MASQUERADE` 是"把寄件人地址换成收发室"。
+两者缺一不可——只开第一个，外面的回信找不到路。
+</Callout>
+
+## 形态三：K8s 场景的 DNS 配合
+
+集群节点走透明网关时，容易踩一个坑：**集群内部域名也被送出去解析了**。
+
+处理办法是让集群 DNS 分开走：
+
+```
+compute.internal / cluster.local 等内部域名 → 云 DNS 或 CoreDNS
+其余域名                                      → 转发给网关
+```
+
+```yaml
+# 大意如此：nodelocaldns / CoreDNS 的 ConfigMap 里分域转发
+cluster.local:53 {
+    kubernetes cluster.local
+}
+compute.internal:53 {
+    forward . 169.254.169.253        # 云厂商的 DNS
+}
+.:53 {
+    forward . /etc/resolv.conf {
+        policy sequential
+    }
+}
+```
+
+这与 [DNS 与策略](/learn/l1-k8s/dns-policy) 那节讲的 `nameserver-policy` 是同一个思路：
+**内部域名必须由知道答案的那一侧解析**。
+
+## 排障顺序
+
+```bash
+# 1. 转发开了吗
+sysctl net.ipv4.ip_forward
+
+# 2. 规则挂上了吗、有没有命中（看 pkts 计数）
+iptables -t nat -nvL PREROUTING
+iptables -t nat -nvL PROXY
+
+# 3. 代理端口在监听吗
+ss -lntp | grep 7892
+
+# 4. 从客户端验证走没走代理
+curl -s https://api.ipify.org       # 看出口 IP 变了没
+
+# 5. DNS 走对了吗
+dig +short example.com              # 与直连时对比
+
+# 6. 有没有形成环路（CPU 高、连接暴涨时先怀疑这个）
+ss -s
+top -bn1 | head -15
+```
+
+第 2 步的 `pkts` 计数最有用：**规则存在但计数为 0，说明流量根本没走到这条链上**——
+去查路由和网关设置，而不是继续改规则。
+
+## 检查点
+
+<Quiz
+  id="tg-1"
+  question="透明代理为什么必须依赖 conntrack？"
+  options={[
+    { text: 'DNAT 改写目的地址后，代理要靠 SO_ORIGINAL_DST 从 conntrack 取回原始目标', correct: true },
+    { text: '为了加密流量', feedback: 'conntrack 不做加密。' },
+    { text: '为了统计流量', feedback: '统计是附带能力，不是必须依赖的原因。' },
+    { text: '为了支持 UDP', feedback: 'UDP 支持取决于用 REDIRECT 还是 TPROXY。' },
+  ]}
+  explain={<>这是透明代理与普通代理的本质区别：HTTP 代理从请求行拿目标、SOCKS5 从握手拿目标，而透明代理两者都没有，只能靠内核记录的原始目的地址。</>}
+/>
+
+<Quiz
+  id="tg-2"
+  question="配好透明网关后 CPU 飙高、连接数暴涨、代理日志刷屏。最可能的原因？"
+  options={[
+    { text: '代理自己的出站流量也被重定向回本地端口，形成了死循环', correct: true },
+    { text: '客户端太多', feedback: '正常负载不会让日志刷屏。' },
+    { text: 'MTU 配置不对', feedback: 'MTU 问题表现为大包卡死，不是连接暴涨。' },
+    { text: 'DNS 劫持规则写错', feedback: 'DNS 问题表现为解析失败，不会造成环路。' },
+  ]}
+  explain={<>必须让代理自己的流量绕过重定向：放行代理服务器的目的地址、按 --uid-owner 放行运行代理的用户，或按 fwmark 放行。第一次配透明网关基本都会遇到这个。</>}
+/>
+
+<Quiz
+  id="tg-3"
+  question="云上 NAT 实例配好了 ip_forward 和 MASQUERADE，私有子网实例仍然出不去。还漏了什么？"
+  options={[
+    { text: '云厂商网卡默认开启的源/目的地址检查，它会丢弃源地址不是本机的转发包', correct: true },
+    { text: '要给私有子网实例也分配公网 IP', feedback: '那就不需要 NAT 实例了，与设计目的矛盾。' },
+    { text: '要关闭安全组', feedback: '安全组要放通，但不是这个经典漏项。' },
+    { text: 'MASQUERADE 要换成 SNAT', feedback: '两者在这个场景效果等价。' },
+  ]}
+  explain={<>这是云上特有的一步：源/目的检查是为防 IP 欺骗设计的，但转发流量的源地址恰好不是本机。不关掉它，iptables 规则写得再对也不通。</>}
+/>
+
+## 这节课的落点
+
+- 透明网关解决的是**客户端无法配代理**的场景：老设备、整网段、容器与 CI
+- 技术前提是**目标地址要能恢复**：靠 conntrack + `SO_ORIGINAL_DST`
+- **先用 REDIRECT**（简单、够用），需要转发 UDP 才上 TPROXY
+- 规则顺序是关键：**先 RETURN 掉私网与代理自身地址，再 REDIRECT 其余**
+- 漏掉"放行代理自身"会**形成死循环**：CPU 高、连接暴涨、日志刷屏
+- **DNS 要一起劫持**，配合 fake-ip 按域名分流比按 IP 准确
+- 家庭旁路由的优点是**可回退**，隐患是新单点与转发路径变长；只把需要的设备指过去
+- 云上 NAT 实例别忘了**关掉源/目的地址检查**，这是云特有的一步
+- K8s 场景要让**内部域名分开解析**，与 `nameserver-policy` 同一思路
+- 排障看 `iptables -t nat -nvL` 的 **pkts 计数**：为 0 说明流量没走到这条链

@@ -409,7 +409,7 @@ export const tracks: Track[] = [
         title: 'SSH 进阶：ProxyJump、ProxyCommand 与配置固化',
         summary: '把一次能用的命令变成一劳永逸的配置，顺手解决多跳、复用与自动重连。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '把多跳访问写进 ~/.ssh/config，之后只敲主机别名',
@@ -504,7 +504,7 @@ export const tracks: Track[] = [
         title: 'Pritunl / OpenVPN：企业级 VPN 服务端',
         summary: '要的是组织、账号、审计和 SSO 时，装一套有管理界面的服务端比拼脚本划算。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '说出 Pritunl 的架构与 MongoDB 在其中的角色',
@@ -563,7 +563,7 @@ export const tracks: Track[] = [
         title: '流量特征与探测抵抗',
         summary: '为什么协议一直在演进：不是加密不够强，是「看起来像什么」不够自然。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '解释 TLS in TLS 的指纹问题以及缓解思路',
@@ -610,7 +610,7 @@ export const tracks: Track[] = [
         title: '透明网关：让整个网段自动分流',
         summary: '不给每台设备装客户端，在网关上一次搞定 —— 包括那些没法配代理的设备。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '用 iptables REDIRECT 把流量透明送进本地代理',
@@ -634,7 +634,7 @@ export const tracks: Track[] = [
         title: '闯关：隧道昨天还好，今天不通了',
         summary: '在模拟终端里从「浏览器打不开」一路查到具体哪一跳断了。',
         kind: 'quest',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '按客户端 → 本地监听 → 隧道 → 出口逐段定位',

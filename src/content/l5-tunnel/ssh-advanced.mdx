@@ -1,0 +1,333 @@
+## 把一次能用的命令变成一劳永逸的配置
+
+上一节的命令都很长：
+
+```bash
+ssh -f -N -J bastion.example.com -L 8082:localhost:9000 10.20.3.40 \
+  -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes
+```
+
+每次敲一遍不现实。这一节把它们收进 `~/.ssh/config`，顺手解决多跳、复用与自动重连。
+
+## ~/.ssh/config：最该先掌握的一个文件
+
+```sshconfig
+# 全局默认（放在文件开头）
+Host *
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%r@%h:%p
+  ControlPersist 10m
+
+# 跳板机
+Host bastion
+  HostName bastion.example.com
+  User ops
+  Port 22
+  IdentityFile ~/.ssh/id_ed25519_ops
+
+# 内网机器：一律经跳板机
+Host 10.20.*
+  User root
+  ProxyJump bastion
+
+# 具体某台，带端口转发
+Host db-prod
+  HostName 10.20.3.40
+  ProxyJump bastion
+  LocalForward 15432 localhost:5432
+```
+
+之后：
+
+```bash
+ssh db-prod                 # 自动经跳板、自动建好本地 15432 转发
+ssh 10.20.3.99              # 匹配通配符，自动经跳板
+```
+
+### 匹配规则的两条要点
+
+1. **从上往下匹配，每个参数取第一次出现的值**——所以 `Host *` 要放在**最后**
+   才能作为"兜底"，放在开头则它设的值会赢。上面示例把通用项放开头是刻意的：
+   `ServerAliveInterval` 这类希望全局生效的参数就该先声明。
+2. `Host` 是**别名**，`HostName` 才是真实地址。两者可以完全不同。
+
+```bash
+# 看某台主机最终生效的配置（合并所有规则后的结果）
+ssh -G db-prod | grep -E 'hostname|user|proxyjump|localforward|controlpath'
+```
+
+<Callout type="tip" title="ssh -G 是排查配置的第一条命令">
+配置文件一长，"到底哪条规则生效了"就说不清。`ssh -G <host>`
+直接打印合并后的最终配置，不用自己推理匹配顺序。
+
+配置改坏了、连不上时的另一条：
+```bash
+ssh -vvv db-prod 2>&1 | grep -E 'Reading configuration|Applying options|debug1: Connecting'
+```
+能看到它读了哪些文件、应用了哪些块。
+</Callout>
+
+## ProxyJump 与 ProxyCommand
+
+`-J` / `ProxyJump` 是现代写法，底层等价于老的 `ProxyCommand ssh -W`：
+
+```sshconfig
+# 现代写法
+Host inner
+  HostName 10.20.3.40
+  ProxyJump bastion
+
+# 等价的老写法（OpenSSH 7.3 之前只能这么写）
+Host inner-old
+  HostName 10.20.3.40
+  ProxyCommand ssh -W %h:%p bastion
+```
+
+多级跳板用逗号串起来：
+
+```bash
+ssh -J bastion1,bastion2 10.20.3.40
+```
+
+关键语义（上一节讲过，这里再强调一次）：**跳板只中转字节，SSH 会话终结在最终主机上**。
+所以 `LocalForward` 里的 `localhost` 指的是**最终主机自己**。
+
+### ProxyCommand：让不认代理的工具走代理
+
+`ssh` 不读 `HTTP_PROXY` 环境变量（[代理基础](/learn/l5-tunnel/proxy-basics) 那节讲过），
+要走 SOCKS5 代理只能用 `ProxyCommand`：
+
+```sshconfig
+Host github.com
+  User git
+  ProxyCommand nc -x 127.0.0.1:1080 %h %p
+  # 或者用 socat（nc 版本不带 -x 时）
+  # ProxyCommand socat - SOCKS4A:127.0.0.1:%h:%p,socksport=1080
+```
+
+这一条同时解决了 **`git clone git@github.com:...` 走代理**的问题——
+因为 git 的 ssh 传输就是调用 `ssh`，配置在这里对它一样生效。
+
+占位符只要记三个：
+
+| 占位符 | 含义 |
+| --- | --- |
+| `%h` | 目标主机名 |
+| `%p` | 目标端口 |
+| `%r` | 远程用户名 |
+
+## ControlMaster：第二次连接秒开
+
+每次 `ssh` 都要重新做 TCP 握手 + 密钥交换 + 认证。经跳板机时这个开销翻倍。
+连接复用把它降到接近零：
+
+```sshconfig
+Host *
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%r@%h:%p
+  ControlPersist 10m
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `ControlMaster auto` | 没有主连接就建一个，有就复用 |
+| `ControlPath` | 复用用的 socket 文件路径 |
+| `ControlPersist 10m` | 主连接在最后一个会话退出后继续保留 10 分钟 |
+
+效果很直观：第一次连接一两秒，之后**每次都是毫秒级**。
+对频繁执行远程命令的脚本（`ansible`、批量运维）收益尤其大。
+
+```bash
+# 看当前有哪些复用连接
+ls -l ~/.ssh/cm-*
+# 检查某台是否有活跃主连接
+ssh -O check db-prod
+# 主动关掉主连接
+ssh -O exit db-prod
+```
+
+<Callout type="trap" title="ControlMaster 的三个坑">
+**① 主连接断了，所有复用会话一起断。** 网络抖动时的影响面比不复用更大。
+
+**② socket 路径太长会报错**：`ControlPath too long`。
+Unix socket 路径有长度限制（约 100 字节），主机名长时容易超。
+用短路径或哈希：
+```sshconfig
+ControlPath ~/.ssh/cm-%C          # %C 是哈希，长度固定
+```
+
+**③ 改了配置不生效。** 因为复用的是旧主连接，新配置没被读取。
+改完配置记得 `ssh -O exit <host>` 关掉主连接。**这个坑很费时间**——
+你以为配置没生效，其实是连接没重建。
+</Callout>
+
+## 让隧道长期活着：三层做法
+
+### 第一层：保活
+
+```sshconfig
+Host tunnel-*
+  ServerAliveInterval 30      # 每 30 秒发一次心跳
+  ServerAliveCountMax 3       # 连续 3 次没回应就断开
+  ExitOnForwardFailure yes    # 端口绑定失败就退出，别留假隧道
+  TCPKeepAlive no
+```
+
+`ServerAliveInterval` 与 `TCPKeepAlive` 的区别值得知道：
+
+| | 层次 | 特点 |
+| --- | --- | --- |
+| `ServerAliveInterval` | **SSH 协议层** | 走加密通道，中间设备无法伪造，**推荐用这个** |
+| `TCPKeepAlive` | TCP 层 | 明文探测，可能被中间设备欺骗性应答 |
+
+**`ExitOnForwardFailure yes` 是最容易被忽略但最重要的一条**：
+默认情况下端口被占用或 `GatewayPorts` 没开时，ssh 照样连上、只是不转发——
+你会对着一个"进程还在"的假隧道排查很久。
+
+### 第二层：自动重连
+
+```bash
+autossh -M 0 -f -N -L 8080:localhost:80 tunnel-host \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes
+```
+
+`-M 0` 表示不用 autossh 自己的监控端口，改为依赖 SSH 的保活机制——这是现在的推荐用法。
+
+### 第三层：做成 systemd 服务
+
+生产环境的正解。**开机自启 + 崩溃重启 + 日志统一**：
+
+```ini
+# /etc/systemd/system/ssh-tunnel@.service
+[Unit]
+Description=SSH tunnel to %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tunnel
+ExecStart=/usr/bin/ssh -N %i \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes -o BatchMode=yes
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl enable --now ssh-tunnel@db-prod
+systemctl status ssh-tunnel@db-prod
+journalctl -u ssh-tunnel@db-prod -f
+```
+
+模板单元（`@` 形式）的好处是**一份文件管所有隧道**，
+`%i` 就是 `~/.ssh/config` 里的主机别名，转发配置写在 config 里。
+
+<Callout type="warn" title="systemd 跑 ssh 的三个必须项">
+- **`BatchMode=yes`**：禁止任何交互提示。否则首次连接的主机指纹确认会让它一直挂着
+- **密钥必须免密码**，或者用 `ssh-agent` 的 systemd 集成
+- **`known_hosts` 要预先准备好**：以运行用户的身份先手工连一次，
+  或者用 `ssh-keyscan` 预填
+
+```bash
+sudo -u tunnel ssh-keyscan -H bastion.example.com >> /home/tunnel/.ssh/known_hosts
+```
+
+漏掉任何一条，症状都是"服务起来了但隧道不通"，而 `systemctl status` 看着正常。
+</Callout>
+
+## 服务端：把隧道能力收紧
+
+一个能 ssh 上跳板机的账号，**默认就能把跳板机当代理访问它所在的整个网络**。
+生产跳板机应该给隧道用途单独建账号并收紧：
+
+```sshconfig
+# /etc/ssh/sshd_config
+Match User tunnel-only
+    AllowTcpForwarding local          # 只允许 -L，禁掉 -R
+    PermitOpen 10.20.3.40:5432        # 白名单：只能转发到这个目标
+    PermitTTY no
+    X11Forwarding no
+    AllowAgentForwarding no
+    ForceCommand /usr/sbin/nologin    # 不给 shell
+```
+
+```bash
+sshd -t && systemctl reload sshd      # 改完先语法检查再 reload
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `AllowTcpForwarding local/remote/no` | 分别控制 `-L` / `-R` 是否允许 |
+| `PermitOpen host:port` | **转发目标白名单**，可以写多个 |
+| `GatewayPorts no`（默认） | `-R` 只能绑 loopback |
+| `ForceCommand /usr/sbin/nologin` | 只能转发、不能执行命令 |
+
+<Callout type="tip" title="AllowAgentForwarding no 值得单独说">
+Agent 转发（`ssh -A`）让你在跳板机上继续用本地的密钥。方便，但有风险：
+**跳板机的 root 可以劫持你的 agent socket，用你的密钥去连别的机器。**
+
+所以：
+- 跳板机上默认关掉 agent 转发
+- 需要多跳时用 **`ProxyJump` 而不是 `-A`**——ProxyJump 的密钥交换只在本地进行，
+  跳板机全程接触不到你的私钥
+
+这也是 `-J` 相对老式"先登跳板再登目标"做法的一个安全优势。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="sa-1"
+  question="改了 ~/.ssh/config 里某台主机的转发配置，重新 ssh 却发现没生效。最可能的原因？"
+  options={[
+    { text: 'ControlMaster 复用了旧的主连接，新配置没被读取，需要 ssh -O exit 关掉', correct: true },
+    { text: '配置文件语法错误', feedback: '语法错误会直接报错，而不是静默使用旧配置。' },
+    { text: '需要重启 sshd', feedback: '这是客户端配置，与服务端无关。' },
+    { text: '文件权限不对', feedback: '权限问题会有明确警告并拒绝读取。' },
+  ]}
+  explain={<>连接复用是很容易踩的坑：会话走的是已存在的主连接，压根没重新读配置。改完配置先 <code>ssh -O exit host</code>，再用 <code>ssh -G host</code> 确认最终生效的参数。</>}
+/>
+
+<Quiz
+  id="sa-2"
+  question="用 systemd 跑 ssh 隧道，服务显示 running 但隧道不通。首先检查什么？"
+  options={[
+    { text: 'BatchMode 是否开启、运行用户的 known_hosts 是否有目标主机指纹', correct: true },
+    { text: '增大 RestartSec', feedback: '重启间隔不影响能否建立连接。' },
+    { text: '换成 autossh', feedback: '换工具不解决认证与指纹确认问题。' },
+    { text: '检查目标端口是否监听', feedback: '值得查，但 systemd 场景最高频的原因是交互提示卡住。' },
+  ]}
+  explain={<>非交互环境下首次连接的主机指纹确认会让 ssh 一直挂着，而进程还活着所以 systemd 认为正常。三个必须项：BatchMode=yes、免密码密钥、预先 ssh-keyscan 填好 known_hosts。</>}
+/>
+
+<Quiz
+  id="sa-3"
+  question="为什么推荐用 ProxyJump 而不是 ssh -A（agent 转发）来做多跳？"
+  options={[
+    { text: 'ProxyJump 的密钥交换只在本地进行，跳板机接触不到你的私钥或 agent', correct: true },
+    { text: 'ProxyJump 速度更快', feedback: '性能差异不是主要考虑。' },
+    { text: 'agent 转发已被废弃', feedback: '它没有被废弃，只是有安全风险。' },
+    { text: 'ProxyJump 支持更多跳数', feedback: '两者都能多跳，差异在安全模型。' },
+  ]}
+  explain={<>agent 转发时跳板机的 root 可以劫持你的 agent socket，用你的密钥去连别的机器。ProxyJump 只把跳板机当字节中转，私钥全程留在本地。跳板机侧应配 AllowAgentForwarding no。</>}
+/>
+
+## 这节课的落点
+
+- `~/.ssh/config` 把长命令变成别名；**`Host` 是别名、`HostName` 才是真实地址**
+- **`ssh -G <host>` 是排查配置的第一条命令**，直接给出合并后的最终参数
+- `ProxyJump` 等价于老的 `ProxyCommand ssh -W`；会话终结在最终主机，
+  所以 `localhost` 指最终主机自己
+- **`ssh` 不读代理环境变量**，走 SOCKS5 要用 `ProxyCommand nc -x`；这同时解决 git over ssh
+- `ControlMaster` 让第二次连接毫秒级；三个坑：主连接断则全断、路径过长、
+  **改配置后要 `ssh -O exit` 才生效**
+- 保活用 `ServerAliveInterval`（SSH 层）而不是 `TCPKeepAlive`
+- **`ExitOnForwardFailure yes`** 避免"进程还在但没转发"的假隧道
+- 长期隧道做成 **systemd 模板单元**；必须 `BatchMode=yes` + 免密钥 + 预填 `known_hosts`
+- 服务端用 `Match User` 收紧：`AllowTcpForwarding local`、`PermitOpen` 白名单、
+  **`AllowAgentForwarding no`**

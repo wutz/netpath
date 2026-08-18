@@ -1,0 +1,277 @@
+## 接手
+
+自己的开发机，今天早上开始出问题：
+
+> 浏览器打不开 GitHub，`git push` 卡住，`pip install` 超时。**昨天下班前还好的**。
+> 隧道进程看着是活的。
+
+已知信息：
+
+- 本地 Mihomo 监听 `mixed-port 7892`，出口是自建的 gost 服务器 `proxy.example.com:443`
+- 昨晚没改过任何配置
+- 公司内网服务访问正常
+
+<Callout type="tip" title="怎么玩">
+按 L5 的排障顺序：**本地监听 → 隧道连接 → 出口可达 → 目标可达**。
+输入 <code>goals</code> 看目标，<code>hint</code> 要提示。四个目标全达成即过关。
+
+"进程还活着"这句话不能当证据用 —— 想想上一节讲的 `ExitOnForwardFailure`。
+</Callout>
+
+<Terminal
+  id="proxy-broken-quest"
+  host="wutz@devbox"
+  intro={`浏览器打不开 GitHub、git push 卡住、pip 超时。
+本地 Mihomo 在 7892，出口 proxy.example.com:443。昨晚未改配置。`}
+  commands={[
+    {
+      cmd: 'curl -m 5 -sS https://github.com',
+      output: `curl: (28) Failed to connect to github.com port 443 after 5001 ms: Timeout was reached
+
+# 超时而不是 refused —— 包发出去了没人应，或者压根没发出去。`,
+    },
+    {
+      cmd: 'ss -lntp | grep 7892',
+      goal: '确认本地代理端口是否还在监听',
+      hint: '第一层永远是「本地这一跳还在不在」，进程活着不等于端口在听',
+      aliases: ['ss -lntp | grep -E "7892|mihomo"', 'ss -lnt | grep 7892'],
+      output: `LISTEN 0  4096  *:7892  *:*  users:(("mihomo",pid=2841,fd=9))
+
+# 端口在监听，进程也在。本地这一跳没问题。`,
+    },
+    {
+      cmd: 'curl -m 5 -sS -x socks5h://127.0.0.1:7892 https://github.com',
+      goal: '确认问题出在代理链路而不是本机 DNS 或系统代理设置',
+      hint: '绕开系统代理设置，直接指定代理去连一次，把变量减到最少',
+      aliases: [
+        'curl -m 5 -sS --proxy socks5h://127.0.0.1:7892 https://github.com',
+        'curl -m 5 -sS -x http://127.0.0.1:7892 https://github.com',
+      ],
+      output: `curl: (97) Can't complete SOCKS5 connection to github.com
+
+# 代理本身应答了（说明本地代理在工作），但它告诉我们它连不到目标。
+# 问题在代理的上游，也就是出口那一侧。`,
+    },
+    {
+      cmd: 'curl -s http://127.0.0.1:9090/proxies | jq -r ".proxies | keys[]"',
+      aliases: ['curl -s http://127.0.0.1:9090/proxies | jq'],
+      output: `DIRECT
+REJECT
+自动选择
+兜底
+代理
+proxy-jp-01
+
+# 节点列表正常，配置加载没问题。`,
+    },
+    {
+      cmd: 'curl -s http://127.0.0.1:9090/connections | jq ".connections[0:3] | .[] | {host, chains, rule}"',
+      aliases: ['curl -s http://127.0.0.1:9090/connections | jq'],
+      output: `{
+  "host": "github.com",
+  "chains": ["proxy-jp-01", "代理"],
+  "rule": "DomainSuffix"
+}
+
+# 规则命中正确（DomainSuffix → 代理），选的节点也对。
+# 排除规则写错与选组错误 —— 这两个是最常见的自己作的问题。`,
+    },
+    {
+      cmd: 'tail -20 ~/.config/mihomo/logs/mihomo.log',
+      goal: '从日志确认代理到出口的连接失败在哪一步',
+      hint: '核心日志会写明和上游握手时发生了什么',
+      aliases: ['journalctl --user -u mihomo -n 20', 'tail -f ~/.config/mihomo/logs/mihomo.log'],
+      output: `10:12:03 INF [TCP] github.com:443 --> proxy-jp-01 match DomainSuffix
+10:12:08 WRN [TCP] dial proxy-jp-01 failed: dial tcp 203.0.113.77:443: i/o timeout
+10:12:19 WRN [TCP] dial proxy-jp-01 failed: dial tcp 203.0.113.77:443: i/o timeout
+10:12:31 WRN [TCP] dial proxy-jp-01 failed: dial tcp 203.0.113.77:443: i/o timeout
+
+# 关键信息：连 203.0.113.77:443 超时。
+# 代理本身没问题，是它连不上出口服务器。
+# 注意这个 IP —— 待会儿要和 DNS 解析结果对一下。`,
+    },
+    {
+      cmd: 'nc -zv 203.0.113.77 443',
+      aliases: ['nc -zvw 5 203.0.113.77 443', 'timeout 5 nc -zv 203.0.113.77 443'],
+      output: `nc: connectx to 203.0.113.77 port 443 (tcp) failed: Operation timed out
+
+# 直接连出口 IP 的 443 也超时，和代理日志一致。
+# 现在的问题变成：这个 IP 到底对不对，以及它为什么不通。`,
+    },
+    {
+      cmd: 'dig +short proxy.example.com',
+      goal: '找出根因：确认域名解析到的地址是否与实际使用的一致',
+      hint: '日志里那个 IP 是从哪来的？和现在解析出来的一样吗？',
+      aliases: ['dig proxy.example.com', 'nslookup proxy.example.com', 'dig +short @1.1.1.1 proxy.example.com'],
+      output: `203.0.113.201
+
+# 找到了：现在解析出来是 203.0.113.201，
+# 而 Mihomo 一直在连日志里那个 203.0.113.77。
+#
+# 说明服务器的 IP 变了（VPS 迁移 / 重建 / 弹性 IP 重新分配），
+# 而 Mihomo 缓存了旧的解析结果，一直在往已经不存在的地址上打。`,
+    },
+    {
+      cmd: 'ping -c 3 203.0.113.201',
+      output: `PING 203.0.113.201 (203.0.113.201): 56 data bytes
+64 bytes from 203.0.113.201: icmp_seq=0 ttl=48 time=68.412 ms
+64 bytes from 203.0.113.201: icmp_seq=1 ttl=48 time=67.905 ms
+64 bytes from 203.0.113.201: icmp_seq=2 ttl=48 time=68.223 ms
+
+--- 203.0.113.201 ping statistics ---
+3 packets transmitted, 3 packets received, 0.0% packet loss
+
+# 新地址完全可达，延迟正常。确认是缓存了旧 IP 的问题。`,
+    },
+    {
+      cmd: 'nc -zv 203.0.113.201 443',
+      aliases: ['nc -zvw 5 203.0.113.201 443'],
+      output: `Connection to 203.0.113.201 port 443 [tcp/https] succeeded!
+
+# 新地址的 443 通。出口服务本身是好的。`,
+    },
+    {
+      cmd: 'curl -s http://127.0.0.1:9090/version',
+      output: `{"version":"v1.18.10","meta":true}
+
+# 核心版本正常，不是崩了。`,
+    },
+    {
+      cmd: 'ps aux | grep mihomo',
+      output: `wutz  2841  0.3  0.4  ... /usr/local/bin/mihomo -d /Users/wutz/.config/mihomo
+
+# 进程从昨天就没重启过 —— 这正是它还拿着旧解析结果的原因。`,
+    },
+    {
+      cmd: 'sysctl -a | grep -i somaxconn',
+      output: `kern.ipc.somaxconn: 128
+
+# 与本次故障无关。`,
+    },
+  ]}
+/>
+
+## 结论应该长什么样
+
+| 证据 | 说明 |
+| --- | --- |
+| `curl` 超时而非 refused | 包没到目标，或到了没回音 |
+| `ss -lntp` 端口在监听 | **本地这一跳正常** |
+| 显式指定代理后报 SOCKS5 连接失败 | 本地代理在工作，**问题在它的上游** |
+| `/connections` 显示规则与节点都命中正确 | 排除规则写错、选组错误 |
+| 日志：`dial tcp 203.0.113.77:443: i/o timeout` | 拿到了它实际在连的 IP |
+| `nc` 连 `.77` 超时 | 那个地址确实不通 |
+| `dig` 解析出 `.201`，与日志里的 `.77` **不一致** | **根因** |
+| `nc` 连 `.201` 成功、`ping` 正常 | 出口服务本身健康 |
+| 进程从昨天未重启 | 解释了为什么它还拿着旧地址 |
+
+**根因**：出口服务器的公网 IP 变了（VPS 迁移或弹性 IP 重新分配），
+DNS 已经更新到新地址，但**长期运行的 Mihomo 进程缓存了旧的解析结果**，
+一直在往已经不存在的旧 IP 上建连。
+
+**修法**：
+
+```bash
+# 立刻恢复：重启核心让它重新解析
+# （Mihomo 也可以通过 API 触发配置重载）
+curl -X PUT http://127.0.0.1:9090/configs -d '{"path":"","payload":""}'
+# 或者直接重启服务
+launchctl kickstart -k gui/$(id -u)/mihomo     # macOS
+systemctl --user restart mihomo                # Linux
+
+# 验证
+curl -m 5 -sS -x socks5h://127.0.0.1:7892 https://github.com -o /dev/null -w '%{http_code}\n'
+```
+
+**根治**（按有效性排序）：
+
+1. **服务端用弹性/静态 IP**，别让它随重建变化
+2. 客户端配置里**用域名而不是 IP**（这次已经是域名，问题在缓存）
+3. 给节点配**健康检查**，让 `fallback` 组能自动切走
+4. **定期重启或重载**长期运行的代理进程
+
+<Callout type="trap" title="「进程还活着」不能当证据">
+这一关和 [SSH 进阶](/learn/l5-tunnel/ssh-advanced) 那节的 `ExitOnForwardFailure` 是同一类问题：
+
+**进程在跑 ≠ 链路可用。** 长期运行的隧道进程有三种"假活"状态：
+
+| 假活形态 | 表现 |
+| --- | --- |
+| **缓存了旧的 DNS 解析** | 本例 |
+| 端口绑定失败但进程未退出 | ssh 不加 `ExitOnForwardFailure` |
+| 底层连接已断但未检测到 | 缺少保活探测 |
+
+所以健康检查要**探测端到端可用性**，而不是看进程存活：
+
+```bash
+# 一条能进 cron 的健康检查
+curl -m 8 -s -o /dev/null -w '%{http_code}' \
+  -x socks5h://127.0.0.1:7892 https://www.gstatic.com/generate_204 \
+  | grep -q 204 || echo "proxy broken at $(date)"
+```
+</Callout>
+
+<Callout type="note" title="这一关的通用方法：从近到远逐跳确认">
+隧道类故障的路径很长，但排查顺序是固定的：
+
+```
+① 本地监听在不在       ss -lntp | grep <port>
+② 本地代理是否响应     curl -x <本地代理> <目标>
+③ 规则与节点选对没     /connections 的 rule 与 chains
+④ 代理到出口通不通     日志里的 dial 结果 + nc 直连出口
+⑤ 出口地址对不对       dig 与日志里的 IP 对比      ← 本例的根因
+⑥ 出口到目标通不通     在出口服务器上验证
+```
+
+**每一步都只确认一件事，确认完就往下走一跳。**
+乱序排查（比如一上来就重装客户端）会让你丢掉现场，还找不到原因。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="qpb-1"
+  question="curl 报超时而不是 connection refused，这个区别说明什么？"
+  options={[
+    { text: '包发出去后没有任何回音 —— 可能地址不通、被静默丢弃，而不是对端明确拒绝', correct: true },
+    { text: '端口没有程序在监听', feedback: '那会是 refused —— 对端明确回了 RST。' },
+    { text: '证书有问题', feedback: '证书问题会在 TLS 阶段报明确的证书错误。' },
+    { text: 'DNS 解析失败', feedback: '解析失败会报 Could not resolve host。' },
+  ]}
+  explain={<>timeout 与 refused 的方向完全相反，这是 L0 第一节就强调的一对。refused 说明链路通、只是没人听；timeout 说明包根本没到或被静默丢弃 —— 后者要往路由、防火墙、地址正确性方向查。</>}
+/>
+
+<Quiz
+  id="qpb-2"
+  question="代理日志显示 dial tcp 203.0.113.77:443: i/o timeout，而 dig 解析出的是 203.0.113.201。说明什么？"
+  options={[
+    { text: '进程缓存了旧的 DNS 解析结果，服务器 IP 已经变了但它还在连旧地址', correct: true },
+    { text: 'DNS 被污染了', feedback: '污染会让你解析到错误地址，而这里 dig 给的是正确的新地址。' },
+    { text: '有两台服务器在做负载均衡', feedback: '那不会导致其中一个完全不通且与解析结果不一致。' },
+    { text: '本地 hosts 文件写错了', feedback: '值得查，但 dig 已经返回了正确结果，说明解析链路是对的。' },
+  ]}
+  explain={<>把「日志里实际在连的 IP」和「现在解析出来的 IP」对比，是这类故障最快的定位手段。根治靠服务端用静态 IP、节点配健康检查让 fallback 自动切走、以及定期重载长期运行的进程。</>}
+/>
+
+<Quiz
+  id="qpb-3"
+  question="为什么健康检查不能只看进程是否存活？"
+  options={[
+    { text: '隧道进程有多种「假活」状态：缓存旧解析、端口绑定失败未退出、底层连接已断未检测', correct: true },
+    { text: '因为进程可能被重命名', feedback: '与进程名无关。' },
+    { text: '因为 ps 命令不可靠', feedback: 'ps 是可靠的，问题在于进程存活不代表链路可用。' },
+    { text: '因为需要 root 权限才能看进程', feedback: '看自己的进程不需要 root。' },
+  ]}
+  explain={<>要探测端到端可用性：用 curl 经代理去拿一个已知的 204 响应，失败就告警。这与 SSH 那节的 ExitOnForwardFailure 是同一类教训 —— 进程在跑不等于转发在工作。</>}
+/>
+
+## 这一关的落点
+
+- 排障顺序固定：**本地监听 → 本地代理响应 → 规则与节点 → 代理到出口 → 出口地址 → 出口到目标**
+- **timeout 与 refused 方向相反**：前者包没到，后者到了被拒
+- 显式 `curl -x <本地代理>` 能一步把"系统代理设置"这个变量摘掉
+- `/connections` 的 `rule` 与 `chains` 两个字段可以排除掉最常见的自己作的问题
+- **把日志里实际在连的 IP 与 `dig` 结果对比**，是这类故障最快的定位手段
+- 长期运行的进程会**缓存旧的 DNS 解析**，服务端 IP 一变就静默失效
+- **"进程还活着"不是证据**：假活有三种形态，健康检查必须探端到端可用性
+- 根治顺序：服务端静态 IP → 配置用域名 → 节点健康检查让 fallback 自动切 → 定期重载
