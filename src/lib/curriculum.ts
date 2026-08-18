@@ -1234,7 +1234,7 @@ export const tracks: Track[] = [
         title: '需求拆解：从业务话术到端口和带宽',
         summary: '"我们要建个 AI 集群"这句话里没有一个可采购的数字。这节讲怎么问出来。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 25,
         objectives: [
           '用一份清单把模糊需求问成可计算的参数',
@@ -1277,7 +1277,7 @@ export const tracks: Track[] = [
         title: '地址与 VLAN 规划：给集群划地盘',
         summary: '地址规划是一次性决定、长期后悔的事。Pod CIDR 划小了以后加不了节点。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '按节点数与单节点 Pod 数上限反推 Pod CIDR 大小',
@@ -1322,7 +1322,7 @@ export const tracks: Track[] = [
         title: '选型对比：IB、RoCE 与 Spectrum-X',
         summary: '同一笔预算三种方案，差别不在峰值带宽，在运维成本和确定性。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '按团队能力与规模给出一个能落地的选型建议',
