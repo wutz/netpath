@@ -1036,7 +1036,7 @@ export const tracks: Track[] = [
         title: 'InfiniBand 架构：子网管理器、LID 与 UFM',
         summary: 'IB 不是"快一点的以太网"，它是另一套体系：地址、路由、拥塞控制全都自成一家。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '解释 SM 的作用，说出 SM 失效会发生什么',
@@ -1085,7 +1085,7 @@ export const tracks: Track[] = [
         title: 'Fat-Tree 与 Rail-Optimized 拓扑',
         summary: 'GPU 集群的网络拓扑不是"接上就行"，接错了 AllReduce 直接掉一半带宽。',
         kind: 'concept',
-        status: 'planned',
+        status: 'ready',
         minutes: 30,
         objectives: [
           '画出两层 Fat-Tree 并算出它的无阻塞条件',
@@ -1107,7 +1107,7 @@ export const tracks: Track[] = [
         title: '动手：用 perftest 打通第一条 RDMA 链路',
         summary: 'ib_send_bw 跑不出线速时，问题几乎总在 GID、设备名或 MTU 上。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 35,
         objectives: [
           '用 show_gids 选对 GID index 并解释为什么要选',
@@ -1129,7 +1129,7 @@ export const tracks: Track[] = [
         title: '动手：K8s 里把 RDMA 交给 Pod',
         summary: 'network-operator、rdma/hca 资源、hostNetwork 与 MacVLAN 两种模式的实际配法。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 40,
         objectives: [
           '部署 network-operator 并用 NicClusterPolicy 暴露 rdma/hca 资源',
@@ -1154,7 +1154,7 @@ export const tracks: Track[] = [
         title: '动手：NCCL 与 busbw 判读',
         summary: 'AllReduce 的 busbw 是 GPU 集群的网络体检报告。这节讲怎么跑、怎么读、怎么调。',
         kind: 'lab',
-        status: 'planned',
+        status: 'ready',
         minutes: 40,
         objectives: [
           '跑通多节点 all_reduce_perf 并确认正确性检查通过',

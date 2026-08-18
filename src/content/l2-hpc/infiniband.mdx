@@ -1,0 +1,303 @@
+## IB 不是"快一点的以太网"
+
+这是理解 InfiniBand 的第一步。它是**另一套完整体系**，和以太网在每一层都不同：
+
+| | 以太网 | InfiniBand |
+| --- | --- | --- |
+| 地址 | MAC + IP | **LID**（本地）+ **GID**（全局） |
+| 转发表来源 | 自学习 / 路由协议 | **子网管理器统一下发** |
+| 流控 | 靠丢包 + PFC 补救 | **链路层 credit，天生不丢包** |
+| 拥塞控制 | ECN/DCQCN（端到端） | 硬件拥塞控制 + 自适应路由 |
+| 管理平面 | SNMP / 各家 CLI | **SM + UFM** |
+
+所以 IB 的运维知识不能从以太网直接迁移。好消息是：**它的很多难题被架构消掉了**——
+比如不需要配 PFC/ECN，因为链路层本来就不丢包。
+
+## Credit 流控：为什么天生无损
+
+以太网的发送方是"先发出去，堵了再说"。IB 反过来：
+
+```
+接收方告诉发送方：我还有 N 个 credit（缓冲单元）
+发送方：只发不超过 N 个单位的数据
+接收方处理完，归还 credit
+credit 用完 → 发送方停下等待，而不是把包丢掉
+```
+
+这是**逐跳的、硬件实现的**背压。对比一下 [RoCE 那节](/learn/l2-hpc/roce)：
+RoCE 要靠 PFC 模拟这个效果，而 PFC 是"事后踩刹车"，还会反压扩散、可能死锁。
+
+**IB 的无损是网络自带的，RoCE 的无损要靠人配。** 这就是两者最本质的运维差异。
+
+## 子网管理器：整张网只有一个大脑
+
+以太网交换机各自学习转发表。IB 完全不同：**一个子网里有一个 SM（Subnet Manager）
+负责发现拓扑、分配地址、计算并下发所有转发表**。
+
+```
+SM 启动
+  ↓ 扫描整个子网，发现所有 HCA 与交换机端口
+  ↓ 给每个端口分配 LID
+  ↓ 按路由算法计算路径
+  ↓ 把转发表（LFT）写进每台交换机
+  ↓ 之后持续监控，拓扑变化就重算
+```
+
+SM 可以跑在交换机上（内置）或某台服务器上（`opensm` / UFM）。
+
+```bash
+# 谁是 SM，在哪
+sminfo
+ibstat | grep -i sm_lid
+```
+
+<Callout type="warn" title="SM 挂了会怎样：不是立刻断网">
+这是最容易误解的一点。**SM 挂掉后已有的转发表还在交换机里，现有流量继续跑。**
+
+真正的问题是**拓扑变化时没人处理**：
+- 新加的节点拿不到 LID，起不来
+- 某条链路故障后没人重算路径，受影响的通信一直不恢复
+- 重启的节点接不回来
+
+所以症状往往是"平时没事，一动就出事"，而且很难第一时间联想到 SM。
+
+生产环境要配**主备 SM**（多个 SM 用优先级选主）。检查方法：
+```bash
+sminfo                    # 当前 SM 的 LID 与优先级
+ibnetdiscover | grep -ci switch    # 能不能正常发现拓扑
+```
+</Callout>
+
+## LID 与 GID：两套地址
+
+| | LID | GID |
+| --- | --- | --- |
+| 全称 | Local Identifier | Global Identifier |
+| 长度 | 16 位 | 128 位（形如 IPv6） |
+| 作用范围 | **一个子网内** | 跨子网 |
+| 谁分配 | **SM** | 由子网前缀 + 端口 GUID 组成 |
+| 类比 | MAC 地址 | IP 地址 |
+
+绝大多数集群只有一个子网，所以**日常打交道的是 LID**；GID 主要在 RoCE 场景里用
+（[RoCE 那节](/learn/l2-hpc/roce) 讲的 `show_gids` 选 index 就是它）。
+
+## 必会的六条命令
+
+### ① `ibstat` —— 本机 HCA 的状态
+
+```bash
+ibstat
+```
+
+```
+CA 'mlx5_0'
+	CA type: MT4129
+	Firmware version: 28.42.1000
+	Port 1:
+		State: Active            ← 必须 Active
+		Physical state: LinkUp   ← 必须 LinkUp
+		Rate: 400                ← 必须符合预期
+		Base lid: 37
+		LMC: 0
+		SM lid: 1
+		Link layer: InfiniBand
+```
+
+四个必看字段：`State`、`Physical state`、`Rate`、`Link layer`。
+
+| 组合 | 含义 |
+| --- | --- |
+| `Active` + `LinkUp` | 正常 |
+| `Down` + `Polling` | **没插线**，或对端端口关闭 |
+| `Initializing` + `LinkUp` | 物理层通了但**没被 SM 初始化**——去查 SM |
+| `Active` + Rate 偏低 | 速率协商降级，查线缆/光模块/端口配置 |
+
+`Initializing` 这个状态很有诊断价值：**它精确指向 SM 问题**，因为端口从
+`Initializing` 变成 `Active` 正是 SM 的工作。
+
+### ② `ibdev2netdev` —— 设备名与网卡名的对应
+
+```bash
+ibdev2netdev -v
+```
+
+```
+mlx5_0 port 1 ==> ens1f0np0 (Up)
+mlx5_1 port 1 ==> ens1f1np0 (Up)
+```
+
+多卡机器上这条最实用：`NCCL_IB_HCA` 里写的是 `mlx5_x`，
+而 `ethtool`、`ip` 用的是 `ens1f0np0`，两套名字靠它对上。
+
+### ③ `iblinkinfo` —— 全网链路一览
+
+```bash
+iblinkinfo | head -20
+```
+
+```
+Switch 0xb8cef60300a1b2c0 QM9700:
+   1    1[  ] ==( 4X 400Gbps Active/ LinkUp)==>  37    1[  ] "node-101 mlx5_0"
+   1    2[  ] ==( 4X 400Gbps Active/ LinkUp)==>  38    1[  ] "node-102 mlx5_0"
+   1    3[  ] ==(      Down/ Polling)==>            [  ] ""
+```
+
+一眼能看出**哪个端口没接、哪条链路速率不对**。批量检查：
+
+```bash
+# 找出所有非 400Gbps 的活动链路（降速）
+iblinkinfo | grep Active | grep -v '400Gbps'
+# 统计各速率的链路数
+iblinkinfo | grep -o '[0-9]*Gbps' | sort | uniq -c
+```
+
+### ④ `ibdiagnet` —— 一次性全网体检
+
+这是交付验收和例行巡检的主力命令：
+
+```bash
+ibdiagnet -r --pm_pause_time 30
+```
+
+它会检查：拓扑一致性、链路速率与宽度、**误码率（BER）**、
+端口错误计数、SM 状态、固件版本一致性，最后把报告写到 `/var/tmp/ibdiagnet2/`。
+
+```bash
+# 关键报告
+grep -iE 'error|warning' /var/tmp/ibdiagnet2/ibdiagnet2.log | head -20
+```
+
+<Callout type="tip" title="BER 是 IB 特有的、也最值得看的指标">
+以太网侧我们看丢包和 CRC 错误。IB 有更细的指标：**符号错误与误码率（BER）**。
+
+```bash
+# 端口错误计数（symbol errors、link recovery 等）
+perfquery -a
+# 清零后观察增量
+perfquery -R -a
+```
+
+BER 缓慢恶化是**光模块或线缆即将失效的早期信号**。它的表现不是断网，
+而是"偶发重传、集合通信出现长尾"——和 NVLink 掉链一样属于静默故障。
+
+例行巡检的价值就在这里：**在它变成故障之前换掉那根线**。
+</Callout>
+
+### ⑤ `ibnetdiscover` —— 导出拓扑
+
+```bash
+ibnetdiscover > topo.txt
+grep -c '^Switch' topo.txt        # 交换机台数
+grep -c '^Ca' topo.txt            # HCA 数量
+```
+
+用来核对"实际接线是否符合设计"。[Rail 拓扑那节](/learn/l2-hpc/topology-rail)
+讲的"图纸对 ≠ 现场接对"，靠的就是这条命令导出的实际拓扑。
+
+### ⑥ `ibping` / `ibhosts` —— 连通性与成员
+
+```bash
+ibhosts                 # 子网里有哪些 HCA
+ibswitches              # 有哪些交换机
+ibping -S               # 服务端
+ibping -c 10 <lid>      # 客户端
+```
+
+## 自适应路由与拥塞控制
+
+IB 的转发表由 SM 下发，默认是**静态的**：同一对端点之间总走同一条路。
+大规模集群里这会导致哈希不均——多条流挤在同一条 spine 链路上。
+
+**自适应路由（AR）** 让交换机在多条等价路径中按实时拥塞情况选路。
+对 AllReduce 这种全员同时通信的模式收益明显。
+
+```bash
+# 查询 AR 是否启用（具体命令依交换机与 UFM 版本）
+# 交换机侧：show adaptive-routing
+```
+
+存储流量也受益——[SuperPOD 参考架构](https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-h200/latest/abstract.html)
+明确提到存储网选 IB 的理由之一就是**拥塞控制与自适应路由**。
+
+## UFM：管理平面
+
+UFM（Unified Fabric Manager）是 IB 的集中管理平台：拓扑可视化、SM 服务、
+告警、性能采集、固件管理。
+
+它也解释了一个规划细节：[Rail 布线账](/learn/l3-planning/fabric-plan) 里
+**一个 SU 是 32 个机位却只装 31 台节点**——腾出的位置和线缆给 UFM 用。
+
+## 一份 IB 交付验收清单
+
+```bash
+# 1. 所有端口 Active/LinkUp 且速率符合预期
+for d in $(ibstat -l); do echo "== $d"; ibstat $d | grep -E 'State|Rate'; done
+
+# 2. 全网没有降速或未接的链路
+iblinkinfo | grep Active | grep -v '400Gbps'
+
+# 3. SM 存在且有备份
+sminfo
+
+# 4. 实际拓扑与设计一致
+ibnetdiscover | grep -c '^Switch'
+ibnetdiscover | grep -c '^Ca'
+
+# 5. 全网体检无错误
+ibdiagnet -r && grep -icE 'error' /var/tmp/ibdiagnet2/ibdiagnet2.log
+
+# 6. 点对点带宽达线速 90%（下一节）
+# 7. 集群 busbw 达理论峰值 90%（NCCL 那节）
+```
+
+前五条是 IB 特有的，后两条是所有高性能网络的共同验收标准。
+
+## 检查点
+
+<Quiz
+  id="ib-1"
+  question="ibstat 显示某端口 Physical state: LinkUp 但 State: Initializing。最该查什么？"
+  options={[
+    { text: '子网管理器 —— 端口从 Initializing 变成 Active 正是 SM 的工作', correct: true },
+    { text: '线缆或光模块', feedback: 'LinkUp 说明物理层已经通了，线缆没问题。' },
+    { text: '网卡固件版本', feedback: '固件不匹配通常表现为设备识别不到或功能异常，不是卡在 Initializing。' },
+    { text: 'MTU 配置', feedback: 'MTU 不影响端口状态机。' },
+  ]}
+  explain={<>这是 IB 独有的、诊断价值很高的状态：物理层通了但没被 SM 初始化。用 sminfo 确认 SM 是否存在与可达。以太网没有对应概念，因为它没有集中的管理实体。</>}
+/>
+
+<Quiz
+  id="ib-2"
+  question="SM 进程挂掉后，为什么集群往往当时没有任何异常？"
+  options={[
+    { text: '已下发的转发表还在交换机里，现有流量继续跑；只有拓扑变化时才暴露', correct: true },
+    { text: 'SM 只负责监控，不参与转发', feedback: 'SM 负责分配 LID 与计算下发转发表，作用不止监控。' },
+    { text: '交换机会自动学习转发表', feedback: '那是以太网的机制，IB 的转发表由 SM 统一下发。' },
+    { text: '因为有 credit 流控兜底', feedback: 'credit 是链路层流控，与转发表无关。' },
+  ]}
+  explain={<>症状是「平时没事、一动就出事」：新节点拿不到 LID、链路故障后不重算路径、重启的节点接不回来。所以要配主备 SM，并把 sminfo 放进例行巡检。</>}
+/>
+
+<Quiz
+  id="ib-3"
+  question="为什么 IB 不需要配 PFC 和 ECN？"
+  options={[
+    { text: '它的链路层用 credit 机制，发送方在对端没有缓冲时就不发，天生不丢包', correct: true },
+    { text: '因为 IB 带宽足够大，不会拥塞', feedback: '带宽再大也会拥塞，IB 另有硬件拥塞控制与自适应路由。' },
+    { text: '因为 IB 用 UDP 封装，丢包由上层处理', feedback: '那是 RoCEv2 的做法，IB 有自己的链路层。' },
+    { text: '因为 IB 不做可靠传输', feedback: 'IB 提供可靠传输，而且正是它对丢包敏感才需要无损。' },
+  ]}
+  explain={<>credit 是逐跳的硬件背压：接收方先声明能收多少，发送方绝不超发。这就是「IB 的无损是网络自带的，RoCE 的无损要靠人配」这句话的技术根据 —— 也是两者最本质的运维成本差异。</>}
+/>
+
+## 这节课的落点
+
+- IB 是另一套体系：**LID/GID 寻址、SM 统一下发转发表、credit 链路层流控**
+- **credit 机制让它天生无损**，所以不需要配 PFC/ECN——这是相对 RoCE 最大的运维优势
+- **SM 是整张网唯一的大脑**；它挂了不会立刻断网，但"一动就出事"，必须配主备
+- `ibstat` 的 `Initializing` + `LinkUp` 精确指向 SM 问题
+- 六条命令：`ibstat`（本机）、`ibdev2netdev`（名字对应）、`iblinkinfo`（全网链路）、
+  `ibdiagnet`（体检）、`ibnetdiscover`（拓扑）、`ibhosts`/`ibping`（成员与连通）
+- **BER 与符号错误是 IB 特有指标**，缓慢恶化是线缆将坏的早期信号，属于静默故障
+- 自适应路由解决静态转发表的哈希不均，对 AllReduce 收益明显
+- 交付验收五条 IB 专项 + 两条通用（点对点线速、集群 busbw）

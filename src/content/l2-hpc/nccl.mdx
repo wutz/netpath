@@ -1,0 +1,290 @@
+## busbw 是 GPU 集群的体检报告
+
+前面几节验证的都是"某一段是对的"：PCIe 够、NVLink 全、链路速率对、点对点跑满线速。
+但它们都测不出**多机多卡同时通信**时的表现。
+
+NCCL 的 AllReduce 测试补上这一环。它一个数字就能覆盖：网卡、PCIe、NVLink、链路速率、
+rail 布线、拥塞控制、参数配置——**任何一处错都会反映在 busbw 上**。
+
+所以它既是调优工具，也是交付验收的最终指标。
+
+## 先算理论峰值
+
+不知道目标值，测出来的数字没有意义。公式很简单：
+
+```
+理论峰值 busbw = 每节点计算网卡数 × 单口带宽 ÷ 8
+```
+
+| 配置 | 计算 | 理论峰值 |
+| --- | --- | --- |
+| 8 × 400 Gb（NDR） | 8 × 400 ÷ 8 | **400 GB/s** |
+| 8 × 200 Gb（HDR） | 8 × 200 ÷ 8 | 200 GB/s |
+| 4 × 200 Gb | 4 × 200 ÷ 8 | 100 GB/s |
+
+判定标准（来自实践口径）：
+
+| busbw / 理论峰值 | 评级 |
+| --- | --- |
+| ≥ 90% | 优秀 |
+| 80–90% | 可接受 |
+| 低于 80% | **异常，必须查** |
+
+## 两个任务，顺序不能反
+
+| | 任务一：单次测试 | 任务二：压力测试 |
+| --- | --- | --- |
+| 参数 | `-b 8 -e 8G -f 2 -g 1` | `-b 8G -e 8G -i 0 -g 1` |
+| 数据量 | 8 B 到 8 GB 翻倍扫描 | 固定 8 GB 循环 |
+| 行为 | 扫完自动退出 | 持续跑，手动停 |
+| 目的 | **正确性 + 性能曲线** | **满载长稳** |
+
+**先做任务一，通过了再做任务二。** 正确性没过就调性能是白费功夫。
+
+`-i 0` 让数据量不递增，配合 `-b`/`-e` 相等，程序就会一直循环输出同一个尺寸的结果。
+
+## 关键环境变量
+
+配错任何一个，结果都会失真。分两类看。
+
+### 所有机型一致的
+
+| 变量 | 值 | 作用 |
+| --- | --- | --- |
+| `NCCL_ALGO` | `Ring` | **固定算法**，确保多次测试可比 |
+| `NCCL_IB_DISABLE` | `0` | 启用 IB/RoCE；设 1 会**回退 TCP，带宽暴跌** |
+| `NCCL_IB_QPS_PER_CONNECTION` | `8` | 每连接 8 个 QP，提升带宽利用率 |
+| `NCCL_DEBUG` | `WARN`（调试时 `INFO`） | INFO 日志很大，压测时会触发轮转 |
+
+### 按机型/网络差异的
+
+| 变量 | 典型值 | 选错的后果 |
+| --- | --- | --- |
+| `NCCL_IB_HCA` | `mlx5` 或显式列全 | **走错卡或少用卡**，带宽按比例掉 |
+| `NCCL_SOCKET_IFNAME` | `bond0` / `bond1` / `eth0` | 节点间 TCP 控制通道不通，**连不上** |
+| `NCCL_IB_TC` | `106`（RoCE） | 不设则 RoCE 流量没有优先级标记，拥塞时被丢 |
+| `NCCL_CROSS_NIC` | `1`（多网卡） | 不启用跨卡聚合，带宽利用率低 |
+| `UCX_NET_DEVICES` | `bond1` / `eth0` | UCX 选错网卡，hcoll 初始化失败 |
+
+<Callout type="warn" title="NCCL_IB_HCA 是最容易出错的一个">
+它决定 NCCL 用哪几张网卡。三种写法：
+
+```bash
+NCCL_IB_HCA=mlx5                    # 前缀匹配，所有 mlx5* 设备
+NCCL_IB_HCA=mlx5_0,mlx5_1,...       # 显式列举（要列全！）
+NCCL_IB_HCA=^=mlx5_4                # 排除某个设备
+```
+
+**从别的机型抄配置是最常见的事故来源**：4 卡机型的配置搬到 8 卡机器上，
+就只用了一半网卡，busbw 正好掉一半。
+[AllReduce 闯关](/learn/l2-hpc/quest-slow-allreduce) 那一关练的就是这个。
+
+设备名用 `ibdev2netdev` 核对，别猜。
+</Callout>
+
+### 调试时才开的
+
+```bash
+NCCL_DEBUG=INFO
+NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH     # 只看初始化、网络选择、拓扑
+```
+
+## 集合通信原语
+
+AllReduce 是最常用的（数据并行的梯度同步就是它），但要理解 busbw 得先知道它做了什么：
+
+| 原语 | 做什么 | 用在哪 |
+| --- | --- | --- |
+| **AllReduce** | 所有卡的数据求和，结果发回所有卡 | 数据并行的梯度同步 |
+| **AllGather** | 每张卡的数据拼起来发给所有卡 | 张量并行、ZeRO |
+| **ReduceScatter** | 求和后按分片发给各卡 | ZeRO、张量并行 |
+| **AllToAll** | 每张卡给每张卡发不同数据 | **MoE 专家并行，对网络最苛刻** |
+
+Ring AllReduce 的实现是 **ReduceScatter + AllGather** 两阶段，
+每张卡都要收发 `2(n-1)/n` 倍的数据——这正是下面校正因子的来源。
+
+## busbw 与 algbw：为什么要两个指标
+
+测试输出有两列带宽，很多人只看后面那个而不知道区别：
+
+```
+#      size    count    type   redop   time   algbw   busbw #wrong
+    8589934592 2147483648 float sum  84744.2  101.36  190.05      0
+```
+
+| 指标 | 含义 | 特点 |
+| --- | --- | --- |
+| **algbw** | 数据量 ÷ 耗时 | **随 GPU 数变化**，不能直接和硬件比 |
+| **busbw** | algbw × 校正因子 | **可以直接和硬件峰值比** |
+
+AllReduce 的校正因子是：
+
+```
+busbw = algbw × 2(n − 1)/n        n = GPU 总数
+```
+
+16 卡时：`2 × 15 / 16 = 1.875`，所以 `101.36 × 1.875 ≈ 190.05`。
+
+<Callout type="note" title="校正因子的意义：让不同规模可比">
+n 越大，因子越接近 2。这样设计的目的是**消除 GPU 数量对指标的影响**：
+
+- 16 卡集群 busbw 380 GB/s
+- 128 卡集群 busbw 375 GB/s
+
+这两个数字可以直接比较，也都能直接和"8 × 400 Gb ÷ 8 = 400 GB/s"对照。
+如果只看 algbw，规模一变数字就变，没法判断好坏。
+
+**所以验收看 busbw，别看 algbw。**
+</Callout>
+
+## 跑一次完整测试
+
+以 Kubeflow Trainer 提交为例（配置来自实践仓库）：
+
+```bash
+kubectl apply -f nccl-tests-b200.yaml
+
+# 看完整日志（含 NCCL 初始化，--tail=-1 别省）
+kubectl logs -l trainer.kubeflow.org/replicated-job-name=launcher -f --tail=-1
+```
+
+### 完成标准（三条都要过）
+
+```
+# Out of bounds values : 0 OK        ← 正确性
+# Wrong values : 0 OK                ← 正确性
+峰值 busbw ≥ 理论峰值 × 90%           ← 性能
+```
+
+### 扩展到 N 个节点要改两处
+
+```bash
+# numNodes 与 mpirun 的 -np 必须同时改，-np = 节点数 × 每节点 GPU 数
+sed -e 's/numNodes: 2/numNodes: 4/' \
+    -e 's/-np 16/-np 32/' \
+    nccl-tests-b200.yaml > nccl-tests-4node.yaml
+diff nccl-tests-b200.yaml nccl-tests-4node.yaml     # 改完先看 diff
+```
+
+**只改一处是高频错误**：`numNodes` 改了但 `-np` 没改，
+结果只有一部分 GPU 参与，busbw 看起来"莫名偏低"。
+
+### 转成压测
+
+```bash
+sed 's|all_reduce_perf -b 8 -e 16G -f 2 -g 1|all_reduce_perf -b 8G -e 8G -i 0 -g 1|' \
+    nccl-tests-b200.yaml > nccl-tests-stress.yaml
+kubectl apply -f nccl-tests-stress.yaml
+# 跑够时长后手动停
+kubectl delete -f nccl-tests-stress.yaml
+```
+
+## 判读日志：三行定生死
+
+```bash
+kubectl logs <launcher-pod> | grep -E 'NET/|Using network|GPU Direct'
+```
+
+```
+NCCL INFO NET/IB : Using [0]mlx5_0:1/RoCE [1]mlx5_1:1/RoCE ... [7]mlx5_7:1/RoCE
+NCCL INFO NET/IB : GPU Direct RDMA Enabled for HCA 0 'mlx5_0'
+NCCL INFO Using network IB
+```
+
+| 看什么 | 期望 | 不对说明什么 |
+| --- | --- | --- |
+| `NET/IB` 还是 `NET/Socket` | **`NET/IB`** | `NET/Socket` = **回退 TCP**，带宽差一个量级 |
+| 列出的 HCA 数量 | 等于每节点网卡数 | 少了 = `NCCL_IB_HCA` 漏了卡 |
+| `GPU Direct RDMA Enabled` | 有这一行 | 没有 = 显存要经主存中转 |
+
+**这三行是排查 busbw 偏低的第一站**，比调参数快得多。
+
+## busbw 偏低的排查顺序
+
+```
+busbw 不达标
+   │
+   ├─ 只剩几分之一（低于 30%）
+   │     → 日志找 NET/Socket：回退 TCP 了
+   │       查 NCCL_IB_DISABLE、NCCL_IB_HCA 设备名、Pod 内 ibv_devinfo 是否看得到设备
+   │
+   ├─ 约一半
+   │     → ① NCCL_IB_HCA 少列了卡（日志里数一下）
+   │       ② 端口速率降级（ibstat | grep Rate）
+   │       ③ rail 布线接错（ibnetdiscover 核对）
+   │       ④ numNodes 改了但 -np 没改
+   │
+   ├─ 约 60%
+   │     → PCIe 代际/lane 不够（lspci LnkSta，400G 要 Gen5 x16）
+   │
+   ├─ 80–90% 且抖动
+   │     → RoCE 无损配置：PFC 计数是否暴涨、NCCL_IB_TC 是否设置
+   │
+   └─ 单点异常（某几张卡慢）
+         → NVLink 掉链（nvidia-smi topo -m 看 NV 数是否一致）
+           或 BER 恶化（perfquery -a）
+```
+
+<Callout type="tip" title="把它做成基线而不是一次性测试">
+最有价值的用法不是交付时测一次，而是**存一份基线，之后定期复测对比**：
+
+```bash
+# 每次测试后记录关键字段
+date +%F,$(kubectl logs <launcher> | awk '/Avg bus bandwidth/{print $NF}')
+```
+
+理由是这一层的故障大多是**静默退化**：NVLink 掉一条链、光模块 BER 慢慢恶化、
+某次维护后网卡插到了错误槽位。它们都不报错，只让 busbw 掉几个百分点。
+
+有基线才能发现"上周 385、这周 340"。没基线就只能等业务抱怨训练变慢。
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="nc-1"
+  question="8 卡 × 400 Gb 的节点，16 卡测试算出 algbw 101 GB/s、busbw 190 GB/s。这套集群健康吗？"
+  options={[
+    { text: '不健康 —— 理论峰值 400 GB/s，190 只有 47.5%，远低于 80% 的异常线', correct: true },
+    { text: '健康，busbw 190 已经很高', feedback: '要和理论峰值对比才有意义：8 × 400 ÷ 8 = 400 GB/s。' },
+    { text: '要看 algbw 判断', feedback: 'algbw 随 GPU 数变化，不能直接与硬件峰值比较。' },
+    { text: '数据量不够大，看不出来', feedback: '8 GB 已经是大尺寸，曲线早已进入平台期。' },
+  ]}
+  explain={<>验收看 busbw、不看 algbw。约一半这个比例的头号嫌疑是 NCCL_IB_HCA 少列了卡，其次是速率降级、rail 接错、numNodes 改了但 -np 没改。</>}
+/>
+
+<Quiz
+  id="nc-2"
+  question="日志里出现 NET/Socket 而不是 NET/IB，意味着什么？"
+  options={[
+    { text: 'NCCL 没走 RDMA，回退到了 TCP，带宽会差一个量级', correct: true },
+    { text: '用的是 RoCE 而不是 InfiniBand', feedback: '两者在日志里都显示 NET/IB，区别写在后面的 RoCE / IB 标注上。' },
+    { text: '只是日志格式不同', feedback: '这两条路径的性能差距非常大。' },
+    { text: 'GPUDirect 未启用', feedback: 'GPUDirect 有独立的日志行，与选哪个网络插件是两件事。' },
+  ]}
+  explain={<>这是判断「到底走没走 RDMA」最快的方法。常见原因：NCCL_IB_DISABLE=1、设备名写错、Pod 里看不到 RDMA 设备（没申请 rdma/hca 或 RoCE 没设 hostNetwork）。</>}
+/>
+
+<Quiz
+  id="nc-3"
+  question="为什么建议保存 busbw 基线并定期复测？"
+  options={[
+    { text: '这一层的故障多是静默退化：NVLink 掉链、BER 恶化、槽位插错都只让数字掉几个点', correct: true },
+    { text: '为了满足审计要求', feedback: '这是附带好处，不是技术理由。' },
+    { text: '因为 NCCL 版本会变', feedback: '版本变化确实影响结果，但不是主要理由。' },
+    { text: '因为 GPU 会老化降速', feedback: 'GPU 降频有独立的监控指标，且不是网络层问题。' },
+  ]}
+  explain={<>静默退化是高性能网络的典型故障形态 —— 功能全对、只是慢一点、日志无报错。有基线才能发现「上周 385、这周 340」，否则只能等业务抱怨。</>}
+/>
+
+## 这节课的落点
+
+- **理论峰值 = 网卡数 × 单口带宽 ÷ 8**；判定线：≥90% 优秀、80–90% 可接受、低于 80% 必查
+- 两个任务顺序不能反：**单次扫描测正确性与曲线**，通过后再做**固定尺寸压测**
+- 固定 `NCCL_ALGO=Ring` 保证可比；`NCCL_IB_DISABLE=0` 否则回退 TCP
+- **`NCCL_IB_HCA` 是最容易出错的一个**，从别的机型抄配置会少用卡
+- **验收看 busbw 不看 algbw**；`busbw = algbw × 2(n−1)/n`，因子的作用是消除规模影响
+- 扩节点要**同时改 `numNodes` 与 `-np`**，只改一处会让部分 GPU 不参与
+- 日志三行定生死：`NET/IB` vs `NET/Socket`、列出的 HCA 数量、`GPU Direct RDMA Enabled`
+- 偏低比例即线索：**几分之一 = 回退 TCP、一半 = 少卡/降速/接错 rail、60% = PCIe 不够**
+- **存基线定期复测**，这一层的故障几乎都是静默退化

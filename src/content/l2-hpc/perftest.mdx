@@ -1,0 +1,290 @@
+## 这一节的目标：拿到基线
+
+原理讲完了，现在要回答一个很实际的问题：**这条链路到底能跑多快？**
+
+`perftest` 是 RDMA 的标准测试套件。它的价值不在"跑个分"，而在**给出一个可对照的基线**——
+后面 NCCL 出问题时，能立刻判断是网络的问题还是上层的问题。
+
+顺序永远是：**先点对点，再集群**。点对点不达标就没必要往上测。
+
+## 环境检查（三条，缺一不可）
+
+```bash
+# ① 设备识别到了吗
+ibv_devinfo | grep -E 'hca_id|state|phys_state|link_layer'
+
+# ② 设备名与网卡名的对应关系
+ibdev2netdev -v
+
+# ③ 锁内存额度（RDMA 要注册并锁住内存）
+ulimit -l          # 期望 unlimited
+```
+
+```
+hca_id: mlx5_0
+        state:            PORT_ACTIVE (4)
+        phys_state:       LINK_UP (5)
+        link_layer:       Ethernet          ← RoCE；显示 InfiniBand 则是 IB
+```
+
+`link_layer` 决定了后面要不要选 GID：
+
+| link_layer | 场景 | 要不要 `-x` |
+| --- | --- | --- |
+| `InfiniBand` | 纯 IB | 通常不用 |
+| `Ethernet` | **RoCE** | **要**，必须选对 RoCEv2 的 GID index |
+
+<Callout type="trap" title="ulimit -l 不是 unlimited 就先别往下走">
+`ib_send_bw` 会在初始化阶段报 `Couldn't allocate MR` 或 `Failed to register memory region`，
+而机器上明明有几百 GB 空闲内存。原因是**锁内存额度**不够，不是内存不够。
+
+```bash
+# 临时
+ulimit -l unlimited
+# 持久化
+cat >> /etc/security/limits.conf <<'EOF'
+* soft memlock unlimited
+* hard memlock unlimited
+EOF
+```
+
+容器里还要额外加 `IPC_LOCK`（[为什么需要 RDMA](/learn/l2-hpc/why-rdma) 那节讲过）。
+这个坑查一次记一辈子。
+</Callout>
+
+## RoCE 场景：先选对 GID
+
+一张网卡有多个 GID 条目，对应 RoCEv1/RoCEv2、IPv4/IPv6。**选错会出现"连得上但性能不对"
+或者直接连不上**。
+
+```bash
+show_gids | grep v2
+```
+
+```
+DEV     PORT  INDEX  GID                                      IPv4          VER  DEV
+mlx5_0  1     3      0000:0000:0000:0000:0000:ffff:0a68:1467  10.104.20.101 v2   ens1f0np0
+mlx5_1  1     3      0000:0000:0000:0000:0000:ffff:0a68:1468  10.104.20.102 v2   ens1f1np0
+```
+
+记住 `INDEX`（这里是 3），后面所有命令的 `-x` 参数用它。
+
+```bash
+# 只看某个设备
+show_gids mlx5_0 | grep v2
+# 没有 show_gids 时的等价查法
+ls /sys/class/infiniband/mlx5_0/ports/1/gids/
+```
+
+## 测试一：带宽 `ib_send_bw`
+
+**服务端**（先起）：
+
+```bash
+ib_send_bw -x 3 -d mlx5_0 -F --report_gbits
+```
+
+**客户端**：
+
+```bash
+ib_send_bw -x 3 -d mlx5_0 -F --report_gbits 10.104.20.101
+```
+
+```
+---------------------------------------------------------------------------------------
+ #bytes  #iterations   BW peak[Gb/sec]  BW average[Gb/sec]  MsgRate[Mpps]
+ 65536   1000          394.21           392.87              0.749412
+---------------------------------------------------------------------------------------
+```
+
+常用参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `-x <idx>` | GID index（RoCE 必需） |
+| `-d <dev>` | 设备名，`mlx5_0` 这种 |
+| `-F` | 忽略 CPU 频率变化的警告 |
+| `--report_gbits` | 用 Gb/s 报告，方便和网卡标称值对比 |
+| `-s <bytes>` | 消息大小，默认 65536 |
+| `-q <n>` | QP 数量，多 QP 更容易打满 |
+| `-D <sec>` | 按时间跑而不是按次数 |
+| `-a` | 扫描所有消息大小（看曲线） |
+
+### 合格线怎么定
+
+```
+理论线速 = 端口速率（如 400 Gbps）
+合格线   = 理论线速 × 90%  = 360 Gbps
+```
+
+上面那个结果 392.87 / 400 ≈ **98%**，健康。
+
+<Callout type="warn" title="别忘了 PCIe 这道天花板">
+如果 `ib_send_bw` 稳定卡在某个奇怪的数值上不动，先算一下 PCIe 够不够：
+
+| 网卡 | 需要 | Gen4 x16（31.5 GB/s）够吗 |
+| --- | --- | --- |
+| 200 Gb | 25 GB/s | 刚好 |
+| **400 Gb** | **50 GB/s** | **不够** |
+
+```bash
+lspci -vv -s <bdf> | grep -E 'LnkCap|LnkSta'
+```
+
+400G 网卡插在 Gen4 x16 上，`ib_send_bw` 的上限就是约 250 Gb，
+而 `ibstat` 照样显示 `Rate: 400`。详见
+[PCIe：机内的那张网](/learn/l2-hpc/pcie-topology)。
+</Callout>
+
+## 测试二：延迟 `ib_write_lat`
+
+带宽好看不代表延迟好。**延迟是 RDMA 的核心卖点，必须单独测。**
+
+```bash
+# 服务端
+ib_write_lat -x 3 -d mlx5_0 -F
+# 客户端
+ib_write_lat -x 3 -d mlx5_0 -F 10.104.20.101
+```
+
+```
+ #bytes #iterations    t_min[usec]  t_avg[usec]  t_max[usec]  99% percentile[usec]
+ 2      1000           1.42         1.51         8.93         1.78
+```
+
+**看 P99 而不是平均值。** 判断口径：
+
+| 场景 | t_avg | P99 |
+| --- | --- | --- |
+| 同交换机（一跳） | 1–2 μs | 低于 3 μs |
+| 跨 spine（三跳） | 2–4 μs | 低于 6 μs |
+| 出现十几微秒的 max | 正常（偶发调度抖动） | 但 P99 若也这么高就要查 |
+
+对照一下 [L0](/learn/l0-basics/metrics-units)：内核 TCP 同机房是 20–50 μs。
+**这一个数量级的差距就是 RDMA 存在的理由。**
+
+## 测试三：单边操作 `ib_write_bw` / `ib_read_bw`
+
+```bash
+ib_write_bw -x 3 -d mlx5_0 -F --report_gbits <server>    # WRITE
+ib_read_bw  -x 3 -d mlx5_0 -F --report_gbits <server>    # READ
+```
+
+三者的差异值得知道：
+
+| 工具 | 操作 | 特点 |
+| --- | --- | --- |
+| `ib_send_bw` | SEND（双边） | 对端要挂 RECV，最接近通用场景 |
+| `ib_write_bw` | WRITE（单边） | 对端 CPU 不参与，**通常带宽最高** |
+| `ib_read_bw` | READ（单边） | 要等对端返回数据，**延迟敏感、带宽通常略低** |
+
+## 结果不达标：按顺序排除
+
+```
+带宽偏低 / 延迟偏高
+   │
+   ├─ 1. 端口速率对吗           ibstat | grep Rate
+   ├─ 2. PCIe 够吗              lspci -vv | grep LnkSta
+   ├─ 3. GID 选对了吗（RoCE）    show_gids | grep v2
+   ├─ 4. MTU 两端一致吗          ibstat | grep -i mtu
+   ├─ 5. 无损配置生效了吗（RoCE） mlnx_qos -i <dev>；ethtool -S | grep pause
+   ├─ 6. 跨 NUMA 了吗            nvidia-smi topo -m / lspci NUMA node
+   └─ 7. 试多 QP                 ib_send_bw -q 8
+```
+
+一张对照表：
+
+| 现象 | 最可能的原因 |
+| --- | --- |
+| 稳定在理论值的 **60%** 左右 | **PCIe 代际或 lane 数不够** |
+| 稳定在 **一半** | 端口协商降速（400 跑成 200） |
+| 带宽正常但**延迟高、抖动大** | 跨 NUMA，或路径上有拥塞 |
+| 空载正常、加压就崩 | **RoCE 无损配置没生效**（PFC/ECN 映射） |
+| 单 QP 低、多 QP 正常 | 正常现象，单 QP 打不满高速网卡 |
+| 完全连不上 | GID 选错，或 MTU 不一致 |
+
+<Callout type="tip" title="点对点跑满 ≠ 集群没问题">
+点对点测试是**无拥塞**的两点通信，它验证的是"这条链路的物理与配置正确"。
+
+它**测不出来**的问题：
+- rail 布线接错（[拓扑那节](/learn/l2-hpc/topology-rail)）
+- 多对多同时通信时的拥塞与无损配置缺陷
+- NCCL 参数配错（少用了几张卡）
+
+所以顺序必须是：**点对点达标 → 再测集群 busbw**。
+反过来（直接测 NCCL 发现慢）会让你在一堆可能性里乱猜。
+</Callout>
+
+## 把它变成例行检查
+
+交付一批机器时，手工两两测不现实。写成脚本按 rail 遍历：
+
+```bash
+#!/bin/bash
+# 对每张卡都和参考节点对打一次，输出不达标的
+REF=10.104.20.101; MIN=360        # 400G 的 90%
+for d in $(ibstat -l); do
+  bw=$(ib_send_bw -x 3 -d "$d" -F --report_gbits "$REF" 2>/dev/null \
+       | awk '/^ [0-9]/ {print $4}')
+  ok=$(awk -v b="${bw:-0}" -v m="$MIN" 'BEGIN{print (b>=m)?"OK":"FAIL"}')
+  printf '%-10s %8s Gb/s  %s\n' "$d" "${bw:-n/a}" "$ok"
+done
+```
+
+```
+mlx5_0      392.87 Gb/s  OK
+mlx5_1      391.44 Gb/s  OK
+mlx5_4      248.10 Gb/s  FAIL       ← 这张卡要查（PCIe 或速率）
+```
+
+**把它放进上机验收流程**，比事后调 NCCL 参数有效得多。
+
+## 检查点
+
+<Quiz
+  id="pt-1"
+  question="RoCE 环境下 ib_send_bw 直接连不上或性能异常，最先该检查什么？"
+  options={[
+    { text: 'show_gids 确认 RoCEv2 的 GID index，并用 -x 传给测试工具', correct: true },
+    { text: '重装 OFED 驱动', feedback: '在排除配置前不该重装驱动。' },
+    { text: '调大 MTU', feedback: 'MTU 不一致确实会报错，但 GID 是 RoCE 场景更高频的原因。' },
+    { text: '增加 QP 数量', feedback: '多 QP 影响的是能否打满，不影响能否连上。' },
+  ]}
+  explain={<>一张卡有多个 GID（RoCEv1/v2、IPv4/IPv6），选错会「连得上但性能不对」或直接失败。判断是否需要 -x 看 ibv_devinfo 的 link_layer：Ethernet 就是 RoCE，必须选。</>}
+/>
+
+<Quiz
+  id="pt-2"
+  question="400G 网卡的 ib_send_bw 稳定在 240 Gb/s 左右，而 ibstat 显示 Rate: 400。最可能的原因？"
+  options={[
+    { text: '网卡插在 PCIe Gen4 x16 槽位，PCIe 上限约 250 Gb 成了天花板', correct: true },
+    { text: 'GID 选错了', feedback: 'GID 错通常表现为连不上或性能异常波动，不是稳定卡在某个值。' },
+    { text: '无损配置没生效', feedback: '那会表现为空载正常、加压就崩，而不是稳定偏低。' },
+    { text: '需要多 QP', feedback: '多 QP 能提升利用率，但突破不了 PCIe 的物理上限。' },
+  ]}
+  explain={<>约 60% 这个比例是 PCIe 瓶颈的指纹：400 Gb 需要 50 GB/s，而 Gen4 x16 只有约 31.5 GB/s。用 lspci -vv 看 LnkSta 确认。ibstat 报的是网络侧速率，看不到 PCIe 这道天花板。</>}
+/>
+
+<Quiz
+  id="pt-3"
+  question="点对点 ib_send_bw 已达线速 98%，为什么还必须再测集群 busbw？"
+  options={[
+    { text: '点对点是无拥塞两点通信，测不出 rail 接错、多对多拥塞与 NCCL 参数问题', correct: true },
+    { text: '因为 perftest 结果不可信', feedback: '结果可信，只是覆盖面有限。' },
+    { text: '因为 busbw 用的是不同的物理链路', feedback: '是同一批链路，区别在通信模式。' },
+    { text: '不必要，点对点达标就够了', feedback: 'rail 接错时点对点完全正常，只有集合通信才暴露。' },
+  ]}
+  explain={<>两者验证的层次不同：点对点证明「这条链路的物理与配置对」，busbw 证明「整个 fabric 的拓扑、拥塞控制与参数都对」。顺序是先点对点、再集群 —— 反过来会在一堆可能性里乱猜。</>}
+/>
+
+## 这节课的落点
+
+- 顺序永远是**先点对点、再集群**；点对点不达标就别往上测
+- 三条环境检查：`ibv_devinfo`（设备与 link_layer）、`ibdev2netdev`（名字对应）、`ulimit -l`
+- **`ulimit -l` 不是 unlimited 会在初始化就报内存注册失败**，容器里还要 `IPC_LOCK`
+- RoCE 必须先 `show_gids | grep v2` 拿 index，再用 `-x` 传进去
+- `ib_send_bw --report_gbits` 测带宽，合格线是**理论线速的 90%**
+- `ib_write_lat` 测延迟，**看 P99**；同机房 RDMA 是个位数微秒，内核 TCP 是 20–50 μs
+- 不达标按七步排除；三个指纹：**约 60% = PCIe 不够**、**一半 = 速率降级**、
+  **空载好加压崩 = 无损配置没生效**
+- 把逐卡带宽检查**写成脚本放进上机验收**，比事后调参有效
