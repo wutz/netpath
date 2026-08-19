@@ -1805,8 +1805,9 @@ export const ROLE_PATHS: RolePath[] = [
   },
   {
     id: 'compute-ops',
-    title: '计算集群运维工程师',
-    alias: '服务工程师 · 交付实施',
+    title: '集群运维工程师',
+    // 标题去掉了"计算"二字，GPU / AI 这个场景挪到副标题里点明
+    alias: '服务工程师 · GPU 集群交付',
     tagline: '集群交付之后，出事第一个被找的是你',
     desc:
       '这条线偏手上功夫：先能把「网络慢」定位到具体一层，再吃透 K8s 容器网络那套看似魔法的机制，' +
