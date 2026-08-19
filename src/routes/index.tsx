@@ -19,7 +19,8 @@ export const Route = createFileRoute('/')({
 })
 
 /**
- * 首页只有两块：一个介绍头，一个带标签的路线区。
+ * 首页从选岗位直接开始 —— 原来顶上那张标题卡只是重复了站点名和阶段介绍，
+ * 占掉手机上大半屏，现在去掉，路线区自己就是页面标题。
  *
  * 标签是四个岗位。原来「岗位路线 / 按目标选起点 / 学习路径」三块讲的是同一件事的三种切法，
  * 堆在一页上反而看不出该从哪起手，所以合并成一处 —— 选一个岗位，这里就有它的说明、
@@ -32,40 +33,7 @@ function Home() {
     doneSet.has(lessonKey(track.id, lesson.id)),
   ).length
 
-  return (
-    <div className="space-y-8">
-      <section className="rounded-2xl border border-gray-200 bg-white px-5 py-7 shadow-sm sm:px-10 sm:py-9">
-        <p className="text-xs font-semibold tracking-widest text-brand-600">
-          系统与集群网络成长路径
-        </p>
-        <h1 className="mt-3 text-3xl font-bold tracking-tight sm:text-4xl">
-          从一个包走过的每一跳，到一整套 GPU 集群的布线账
-        </h1>
-        <p className="mt-4 max-w-3xl leading-relaxed text-gray-600">
-          先把 Linux 协议栈上的收发路径走通，紧接着拿下代理与隧道这套立刻能用的工具箱，
-          再拆开 K8s 容器网络那些看似魔法的机制，然后进入 PCIe / NVLink 与 InfiniBand / RoCE
-          的高性能战场，最后学会把业务需求翻译成端口数与线缆数。
-        </p>
-
-        {/* 手机上排成 2×2，避免最后一格单独掉一行 */}
-        <div className="mt-6 grid grid-cols-2 gap-3 sm:flex sm:flex-wrap sm:gap-4">
-          {[
-            ['学习阶段', `${stats.trackCount} 个`],
-            ['课程', `${stats.lessonCount} 节`],
-            ['预计学时', `${Math.round(stats.totalMinutes / 60)} 小时`],
-            ['已完成', `${doneCount} 节`],
-          ].map(([label, value]) => (
-            <div key={label} className="rounded-xl bg-gray-50 px-4 py-2.5">
-              <div className="text-lg font-bold text-gray-900">{value}</div>
-              <div className="text-xs text-gray-500">{label}</div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <Paths doneSet={doneSet} doneCount={doneCount} />
-    </div>
-  )
+  return <Paths doneSet={doneSet} doneCount={doneCount} />
 }
 
 function Paths({ doneSet, doneCount }: { doneSet: Set<string>; doneCount: number }) {
@@ -73,7 +41,7 @@ function Paths({ doneSet, doneCount }: { doneSet: Set<string>; doneCount: number
 
   return (
     <section className="rounded-2xl border border-brand-200 bg-brand-50/60 px-5 py-5 sm:px-6">
-      <h2 className="text-xl font-bold">选一条岗位路线</h2>
+      <h1 className="text-xl font-bold">选一条岗位路线</h1>
       <p className="mt-1.5 text-sm leading-relaxed text-gray-600">
         {stats.lessonCount} 节课不必都学。挑一个和你当前岗位最近的身份，
         下面会给出裁剪过的清单 —— 只留这个岗位真正会用到的课，并切成几段推进。
@@ -279,8 +247,8 @@ function Catalog({ doneSet, doneCount }: { doneSet: Set<string>; doneCount: numb
       >
         <span className="text-sm font-semibold text-gray-900">全部课程</span>
         <span className="text-xs text-gray-500">
-          {stats.trackCount} 个阶段 · {stats.lessonCount} 节 · 已完成 {doneCount}/
-          {stats.lessonCount}
+          {stats.trackCount} 个阶段 · {stats.lessonCount} 节 · 约{' '}
+          {Math.round(stats.totalMinutes / 60)} 小时 · 已完成 {doneCount}/{stats.lessonCount}
         </span>
         <span className="ml-auto shrink-0 text-xs text-brand-600">{open ? '收起' : '展开'}</span>
       </button>
