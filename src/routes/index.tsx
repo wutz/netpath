@@ -66,6 +66,8 @@ function RolePaths({ doneSet }: { doneSet: Set<string> }) {
 
   const done = path.items.filter((item) => doneSet.has(item.key)).length
   const percent = path.lessonCount > 0 ? Math.round((done / path.lessonCount) * 100) : 0
+  /** 沿这条线往下走的第一节没学完的课 */
+  const resume = path.items.find((item) => !doneSet.has(item.key)) ?? path.items[0]
 
   return (
     <section className="rounded-2xl border border-brand-200 bg-brand-50/60 px-5 py-5 sm:px-6">
@@ -124,6 +126,17 @@ function RolePaths({ doneSet }: { doneSet: Set<string> }) {
             style={{ width: `${percent}%` }}
           />
         </div>
+        {resume && (
+          <Link
+            to="/learn/$trackId/$lessonId"
+            params={{ trackId: resume.track.id, lessonId: resume.lesson.id }}
+            search={{ role: roleId }}
+            className="mt-3 inline-block rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-brand-700"
+          >
+            {done > 0 ? '继续这条路线' : '沿这条路线开始'} · 第 {resume.index} 节{' '}
+            {resume.lesson.title}
+          </Link>
+        )}
       </div>
 
       <div className="mt-4 space-y-4">
@@ -146,6 +159,7 @@ function RolePaths({ doneSet }: { doneSet: Set<string> }) {
                     <Link
                       to="/learn/$trackId/$lessonId"
                       params={{ trackId: item.track.id, lessonId: item.lesson.id }}
+                      search={{ role: roleId }}
                       className="flex items-center gap-2.5 rounded-lg bg-white/70 px-3 py-2 transition hover:bg-white"
                     >
                       <span

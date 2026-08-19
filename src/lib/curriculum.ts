@@ -2030,6 +2030,30 @@ export function lessonKey(trackId: string, lessonId: string) {
   return `${trackId}/${lessonId}`
 }
 
+/**
+ * 在一条岗位路线里找相邻课程 —— 沿路线阅读时，「下一课」要跳路线的下一节，
+ * 而不是目录里的下一节（那两者经常不是同一节，路线本来就是跨阶段跳的）。
+ *
+ * 返回 undefined 有两种情况：roleId 不认识，或这一节没排进这条路线。
+ */
+export function getRoleNeighbors(roleId: string, trackId: string, lessonId: string) {
+  const path = getRolePath(roleId)
+  if (!path) return undefined
+
+  const key = lessonKey(trackId, lessonId)
+  const at = path.items.findIndex((item) => item.key === key)
+  if (at === -1) return undefined
+
+  return {
+    path,
+    current: path.items[at],
+    /** 这一节属于路线里的哪一段 */
+    stage: path.stages.find((s) => s.items.some((i) => i.key === key))?.stage,
+    prev: path.items[at - 1],
+    next: path.items[at + 1],
+  }
+}
+
 export const stats = {
   trackCount: tracks.length,
   lessonCount: allLessons.length,
