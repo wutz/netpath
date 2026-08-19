@@ -1,10 +1,12 @@
+import { useState } from 'react'
 import { Link, createFileRoute } from '@tanstack/react-router'
 import {
   DEPTH_LABEL,
   DEPTH_STYLE,
+  ROLE_PATHS,
   allLessons,
-  getBeginnerPath,
   getDepth,
+  getRolePath,
   groupedLessons,
   lessonKey,
   stats,
@@ -16,7 +18,7 @@ export const Route = createFileRoute('/')({
   component: Home,
 })
 
-/** 按目标选起点 —— 53 节课不该让人从第一节硬啃到最后 */
+/** 按目标选起点 —— 给不想按岗位路线走、只想切进某个主题的人 */
 const ENTRIES = [
   {
     label: '补网络基础',
@@ -51,69 +53,138 @@ const ENTRIES = [
 ]
 
 /**
- * 新手路线：给零经验的人的一条主线。
- * 53 节课容易让人不知道从哪下手，这里把它压成 14 节的清单。
+ * 岗位路线：按岗位裁剪出的三条主线。
+ *
+ * 54 节课平铺出来没人知道从哪下手，而"新手"这个身份又太笼统 ——
+ * 架构师要的是算账与选型，运维要的是排障手感，必修课重叠不到一半。
+ * 所以这里让人先选岗位，再看被裁剪过的清单。
  */
-function BeginnerPath({ doneSet }: { doneSet: Set<string> }) {
-  const path = getBeginnerPath()
-  const total = path.at(-1)?.cumulativeMinutes ?? 0
-  const done = path.filter((item) => doneSet.has(item.key)).length
+function RolePaths({ doneSet }: { doneSet: Set<string> }) {
+  const [roleId, setRoleId] = useState(ROLE_PATHS[0].id)
+  const path = getRolePath(roleId)
+  if (!path) return null
+
+  const done = path.items.filter((item) => doneSet.has(item.key)).length
+  const percent = path.lessonCount > 0 ? Math.round((done / path.lessonCount) * 100) : 0
 
   return (
     <section className="rounded-2xl border border-brand-200 bg-brand-50/60 px-5 py-5 sm:px-6">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h2 className="text-xl font-bold">新手路线</h2>
-        <span className="text-xs text-gray-500">
-          {path.length} 节 · 约 {Math.round(total / 60)} 小时 · 已完成 {done}/{path.length}
-        </span>
-      </div>
+      <h2 className="text-xl font-bold">选一条岗位路线</h2>
       <p className="mt-1.5 text-sm leading-relaxed text-gray-600">
-        零经验、不知道从哪下手就照这条走。全部选的是已有正文的课，顺序与下面的目录一致：
-        L0 打完基础，紧接着是代理与 SSH 这类入职第一周就用得上的工具，再进容器网络。
+        54 节课不必都学。选一个和你当前岗位最近的身份，下面会给出裁剪过的清单 ——
+        只留这个岗位真正会用到的课，并切成几段推进。
       </p>
 
-      <ol className="mt-4 space-y-1">
-        {path.map((item, index) => {
-          const isDone = doneSet.has(item.key)
-          const depth = getDepth(item.track.id, item.lesson.id)
+      {/* 手机上两列排不下三个岗位名，直接横向滚动 */}
+      <div className="mt-4 flex gap-2 overflow-x-auto pb-1">
+        {ROLE_PATHS.map((role) => {
+          const active = role.id === roleId
           return (
-            <li key={item.key}>
-              <Link
-                to="/learn/$trackId/$lessonId"
-                params={{ trackId: item.track.id, lessonId: item.lesson.id }}
-                className="flex items-center gap-2.5 rounded-lg bg-white/70 px-3 py-2 transition hover:bg-white"
+            <button
+              key={role.id}
+              type="button"
+              onClick={() => setRoleId(role.id)}
+              className={`shrink-0 rounded-xl border px-3.5 py-2 text-left transition ${
+                active
+                  ? 'border-brand-500 bg-white shadow-sm'
+                  : 'border-transparent bg-white/50 hover:bg-white/80'
+              }`}
+            >
+              <div
+                className={`text-sm font-semibold ${active ? 'text-brand-700' : 'text-gray-700'}`}
               >
-                <span
-                  className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-medium ${
-                    isDone ? 'bg-emerald-500 text-white' : 'bg-gray-200 text-gray-600'
-                  }`}
-                >
-                  {isDone ? '✓' : index + 1}
-                </span>
-                <span
-                  className={`shrink-0 rounded px-1 py-0.5 text-[10px] ${item.track.accent.bg} ${item.track.accent.text}`}
-                >
-                  {item.track.level}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-sm text-gray-800">
-                  {item.lesson.title}
-                </span>
-                {depth === 'intro' && (
-                  <span
-                    className={`hidden shrink-0 rounded px-1.5 py-0.5 text-[10px] sm:inline ${DEPTH_STYLE[depth]}`}
-                  >
-                    {DEPTH_LABEL[depth]}
-                  </span>
-                )}
-                <span className="shrink-0 text-[11px] text-gray-400">{item.lesson.minutes} 分</span>
-              </Link>
-            </li>
+                {role.title}
+              </div>
+              <div className="mt-0.5 text-[11px] text-gray-500">{role.alias}</div>
+            </button>
           )
         })}
-      </ol>
+      </div>
 
-      <p className="mt-3 text-xs text-gray-500">
-        走完这条线再按下面的方向深入。标「深入」的课可以先跳过，遇到具体问题再回来。
+      <div className="mt-4 rounded-xl bg-white/70 px-4 py-3.5">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <span className="text-sm font-semibold text-gray-900">{path.role.tagline}</span>
+          <span className="text-xs text-gray-500">
+            {path.lessonCount} 节 · 约 {Math.round(path.minutes / 60)} 小时 · 已完成 {done}/
+            {path.lessonCount}
+          </span>
+        </div>
+        <p className="mt-1.5 text-sm leading-relaxed text-gray-600">{path.role.desc}</p>
+        <ul className="mt-2.5 space-y-1">
+          {path.role.outcome.map((line) => (
+            <li key={line} className="flex gap-2 text-xs leading-relaxed text-gray-600">
+              <span className="text-brand-500">✓</span>
+              <span>{line}</span>
+            </li>
+          ))}
+        </ul>
+        <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-gray-100">
+          <div
+            className="h-full rounded-full bg-brand-500 transition-all"
+            style={{ width: `${percent}%` }}
+          />
+        </div>
+      </div>
+
+      <div className="mt-4 space-y-4">
+        {path.stages.map(({ stage, items, minutes }) => (
+          <div key={stage.title}>
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+              <h3 className="text-sm font-semibold text-gray-900">{stage.title}</h3>
+              <span className="text-[11px] text-gray-400">
+                {items.length} 节 · {minutes} 分钟
+              </span>
+            </div>
+            <p className="mt-0.5 text-xs leading-relaxed text-gray-500">{stage.hint}</p>
+
+            <ol className="mt-2 space-y-1">
+              {items.map((item) => {
+                const isDone = doneSet.has(item.key)
+                const depth = getDepth(item.track.id, item.lesson.id)
+                return (
+                  <li key={item.key}>
+                    <Link
+                      to="/learn/$trackId/$lessonId"
+                      params={{ trackId: item.track.id, lessonId: item.lesson.id }}
+                      className="flex items-center gap-2.5 rounded-lg bg-white/70 px-3 py-2 transition hover:bg-white"
+                    >
+                      <span
+                        className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-medium ${
+                          isDone ? 'bg-emerald-500 text-white' : 'bg-gray-200 text-gray-600'
+                        }`}
+                      >
+                        {isDone ? '✓' : item.index}
+                      </span>
+                      <span
+                        className={`shrink-0 rounded px-1 py-0.5 text-[10px] ${item.track.accent.bg} ${item.track.accent.text}`}
+                      >
+                        {item.track.level}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-sm text-gray-800">
+                        {item.lesson.title}
+                      </span>
+                      {depth !== 'core' && (
+                        <span
+                          className={`hidden shrink-0 rounded px-1.5 py-0.5 text-[10px] sm:inline ${DEPTH_STYLE[depth]}`}
+                        >
+                          {DEPTH_LABEL[depth]}
+                        </span>
+                      )}
+                      <span className="shrink-0 text-[11px] text-gray-400">
+                        {item.lesson.minutes} 分
+                      </span>
+                    </Link>
+                  </li>
+                )
+              })}
+            </ol>
+          </div>
+        ))}
+      </div>
+
+      <p className="mt-4 text-xs text-gray-500">
+        三条线都从 L0 起步，之后分叉。跨岗位的课没被删掉，只是没排进这条线 ——
+        需要时从下面的目录直接进去，课程页会提示要先补哪几节。
       </p>
     </section>
   )
@@ -190,12 +261,12 @@ function Home() {
         </div>
       </section>
 
-      <BeginnerPath doneSet={doneSet} />
+      <RolePaths doneSet={doneSet} />
 
       <section>
         <h2 className="text-xl font-bold">按目标选起点</h2>
         <p className="mt-1 text-sm text-gray-500">
-          不必从第一节按顺序啃到最后。挑一个和当前工作最近的入口进去，
+          不想按岗位路线走，只想解决眼前那件事，就从这里切进去。
           课程页会提示这一节需要先补哪几节。
         </p>
         <div className="mt-3 grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
