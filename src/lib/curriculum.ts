@@ -1717,32 +1717,15 @@ export interface RolePath {
 }
 
 /**
- * 首页第四个标签：不按岗位裁剪，按阶段通读全部课程。
- * 和三条岗位路线并列，但内容是完整目录，所以只在这里放文案，课程清单直接用 tracks。
- */
-export const FULL_PATH = {
-  id: 'all',
-  title: '完整目录',
-  alias: '不做裁剪 · 按阶段通读',
-  tagline: '六个阶段顺着啃，一节不落',
-  desc:
-    '不挑岗位，或者想先看看全貌，就走这条。顺序是 L0 → T → L1 → L2 → L3 → L4，' +
-    '每个阶段再拆成 3～4 个小组，组内按依赖排列 —— 点小组名进去看具体课程。',
-  notes: [
-    'T（代理与隧道）只依赖 L0，门槛最低、入职第一周就用得上，所以排在第二而不是压到最后',
-    '标「深入」的课可以先跳过，遇到具体问题再回来',
-    '想直接切进某个主题也行，课程页会提示要先补哪几节',
-  ],
-}
-
-/**
- * 按岗位切三条主线。
+ * 按岗位切四条主线。
  *
  * 54 节课平铺出来没人知道从哪下手，而"零经验新手"这个身份太笼统 ——
  * 架构师需要的是算账与选型，运维需要的是排障手感，两者的必修课重叠不到一半。
  * 所以按岗位裁剪：每条线只保留这个岗位真正会用到的课，并切成几段推进。
  *
- * 三条线都从 L0 起步（术语和指标是共同地基），之后分叉。
+ * 四条线都从 L0 起步（术语和指标是共同地基），之后分叉。
+ * 网络运维那条覆盖最广 —— 这张网整个是他的地盘 —— 但仍然是裁剪过的，
+ * 机内互联、GPU 专项与那些加速卸载专题都不在上面。
  */
 export const ROLE_PATHS: RolePath[] = [
   {
@@ -1920,6 +1903,88 @@ export const ROLE_PATHS: RolePath[] = [
           'l4-advanced/sriov-macvlan',
           'l1-k8s/secondary-cni',
           'l4-advanced/observability',
+        ],
+      },
+    ],
+  },
+  {
+    id: 'net-ops',
+    title: '网络运维工程师',
+    alias: '网络工程师 · 数据中心网络',
+    tagline: '这张网整个是你的地盘，从接入口一直到 spine',
+    desc:
+      '四条线里覆盖最广的一条：转发与 TCP 行为要吃透，代理、VPN 与透明网关是日常工具，' +
+      'K8s 那层 overlay 要能看穿，RoCE 的无损配置要会调，最后还得出得了规划、值得了班。' +
+      '仍然是裁剪过的 —— 机内互联（PCIe / NVLink）、GPU 专项与那些加速卸载专题都不在上面。',
+    outcome: [
+      '任何一段"不通"或"变慢"，都能定位到具体某一跳、某一层',
+      '把内网服务、跨地域机器与整个网段的出口流量安排妥当',
+      '看穿容器那层封装：Service 的 VIP、Ingress 的入口与 overlay 的每一跳',
+    ],
+    stages: [
+      {
+        title: '协议栈与转发',
+        hint: 'L0 全部八节，这条线的其余部分都建在这上面',
+        lessons: [
+          'l0-basics/first-look',
+          'l0-basics/metrics-units',
+          'l0-basics/switching-routing',
+          'l0-basics/packet-journey',
+          'l0-basics/tcp-behavior',
+          'l0-basics/kernel-stack',
+          'l0-basics/toolbox',
+          'l0-basics/quest-slow-host',
+        ],
+      },
+      {
+        title: '远程接入与隧道',
+        hint: '日常工具箱：端口转发、组网、企业 VPN 与整网段分流',
+        lessons: [
+          'l5-tunnel/proxy-basics',
+          'l5-tunnel/ssh-tunnels',
+          'l5-tunnel/ssh-advanced',
+          'l5-tunnel/gost-toolbox',
+          'l5-tunnel/wireguard',
+          'l5-tunnel/tailscale',
+          'l5-tunnel/pritunl',
+          'l5-tunnel/transparent-gateway',
+          'l5-tunnel/quest-proxy-broken',
+        ],
+      },
+      {
+        title: '容器网络这层封装',
+        hint: '从手搓 netns 到 MetalLB 与 Ingress，L1 基本整段吃下',
+        lessons: [
+          'l1-k8s/netns-veth',
+          'l1-k8s/k8s-model',
+          'l1-k8s/cni',
+          'l1-k8s/service',
+          'l1-k8s/metallb',
+          'l1-k8s/kube-proxy-ebpf',
+          'l1-k8s/ingress-egress',
+          'l1-k8s/dns-policy',
+          'l1-k8s/quest-pod-unreachable',
+        ],
+      },
+      {
+        title: '机房里的高性能网络',
+        hint: '无损以太网那套参数与 IB 的差别，得能自己调、自己测',
+        lessons: [
+          'l2-hpc/why-rdma',
+          'l2-hpc/roce',
+          'l2-hpc/infiniband',
+          'l2-hpc/topology-rail',
+          'l2-hpc/perftest',
+        ],
+      },
+      {
+        title: '规划与值班',
+        hint: '算得出端口与地址，也把排障沉淀成指标和 SOP',
+        lessons: [
+          'l3-planning/ethernet-plan',
+          'l3-planning/ip-plan',
+          'l4-advanced/observability',
+          'l4-advanced/oncall',
         ],
       },
     ],
