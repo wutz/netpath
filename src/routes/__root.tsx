@@ -14,7 +14,10 @@ export const Route = createRootRoute({
           '系统网络的在线交互式学习项目：从 Linux 协议栈与报文路径出发，走过 K8s 容器网络、InfiniBand 与 RoCE 高性能网络，再到以太网与计算网的容量规划。',
       },
     ],
-    links: [{ rel: 'stylesheet', href: appCss }],
+    links: [
+      { rel: 'stylesheet', href: appCss },
+      { rel: 'icon', href: '/logo.svg', type: 'image/svg+xml' },
+    ],
   }),
   component: RootLayout,
 })
@@ -29,9 +32,7 @@ function RootLayout() {
         <header className="sticky top-0 z-20 border-b border-gray-200 bg-white/85 backdrop-blur">
           <div className="mx-auto flex max-w-6xl items-center justify-between gap-2 px-3 py-2.5 sm:px-4 sm:py-3">
             <Link to="/" className="flex shrink-0 items-center gap-2">
-              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-brand-600 text-sm font-bold text-white">
-                N
-              </span>
+              <img src="/logo.svg" alt="" width={28} height={28} className="h-7 w-7 shrink-0" />
               <span className="text-base font-bold tracking-tight">Netpath</span>
               <span className="hidden text-xs text-gray-400 sm:inline">系统与集群网络路径</span>
             </Link>
