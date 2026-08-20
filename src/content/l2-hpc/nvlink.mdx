@@ -19,7 +19,7 @@ PCIe 继续负责 CPU ↔ GPU、GPU ↔ 网卡，NVLink 只管 GPU ↔ GPU。
 | 第 6 代 | Rubin | 3,600 GB/s | 36 | 100 GB/s |
 
 <Callout type="warn" title="这张表全是双向聚合值，别直接和网卡比">
-官方规格里 NVLink 一律写**双向聚合**（"900GB/s bidirectional"）。而网卡、PCIe 的习惯是
+官方规格里 NVLink 一律写**双向聚合**（"900GB/s bidirectional"）。而网卡的习惯是
 **每方向**。两把尺子直接比，又是一次 2 倍误差。
 
 换成单向：第 4 代是 **450 GB/s**、第 5 代 **900 GB/s**。本节后面的对照表统一用单向。
@@ -189,7 +189,7 @@ nvidia-smi topo -m | grep -o 'NV[0-9]*' | sort -u    # NV 数字是否一致
     { text: '1800 GB/s', feedback: '那是第 5 代（Blackwell）的双向聚合值。' },
     { text: '50 GB/s，按单链路算', feedback: '50 GB/s 是单条链路的双向值，不是整卡带宽。' },
   ]}
-  explain={<>NVLink 官方一律给双向聚合，PCIe 与网卡习惯给每方向。换成同一把尺子：NVLink4 单向 450 GB/s，约为单张 400G 网卡的 9 倍。这个比例正是「张量并行必须留在 NVLink 域内」的依据。</>}
+  explain={<>NVLink 官方一律给双向聚合，网卡习惯给每方向。换成同一把尺子：NVLink4 单向 450 GB/s，约为单张 400G 网卡的 9 倍。这个比例正是「张量并行必须留在 NVLink 域内」的依据。</>}
 />
 
 <Quiz
