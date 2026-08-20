@@ -7,11 +7,11 @@ export const Route = createRootRoute({
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1, viewport-fit=cover' },
-      { title: 'Netpath — 系统与集群网络成长路径' },
+      { title: 'Netpath — 网络运维工程师成长路径' },
       {
         name: 'description',
         content:
-          '系统网络的在线交互式学习项目：从 Linux 协议栈与报文路径出发，走过 K8s 容器网络、InfiniBand 与 RoCE 高性能网络，再到以太网与计算网的容量规划。',
+          '网络运维工程师的在线交互式学习项目：从 Linux 协议栈与报文路径出发，走过 K8s 容器网络、InfiniBand 与 RoCE 高性能网络，再到以太网与计算网的容量规划。',
       },
     ],
     links: [
@@ -34,7 +34,7 @@ function RootLayout() {
             <Link to="/" className="flex shrink-0 items-center gap-2">
               <img src="/logo.svg" alt="" width={28} height={28} className="h-7 w-7 shrink-0" />
               <span className="text-base font-bold tracking-tight">Netpath</span>
-              <span className="hidden text-xs text-gray-400 sm:inline">系统与集群网络路径</span>
+              <span className="hidden text-xs text-gray-400 sm:inline">网络运维工程师成长路径</span>
             </Link>
             <nav className="-mr-1 flex items-center gap-0.5 overflow-x-auto text-sm [scrollbar-width:none] sm:gap-1 [&::-webkit-scrollbar]:hidden">
               <Link
@@ -71,7 +71,7 @@ function RootLayout() {
         <footer className="mt-12 border-t border-gray-200 bg-white sm:mt-16">
           <div className="mx-auto max-w-6xl px-3 py-6 text-xs text-gray-400 sm:px-4">
             <p>
-              Netpath · 系统与集群网络成长路径。内容基于 k8s-in-action 部署手册、The Kubernetes
+              Netpath · 网络运维工程师成长路径。内容基于 k8s-in-action 部署手册、The Kubernetes
               Networking Guide、NVIDIA DGX SuperPOD 参考架构与 Systems Performance (2nd Edition)
               整理。
             </p>
