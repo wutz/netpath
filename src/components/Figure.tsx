@@ -25,24 +25,24 @@ export function Figure({
         href={href ?? src}
         target="_blank"
         rel="noreferrer"
-        className="block overflow-hidden rounded-xl border border-gray-200 bg-white"
+        className="block overflow-hidden rounded-lg border border-gray-200 bg-white shadow-e2 transition hover:border-gray-300"
       >
         <img src={src} alt={alt} loading="lazy" className="block h-auto w-full" />
       </a>
       {(caption || source) && (
-        <figcaption className="mt-2 text-xs leading-relaxed text-gray-500">
+        <figcaption className="mt-2.5 text-xs leading-relaxed text-gray-600">
           {caption}
           {source && (
             <>
               {caption && ' '}
-              <span className="text-gray-400">
+              <span className="text-gray-500">
                 图片来源：
                 {href ? (
                   <a
                     href={href}
                     target="_blank"
                     rel="noreferrer"
-                    className="text-brand-600 hover:underline"
+                    className="text-brand-700 underline decoration-brand-200 underline-offset-2 transition hover:decoration-brand-600"
                   >
                     {source} ↗
                   </a>
