@@ -53,18 +53,6 @@ export interface Track {
   title: string
   subtitle: string
   goal: string
-  /**
-   * Tailwind 类名片段，用于阶段配色。
-   *
-   * 只用在小面积标记上 —— 阶段角标、圆点。大块卡片背景一律走中性色，
-   * 否则六个阶段各铺一层浅色，整站就散成了一盒糖。
-   */
-  accent: {
-    text: string
-    bg: string
-    border: string
-    dot: string
-  }
   groups: LessonGroup[]
   lessons: Lesson[]
 }
@@ -77,18 +65,22 @@ export const KIND_LABEL: Record<LessonKind, string> = {
 }
 
 /*
- * 课型标签。
- *
- * 原来四种课型各占一个色（灰/绿/黄/紫），和六个阶段的颜色叠在同一行里，
- * 一屏能出现十种色块，反而看不出哪个维度重要。现在只保留一处对比：
- * 「读」是中性灰，「动手」的三种（实验/闯关/规划）共用主题色 —— 这才是
- * 读者真正要区分的一件事。阶段色继续承担导航。
+ * 阶段（L0–L5）不再各配一种颜色 —— 六条彩虹加品牌色，颜色就没意义了。
+ * 阶段身份交给等宽的 L0…L5 代号本身，颜色预算留给品牌色和下面三个状态徽标。
+ * 与 storpath / kubepath 共用同一组 LEVEL_CHIP。
+ */
+export const LEVEL_CHIP =
+  'rounded-xs bg-soft-2 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-body'
+
+/*
+ * 课型标签：「读」是中性，「动手」的三种各占一个语义色槽 ——
+ * 实验=蓝、闯关=琥珀、规划=紫，与 storpath / kubepath 逐个一致。
  */
 export const KIND_STYLE: Record<LessonKind, string> = {
-  concept: 'border-gray-200 bg-gray-50 text-gray-600',
-  lab: 'border-brand-200 bg-brand-50 text-brand-700',
-  quest: 'border-brand-200 bg-brand-50 text-brand-700',
-  planner: 'border-brand-200 bg-brand-50 text-brand-700',
+  concept: 'bg-soft-2 text-body',
+  lab: 'bg-info-soft text-info-deep',
+  quest: 'bg-warn-soft text-warn-deep',
+  planner: 'bg-plum-soft text-plum-deep',
 }
 
 const REF_SYSPERF: LessonRef = { label: 'Systems Performance, 2nd Edition — Brendan Gregg' }
@@ -123,12 +115,6 @@ export const tracks: Track[] = [
     title: '网络基础',
     subtitle: 'Linux 协议栈与观测',
     goal: '所有网络问题的地基。搞清一个包从应用到网线要经过哪些环节，每个环节能用什么命令看，以及延迟、带宽、PPS 三个指标各自受什么限制。',
-    accent: {
-      text: 'text-sky-700',
-      bg: 'bg-sky-50',
-      border: 'border-sky-200',
-      dot: 'bg-sky-500',
-    },
     groups: [
       {
         id: 'l0-start',
@@ -336,21 +322,6 @@ export const tracks: Track[] = [
     title: '代理与隧道',
     subtitle: '旁路工具箱 · 学完 L0 即可',
     goal: '工程师的日常工具箱：把内网服务安全地暴露给自己、把本地流量按规则送出去、把散落各处的机器组成一张网。它不在 L0→L4 那条主线上 —— 只依赖 L0 的基础，学完立刻能用，所以排在这里而不是压到最后。',
-    /*
-     * 唯一走中性色的阶段，两个原因刚好对上：
-     * 一是 T 本来就不在 L0→L4 主线上（见上面 goal），中性色正好说明「旁路」；
-     * 二是它原来用 teal，和主题色只差 28°，并排出现时分不清谁是可点、谁是阶段。
-     * 让出这段色相之后，主题色才有地方站。
-     *
-     * slate 的 chroma 很低，同一档会显得比别的阶段轻，所以底色取 100 而不是 50、
-     * 文字取 600 而不是 700（明度和其他阶段的 700 更接近），让六个角标视觉重量一致。
-     */
-    accent: {
-      text: 'text-slate-600',
-      bg: 'bg-slate-100',
-      border: 'border-slate-200',
-      dot: 'bg-slate-500',
-    },
     groups: [
       {
         id: 'l5-proxy',
@@ -679,12 +650,6 @@ export const tracks: Track[] = [
     title: '容器网络',
     subtitle: 'K8s 网络模型与 CNI',
     goal: '把 K8s 网络从"魔法"变成可推导的机制。Pod 之间怎么通、Service 的 VIP 是谁在翻译、流量从集群外进来经过哪几跳，全都能画出来。',
-    accent: {
-      text: 'text-emerald-700',
-      bg: 'bg-emerald-50',
-      border: 'border-emerald-200',
-      dot: 'bg-emerald-500',
-    },
     groups: [
       {
         id: 'l1-model',
@@ -948,12 +913,6 @@ export const tracks: Track[] = [
     title: '高性能网络',
     subtitle: '机内互联与 RDMA 网络',
     goal: 'AI 训练与高性能存储的主战场。先看清机内：PCIe 拓扑决定网卡能不能跑满、NVLink 决定 GPU 之间有多快；再看机间：RDMA 为什么快、无损以太网靠什么撑住，以及怎么把一条链路从网卡打通到 NCCL 跑出正常带宽。',
-    accent: {
-      text: 'text-violet-700',
-      bg: 'bg-violet-50',
-      border: 'border-violet-200',
-      dot: 'bg-violet-500',
-    },
     groups: [
       {
         id: 'l2-intra',
@@ -1224,12 +1183,6 @@ export const tracks: Track[] = [
     title: '网络规划',
     subtitle: '以太网与高性能网络',
     goal: '把业务需求翻译成端口数、交换机数、线缆数和地址段。以太网算收敛比与接入账，高性能网络算 rail、SU 与无阻塞条件。',
-    accent: {
-      text: 'text-amber-700',
-      bg: 'bg-amber-50',
-      border: 'border-amber-200',
-      dot: 'bg-amber-500',
-    },
     groups: [
       {
         id: 'l3-require',
@@ -1369,12 +1322,6 @@ export const tracks: Track[] = [
     title: '进阶专题',
     subtitle: '加速、卸载与协议',
     goal: '按需取用的专题库。每个专题回答三个问题：它解决什么问题、代价是什么、什么场景下真的需要它。',
-    accent: {
-      text: 'text-rose-700',
-      bg: 'bg-rose-50',
-      border: 'border-rose-200',
-      dot: 'bg-rose-500',
-    },
     groups: [
       {
         id: 'l4-fastpath',
@@ -1704,9 +1651,9 @@ export const DEPTH_LABEL: Record<LessonDepth, string> = {
 
 /* 深浅只是难度提示，标签文字本身已经说清楚了，不再另给颜色 */
 export const DEPTH_STYLE: Record<LessonDepth, string> = {
-  intro: 'border-gray-200 bg-gray-50 text-gray-500',
+  intro: 'bg-soft-2 text-mute',
   core: '',
-  deep: 'border-gray-200 bg-gray-50 text-gray-500',
+  deep: 'bg-soft-2 text-mute',
 }
 
 export function getDepth(trackId: string, lessonId: string): LessonDepth {

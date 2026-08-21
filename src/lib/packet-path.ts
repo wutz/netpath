@@ -11,13 +11,13 @@
 export type Layer = 'app' | 'kernel' | 'driver' | 'wire' | 'switch' | 'peer' | 'gpu'
 
 export const LAYER_META: Record<Layer, { label: string; dot: string; chip: string }> = {
-  app: { label: '应用', dot: 'bg-brand-500', chip: 'bg-brand-50 text-brand-700' },
-  kernel: { label: '内核', dot: 'bg-indigo-500', chip: 'bg-indigo-50 text-indigo-700' },
-  driver: { label: '驱动/网卡', dot: 'bg-violet-500', chip: 'bg-violet-50 text-violet-700' },
-  wire: { label: '线路', dot: 'bg-gray-400', chip: 'bg-gray-100 text-gray-600' },
-  switch: { label: '交换机', dot: 'bg-amber-500', chip: 'bg-amber-50 text-amber-700' },
-  peer: { label: '对端', dot: 'bg-emerald-500', chip: 'bg-emerald-50 text-emerald-700' },
-  gpu: { label: 'GPU', dot: 'bg-rose-500', chip: 'bg-rose-50 text-rose-700' },
+  app: { label: '应用', dot: 'bg-brand-500', chip: 'bg-soft-2 text-body' },
+  kernel: { label: '内核', dot: 'bg-info', chip: 'bg-soft-2 text-body' },
+  driver: { label: '驱动/网卡', dot: 'bg-plum', chip: 'bg-soft-2 text-body' },
+  wire: { label: '线路', dot: 'bg-line-strong', chip: 'bg-soft-2 text-body' },
+  switch: { label: '交换机', dot: 'bg-warn', chip: 'bg-soft-2 text-body' },
+  peer: { label: '对端', dot: 'bg-ink', chip: 'bg-soft-2 text-body' },
+  gpu: { label: 'GPU', dot: 'bg-danger', chip: 'bg-soft-2 text-body' },
 }
 
 export interface Hop {

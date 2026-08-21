@@ -1,3 +1,4 @@
+import { type ReactNode } from 'react'
 import { Link, createFileRoute } from '@tanstack/react-router'
 import {
   DEPTH_LABEL,
@@ -22,14 +23,11 @@ function TrackPage() {
 
   if (!track) {
     return (
-      <div className="rounded-xl border border-gray-200 bg-white px-6 py-12 text-center shadow-e2">
-        <p className="text-gray-500">
-          没有这个阶段：<span className="font-mono text-gray-700">{trackId}</span>
+      <div className="rounded-lg bg-canvas px-6 py-12 text-center shadow-card">
+        <p className="text-body">
+          没有这个阶段：<span className="font-mono">{trackId}</span>
         </p>
-        <Link
-          to="/"
-          className="mt-4 inline-block rounded-md bg-gray-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-gray-800"
-        >
+        <Link to="/" className="mt-3 inline-block text-sm text-brand-600 hover:underline">
           返回学习路径
         </Link>
       </div>
@@ -51,44 +49,37 @@ function TrackPage() {
 
   return (
     <div className="space-y-8">
-      <nav className="text-xs text-gray-500">
-        <Link to="/" className="transition hover:text-gray-900">
+      <nav className="font-mono text-xs text-mute">
+        <Link to="/" className="transition hover:text-ink">
           学习路径
         </Link>
-        <span className="mx-1.5 text-gray-400">/</span>
-        <span className="text-gray-700">
-          <span className="font-mono">{track.level}</span> {track.title}
+        <span className="mx-1.5 text-line-strong">/</span>
+        <span className="text-body">
+          {track.level} {track.title}
         </span>
       </nav>
 
       {/*
-        阶段头原来整块铺阶段浅色。改成中性卡 + 一个带色角标：
-        颜色仍在，但不再占据视野里最大的一块面积。
+        阶段头不再包卡 —— eyebrow 报代号，display-xl 报标题，
+        进度和小组导航直接铺在页面上，与 storpath 的阶段页同一个骨架。
       */}
-      <header className="rounded-xl border border-gray-200 bg-white px-5 py-6 shadow-e2 sm:px-6">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <span
-            className={`rounded-md border border-gray-200 bg-gray-50 px-2 py-1 font-mono text-[13px] font-medium ${track.accent.text}`}
-          >
-            {track.level}
-          </span>
-          <h1 className="text-2xl font-semibold tracking-[-0.03em] sm:text-[28px]">
-            {track.title}
-          </h1>
-          <span className="text-sm text-gray-500">{track.subtitle}</span>
+      <header>
+        <div className="eyebrow">
+          {track.level} · {track.subtitle}
         </div>
-        <p className="mt-3 max-w-3xl leading-relaxed text-gray-600">{track.goal}</p>
+        <h1 className="display-xl mt-3">{track.title}</h1>
+        <p className="mt-4 max-w-3xl text-[17px] leading-relaxed text-body">{track.goal}</p>
 
         <div className="mt-5 max-w-md">
-          <div className="flex items-baseline justify-between font-mono text-[11px] text-gray-500">
+          <div className="flex items-baseline justify-between font-mono text-[11px] text-mute">
             <span>
               {groups.length} 个小组 · {lessonCount} 节课 · 约 {Math.round(totalMinutes / 60)} 小时
             </span>
-            <span className="text-gray-700">
-              {doneCount}/{lessonCount}
+            <span>
+              已完成 {doneCount}/{lessonCount}
             </span>
           </div>
-          <div className="mt-2 h-1 overflow-hidden rounded-full bg-gray-100">
+          <div className="mt-2 h-1 overflow-hidden rounded-full bg-soft-2">
             <div
               className="h-full rounded-full bg-brand-600 transition-all duration-300"
               style={{ width: `${percent}%` }}
@@ -97,15 +88,15 @@ function TrackPage() {
         </div>
 
         {/* 小组导航：手机上一屏内就能看完整个阶段的结构 */}
-        <div className="mt-5 flex flex-wrap gap-1.5 border-t border-gray-100 pt-4">
+        <div className="mt-5 flex flex-wrap gap-1.5">
           {groups.map(({ group, lessons }, index) => (
             <a
               key={group.id}
               href={`#${group.id}`}
-              className="rounded-md border border-gray-200 px-2.5 py-1 text-xs text-gray-700 transition hover:border-gray-300 hover:bg-gray-50"
+              className="rounded-sm border border-line bg-canvas px-2.5 py-1 text-xs text-body transition hover:border-line-strong hover:text-ink"
             >
-              <span className="font-mono text-gray-500">{index + 1}</span> {group.title}
-              <span className="ml-1.5 font-mono text-gray-500">{lessons.length}</span>
+              <span className="font-mono text-mute">{index + 1}</span> {group.title}
+              <span className="ml-1.5 font-mono text-mute">{lessons.length}</span>
             </a>
           ))}
         </div>
@@ -116,22 +107,18 @@ function TrackPage() {
 
         return (
           <section key={group.id} id={group.id} className="space-y-3">
-            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-gray-200 pb-2.5">
-              <h2 className="text-lg font-semibold tracking-tight">
-                <span className={`mr-2 font-mono text-base ${track.accent.text}`}>
-                  {groupIndex + 1}
-                </span>
-                {group.title}
-              </h2>
-              <span className="font-mono text-[11px] text-gray-500">
+            <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+              <span className="eyebrow">Section {groupIndex + 1}</span>
+              <h2 className="display-sm">{group.title}</h2>
+              <span className="font-mono text-[11px] text-mute">
                 {lessons.length} 节 · {minutes} 分钟
                 {readyCount < lessons.length && ` · 正文 ${readyCount}/${lessons.length}`}
                 {groupDone > 0 && ` · 已完成 ${groupDone}`}
               </span>
             </div>
-            <p className="text-sm leading-relaxed text-gray-600">{group.hint}</p>
+            <p className="text-sm leading-relaxed text-body">{group.hint}</p>
 
-            <ol className="space-y-2.5">
+            <ol className="space-y-3">
               {lessons.map((lesson) => {
                 counter += 1
                 const done = doneSet.has(lessonKey(track.id, lesson.id))
@@ -141,49 +128,37 @@ function TrackPage() {
                     <Link
                       to="/learn/$trackId/$lessonId"
                       params={{ trackId: track.id, lessonId: lesson.id }}
-                      className="block rounded-lg border border-gray-200 bg-white px-4 py-4 shadow-e2 transition hover:border-gray-300 hover:shadow-e3 sm:px-5"
+                      className="block rounded-md bg-canvas px-5 py-4 shadow-card transition hover:shadow-float sm:px-5"
                     >
                       <div className="flex flex-wrap items-center gap-2">
+                        <Marker done={done}>{counter}</Marker>
+                        <h3 className="display-sm">{lesson.title}</h3>
                         <span
-                          className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full font-mono text-[11px] font-medium ${
-                            done
-                              ? 'bg-emerald-600 text-white'
-                              : 'border border-gray-200 bg-gray-50 text-gray-500'
-                          }`}
-                        >
-                          {done ? '✓' : counter}
-                        </span>
-                        <h3 className="font-medium text-gray-900">{lesson.title}</h3>
-                        <span
-                          className={`rounded border px-1.5 py-0.5 text-[11px] ${KIND_STYLE[lesson.kind]}`}
+                          className={`rounded-xs px-1.5 py-0.5 text-[11px] ${KIND_STYLE[lesson.kind]}`}
                         >
                           {KIND_LABEL[lesson.kind]}
                         </span>
                         {depth !== 'core' && (
                           <span
-                            className={`rounded border px-1.5 py-0.5 text-[11px] ${DEPTH_STYLE[depth]}`}
+                            className={`rounded-xs px-1.5 py-0.5 text-[11px] ${DEPTH_STYLE[depth]}`}
                           >
                             {DEPTH_LABEL[depth]}
                           </span>
                         )}
-                        <span className="font-mono text-[11px] text-gray-500">
-                          {lesson.minutes}m
-                        </span>
+                        <span className="font-mono text-[11px] text-mute">{lesson.minutes}m</span>
                         {lesson.status === 'planned' && (
-                          <span className="rounded border border-gray-200 bg-gray-50 px-1.5 py-0.5 text-[11px] text-gray-500">
+                          <span className="rounded-xs bg-soft-2 px-1.5 py-0.5 text-[11px] text-mute">
                             仅大纲
                           </span>
                         )}
                       </div>
 
-                      <p className="mt-2.5 text-sm leading-relaxed text-gray-600">
-                        {lesson.summary}
-                      </p>
+                      <p className="mt-2 text-sm leading-relaxed text-body">{lesson.summary}</p>
 
-                      <ul className="mt-3 space-y-1 text-xs text-gray-500">
+                      <ul className="mt-3 space-y-1 text-xs leading-relaxed text-mute">
                         {lesson.objectives.map((objective) => (
                           <li key={objective} className="flex gap-2">
-                            <span className="text-gray-400">→</span>
+                            <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-line-strong" />
                             {objective}
                           </li>
                         ))}
@@ -197,5 +172,18 @@ function TrackPage() {
         )
       })}
     </div>
+  )
+}
+
+/** 完成标记：做完的品牌色实心，没做的退到中性底 */
+function Marker({ done, children }: { done: boolean; children: ReactNode }) {
+  return (
+    <span
+      className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full font-mono text-[10px] ${
+        done ? 'bg-brand-600 text-white' : 'bg-soft-2 text-mute'
+      }`}
+    >
+      {done ? '✓' : children}
+    </span>
   )
 }
