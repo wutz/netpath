@@ -53,7 +53,12 @@ export interface Track {
   title: string
   subtitle: string
   goal: string
-  /** Tailwind 类名片段，用于阶段配色 */
+  /**
+   * Tailwind 类名片段，用于阶段配色。
+   *
+   * 只用在小面积标记上 —— 阶段角标、圆点。大块卡片背景一律走中性色，
+   * 否则六个阶段各铺一层浅色，整站就散成了一盒糖。
+   */
   accent: {
     text: string
     bg: string
@@ -71,11 +76,19 @@ export const KIND_LABEL: Record<LessonKind, string> = {
   planner: '规划',
 }
 
+/*
+ * 课型标签。
+ *
+ * 原来四种课型各占一个色（灰/绿/黄/紫），和六个阶段的颜色叠在同一行里，
+ * 一屏能出现十种色块，反而看不出哪个维度重要。现在只保留一处对比：
+ * 「读」是中性灰，「动手」的三种（实验/闯关/规划）共用主题色 —— 这才是
+ * 读者真正要区分的一件事。阶段色继续承担导航。
+ */
 export const KIND_STYLE: Record<LessonKind, string> = {
-  concept: 'bg-gray-100 text-gray-600',
-  lab: 'bg-emerald-100 text-emerald-700',
-  quest: 'bg-amber-100 text-amber-700',
-  planner: 'bg-violet-100 text-violet-700',
+  concept: 'border-gray-200 bg-gray-50 text-gray-600',
+  lab: 'border-brand-200 bg-brand-50 text-brand-700',
+  quest: 'border-brand-200 bg-brand-50 text-brand-700',
+  planner: 'border-brand-200 bg-brand-50 text-brand-700',
 }
 
 const REF_SYSPERF: LessonRef = { label: 'Systems Performance, 2nd Edition — Brendan Gregg' }
@@ -1680,10 +1693,11 @@ export const DEPTH_LABEL: Record<LessonDepth, string> = {
   deep: '深入',
 }
 
+/* 深浅只是难度提示，标签文字本身已经说清楚了，不再另给颜色 */
 export const DEPTH_STYLE: Record<LessonDepth, string> = {
-  intro: 'bg-sky-100 text-sky-700',
+  intro: 'border-gray-200 bg-gray-50 text-gray-500',
   core: '',
-  deep: 'bg-slate-200 text-slate-600',
+  deep: 'border-gray-200 bg-gray-50 text-gray-500',
 }
 
 export function getDepth(trackId: string, lessonId: string): LessonDepth {

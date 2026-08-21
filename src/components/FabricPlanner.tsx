@@ -18,16 +18,29 @@ const DEFAULTS: FabricPlanInput = {
   reserveUFM: true,
 }
 
+/* 不写 outline-none —— 全局 :focus-visible 的主题色焦点圈要留出来 */
 const inputCls =
-  'w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100'
+  'w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 transition focus:border-brand-500'
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
     <label className="block">
-      <span className="mb-1 block text-xs font-medium text-gray-600">{label}</span>
+      <span className="mb-1.5 block text-xs font-medium text-gray-700">{label}</span>
       {children}
-      {hint && <span className="mt-1 block text-[11px] text-gray-400">{hint}</span>}
+      {hint && <span className="mt-1 block text-[11px] text-gray-500">{hint}</span>}
     </label>
+  )
+}
+
+/** 与 EthernetPlanner 同一个形状：中性底 + 等宽数字，颜色不参与表达 */
+function Stat({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-3 text-center">
+      <div className="text-[11px] font-medium text-gray-600">{label}</div>
+      <div className="mt-1 font-mono text-xl font-medium tracking-tight text-gray-900">
+        {value}
+      </div>
+    </div>
   )
 }
 
@@ -60,18 +73,18 @@ export function FabricPlanner() {
     raRow.computeCables === result.computeCables
 
   return (
-    <section className="my-6 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
-      <header className="flex items-center justify-between border-b border-gray-100 px-4 py-2.5">
+    <section className="my-6 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-e2">
+      <header className="flex items-center justify-between border-b border-gray-100 bg-gray-50 px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <span className="rounded bg-violet-100 px-2 py-0.5 text-xs font-semibold text-violet-700">
+          <span className="rounded border border-brand-200 bg-brand-50 px-2 py-0.5 text-xs font-medium text-brand-700">
             计算器
           </span>
-          <span className="text-sm font-medium text-gray-700">计算网 Rail-Optimized 布线账</span>
+          <span className="text-sm font-medium text-gray-800">计算网 Rail-Optimized 布线账</span>
         </div>
         <button
           type="button"
           onClick={() => setInput(DEFAULTS)}
-          className="text-xs text-gray-400 transition hover:text-gray-700"
+          className="text-xs text-gray-500 transition hover:text-gray-900"
         >
           重置
         </button>
@@ -136,13 +149,13 @@ export function FabricPlanner() {
               type="checkbox"
               checked={input.reserveUFM}
               onChange={(e) => set('reserveUFM', e.target.checked)}
-              className="h-4 w-4 rounded border-gray-300"
+              className="h-4 w-4 shrink-0 rounded border-gray-300 accent-brand-600"
             />
             预留 UFM 管理链路（IB 场景）
           </label>
 
-          <div className="rounded-xl border border-gray-200 px-3 py-2.5 text-xs text-gray-600">
-            <div className="font-semibold text-gray-700">无阻塞算法</div>
+          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 text-xs text-gray-600">
+            <div className="font-medium text-gray-900">无阻塞算法</div>
             <p className="mt-1 leading-relaxed">
               {input.switchPorts} 口交换机对半分：{Math.floor(input.switchPorts / 2)} 口下行接节点、
               {Math.floor(input.switchPorts / 2)} 口上行接 spine。每个 rail 独立成组，
@@ -153,21 +166,12 @@ export function FabricPlanner() {
 
         <div className="space-y-3">
           <div className="grid grid-cols-3 gap-2">
-            <div className="rounded-xl bg-rose-50 px-2 py-3 text-center">
-              <div className="text-[11px] font-medium text-rose-700">GPU 总数</div>
-              <div className="mt-1 text-xl font-bold text-rose-900">{formatNumber(result.gpus)}</div>
-            </div>
-            <div className="rounded-xl bg-brand-50 px-2 py-3 text-center">
-              <div className="text-[11px] font-medium text-brand-700">leaf</div>
-              <div className="mt-1 text-xl font-bold text-brand-900">{result.leafCount}</div>
-            </div>
-            <div className="rounded-xl bg-violet-50 px-2 py-3 text-center">
-              <div className="text-[11px] font-medium text-violet-700">spine</div>
-              <div className="mt-1 text-xl font-bold text-violet-900">{result.spineCount}</div>
-            </div>
+            <Stat label="GPU 总数" value={formatNumber(result.gpus)} />
+            <Stat label="leaf" value={result.leafCount} />
+            <Stat label="spine" value={result.spineCount} />
           </div>
 
-          <dl className="divide-y divide-gray-100 rounded-xl border border-gray-200 px-3 text-sm">
+          <dl className="divide-y divide-gray-100 rounded-lg border border-gray-200 px-3 text-sm">
             {[
               ['rail 数', `${result.rails} 个`],
               ['每 rail 的 leaf 数', `${result.leavesPerRail} 台（每台接 ${result.nodesPerLeaf} 节点）`],
@@ -181,19 +185,21 @@ export function FabricPlanner() {
               ['通信跳数', `同 rail ${result.hops.sameRail} 跳 ／ 跨 rail ${result.hops.crossRail} 跳`],
             ].map(([label, value]) => (
               <div key={label} className="flex justify-between gap-3 py-2">
-                <dt className="shrink-0 text-gray-500">{label}</dt>
-                <dd className="text-right font-mono text-gray-800">{value}</dd>
+                <dt className="shrink-0 text-gray-600">{label}</dt>
+                <dd className="text-right font-mono text-gray-900">{value}</dd>
               </div>
             ))}
           </dl>
 
           {raRow && (
             <div
-              className={`rounded-xl px-3 py-2.5 text-xs ${
-                raMatch ? 'bg-emerald-50 text-emerald-900' : 'bg-gray-50 text-gray-700'
+              className={`rounded-lg border px-3 py-2.5 text-xs leading-relaxed ${
+                raMatch
+                  ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                  : 'border-gray-200 bg-gray-50 text-gray-700'
               }`}
             >
-              <div className="font-semibold">
+              <div className="font-medium">
                 {raMatch ? '✓ 与 SuperPOD 参考架构一致' : '与 SuperPOD 参考架构对比'}
               </div>
               <p className="mt-1 leading-relaxed">
@@ -205,7 +211,7 @@ export function FabricPlanner() {
             </div>
           )}
 
-          <ul className="space-y-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-900">
+          <ul className="space-y-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-900">
             {result.notes.map((note) => (
               <li key={note} className="flex gap-1.5">
                 <span className="shrink-0">·</span>

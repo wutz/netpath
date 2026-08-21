@@ -1,21 +1,75 @@
 @import "tailwindcss";
 
+/*
+ * 设计语言见仓库根目录 DESIGN.md（Vercel 风格：近白画布 + 墨黑主色 + 发丝分隔线，
+ * 装饰克制、层级靠留白和字重而不是靠颜色）。下面这一段是它的 token 落地。
+ */
 @theme {
-  --color-brand-50: oklch(0.97 0.02 205);
-  --color-brand-100: oklch(0.93 0.05 202);
-  --color-brand-200: oklch(0.88 0.07 203);
-  --color-brand-500: oklch(0.62 0.12 206);
-  --color-brand-600: oklch(0.54 0.12 210);
-  --color-brand-700: oklch(0.46 0.11 214);
-  /* 900 用在 bg-brand-50 数字块上，深度对齐同排的 violet-900 / rose-900 */
-  --color-brand-900: oklch(0.36 0.08 219);
+  /* ---------- 字体 ----------
+   * Geist / Geist Mono 走 Google Fonts 的 latin 子集，中文自然落到系统字面上，
+   * 所以正文汉字不会为了这套字体多下一个字节。
+   */
+  --font-sans:
+    'Geist', 'Inter', system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-mono:
+    'Geist Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Monaco, 'Cascadia Mono',
+    monospace;
+
+  /* ---------- 中性色 ----------
+   * Tailwind 自带的 gray 偏蓝，和 DESIGN.md 的纯灰混在一页里会发闷，
+   * 所以整条 gray 直接换成设计稿那把纯中性灰 —— 站内已有的
+   * text-gray-700 / border-gray-200 / bg-gray-50 无需改写就落到新阶上。
+   *
+   * 400 只用于边框、图标一类装饰；承载信息的小字最低到 500
+   * （#767676 是白底上仍满足 WCAG AA 4.5:1 的最浅一档）。
+   */
+  --color-gray-50: #fafafa; /* canvas-soft：页面底色 */
+  --color-gray-100: #f2f2f2;
+  --color-gray-200: #ebebeb; /* hairline：分隔线与卡片描边 */
+  --color-gray-300: #dcdcdc;
+  --color-gray-400: #a1a1a1; /* hairline-strong：仅装饰 */
+  --color-gray-500: #767676; /* 小字下限，AA 合格 */
+  --color-gray-600: #5c5c5c;
+  --color-gray-700: #4d4d4d; /* body：正文 */
+  --color-gray-800: #333333;
+  --color-gray-900: #171717; /* ink：标题、主按钮 */
+  --color-gray-950: #0a0a0a;
+
+  /* ---------- 主题色 ----------
+   * 取站点 logo 的 #008095（≈ brand-600）：网络与光纤的青蓝，
+   * 也贴合「终端 / 链路」这个题材。
+   *
+   * 按 DESIGN.md 的分工，墨黑负责「动作」（主按钮），
+   * 主题色负责「状态」—— 链接、选中态、进度条、焦点圈。
+   */
+  --color-brand-50: oklch(0.976 0.014 210);
+  --color-brand-100: oklch(0.945 0.031 208);
+  --color-brand-200: oklch(0.898 0.052 209);
+  --color-brand-300: oklch(0.836 0.073 211);
+  --color-brand-400: oklch(0.732 0.09 212);
+  --color-brand-500: oklch(0.634 0.096 213);
+  --color-brand-600: oklch(0.552 0.097 214); /* = #008095，白底 4.6:1 */
+  --color-brand-700: oklch(0.47 0.086 216);
+  --color-brand-800: oklch(0.398 0.071 218);
+  --color-brand-900: oklch(0.34 0.057 220);
+
+  /* ---------- 层次 ----------
+   * DESIGN.md 的层次是「叠加多层极淡投影」，不是一记 8px 大虚化。
+   * 这里只留投影部分，描边继续交给 border-gray-200，避免和 inset 环重影。
+   */
+  --shadow-e1: 0 1px 1px #00000005;
+  --shadow-e2: 0 1px 1px #00000005, 0 2px 2px #0000000a;
+  --shadow-e3: 0 2px 2px #0000000a, 0 8px 8px -8px #0000000a;
+  --shadow-e4: 0 2px 2px #0000000a, 0 8px 16px -4px #0000000a;
+  --shadow-e5: 0 1px 1px #00000005, 0 8px 16px -4px #0000000a, 0 24px 32px -8px #0000000f;
 }
 
 html {
   /* 横屏转竖屏时 iOS 会自作主张放大字号 */
   -webkit-text-size-adjust: 100%;
-  /* 顶栏是 sticky 的，锚点跳转要留出它的高度 */
-  scroll-padding-top: 4.5rem;
+  /* 顶栏是 sticky 的，锚点跳转要留出它的高度（顶栏 4rem + 一点余量） */
+  scroll-padding-top: 5rem;
 }
 
 /*
@@ -26,9 +80,25 @@ body {
   overflow-x: clip;
 }
 
+/* DESIGN.md：选中态是墨底浅字 */
+::selection {
+  background: var(--color-gray-900);
+  color: #f2f2f2;
+}
+
+/*
+ * 键盘焦点圈。原来大部分可点元素只有 hover 没有焦点态，
+ * 纯键盘走一遍会完全看不出光标在哪。
+ */
+:focus-visible {
+  outline: 2px solid var(--color-brand-600);
+  outline-offset: 2px;
+}
+
 /* Shiki 双主题：默认亮色，后续如接入暗色模式再切换变量 */
 .shiki {
   padding: 1rem 1.125rem;
+  font-family: var(--font-mono);
   font-size: 0.8125rem;
   line-height: 1.7;
 }
@@ -43,10 +113,15 @@ body {
 .lesson-body > * + * {
   margin-top: 1rem;
 }
+/*
+ * 标题一律 600 收顶 —— DESIGN.md 明确写了这套几何无衬线不上 700，
+ * 层级差交给字号、字距和上方留白。
+ */
 .lesson-body h2 {
   margin-top: 2.5rem;
   font-size: 1.375rem;
-  font-weight: 700;
+  font-weight: 600;
+  letter-spacing: -0.03em;
   color: var(--color-gray-900);
   border-bottom: 1px solid var(--color-gray-200);
   padding-bottom: 0.5rem;
@@ -54,7 +129,8 @@ body {
 .lesson-body h3 {
   margin-top: 1.75rem;
   font-size: 1.0625rem;
-  font-weight: 700;
+  font-weight: 600;
+  letter-spacing: -0.015em;
   color: var(--color-gray-900);
 }
 .lesson-body ul,
@@ -67,13 +143,26 @@ body {
 .lesson-body ol {
   list-style: decimal;
 }
+.lesson-body li::marker {
+  color: var(--color-gray-400);
+}
 .lesson-body li + li {
   margin-top: 0.375rem;
 }
+.lesson-body strong {
+  font-weight: 600;
+  color: var(--color-gray-900);
+}
 .lesson-body a {
-  color: var(--color-brand-600);
+  color: var(--color-brand-700);
   text-decoration: underline;
+  text-decoration-color: var(--color-brand-200);
+  text-decoration-thickness: 1px;
   text-underline-offset: 2px;
+  transition: text-decoration-color 150ms;
+}
+.lesson-body a:hover {
+  text-decoration-color: var(--color-brand-600);
 }
 /*
  * 代码块。没标语言的 ``` 块 shiki 不会处理，拿不到 .shiki 类，
@@ -88,11 +177,13 @@ body {
   overscroll-behavior-x: contain;
   border: 1px solid var(--color-gray-200);
   border-radius: 0.5rem;
+  box-shadow: var(--shadow-e1);
 }
 .lesson-body pre:not([class]) {
   background: #fff;
   color: var(--color-gray-800);
   padding: 1rem 1.125rem;
+  font-family: var(--font-mono);
   font-size: 0.8125rem;
   line-height: 1.7;
 }
@@ -102,6 +193,7 @@ body {
   color: var(--color-gray-800);
   padding: 0.1rem 0.35rem;
   border-radius: 0.25rem;
+  font-family: var(--font-mono);
   font-size: 0.85em;
 }
 /* 正文里的裸 markdown 图片，兜底不许撑破容器（Figure 组件自带样式，不受影响） */
@@ -126,15 +218,19 @@ body {
   text-align: left;
   vertical-align: top;
 }
+/* 表头走 mono —— DESIGN.md 里技术标签统一是等宽的声音 */
 .lesson-body th {
   background: var(--color-gray-50);
-  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--color-gray-800);
   white-space: nowrap;
 }
 .lesson-body blockquote {
-  border-left: 3px solid var(--color-gray-300);
+  border-left: 2px solid var(--color-gray-300);
   padding-left: 1rem;
-  color: var(--color-gray-500);
+  color: var(--color-gray-600);
 }
 .lesson-body hr {
   border-color: var(--color-gray-200);

@@ -14,24 +14,43 @@ const DEFAULTS: EthPlanInput = {
   dualHomed: true,
 }
 
+/* 不写 outline-none —— 全局 :focus-visible 的主题色焦点圈要留出来 */
 const inputCls =
-  'w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-100'
+  'w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 transition focus:border-brand-500'
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
     <label className="block">
-      <span className="mb-1 block text-xs font-medium text-gray-600">{label}</span>
+      <span className="mb-1.5 block text-xs font-medium text-gray-700">{label}</span>
       {children}
-      {hint && <span className="mt-1 block text-[11px] text-gray-400">{hint}</span>}
+      {hint && <span className="mt-1 block text-[11px] text-gray-500">{hint}</span>}
     </label>
   )
 }
 
+/** 结论色是有含义的（够用 / 紧 / 不够），这里保留语义色 */
 const VERDICT_STYLE = {
-  good: 'bg-emerald-50 text-emerald-800',
-  ok: 'bg-amber-50 text-amber-800',
-  bad: 'bg-rose-50 text-rose-800',
+  good: 'border-emerald-200 bg-emerald-50 text-emerald-900',
+  ok: 'border-amber-200 bg-amber-50 text-amber-900',
+  bad: 'border-rose-200 bg-rose-50 text-rose-900',
 } as const
+
+/**
+ * 结果数字块。原来 leaf 是青底、spine 是紫底、GPU 是红底 ——
+ * 颜色并不携带信息，只是让三个格子看起来不一样。现在统一中性底，
+ * 数字本身够大够粗，对比留给真正有语义的结论块。
+ */
+function Stat({ label, value, hint }: { label: string; value: ReactNode; hint?: string }) {
+  return (
+    <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-3 text-center">
+      <div className="text-xs font-medium text-gray-600">{label}</div>
+      <div className="mt-1 font-mono text-2xl font-medium tracking-tight text-gray-900">
+        {value}
+      </div>
+      {hint && <div className="mt-1 text-[11px] leading-snug text-gray-500">{hint}</div>}
+    </div>
+  )
+}
 
 /** 以太网 Spine-Leaf 规划计算器 */
 export function EthernetPlanner() {
@@ -51,18 +70,18 @@ export function EthernetPlanner() {
   })
 
   return (
-    <section className="my-6 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
-      <header className="flex items-center justify-between border-b border-gray-100 px-4 py-2.5">
+    <section className="my-6 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-e2">
+      <header className="flex items-center justify-between border-b border-gray-100 bg-gray-50 px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <span className="rounded bg-violet-100 px-2 py-0.5 text-xs font-semibold text-violet-700">
+          <span className="rounded border border-brand-200 bg-brand-50 px-2 py-0.5 text-xs font-medium text-brand-700">
             计算器
           </span>
-          <span className="text-sm font-medium text-gray-700">以太网 Spine-Leaf 端口账</span>
+          <span className="text-sm font-medium text-gray-800">以太网 Spine-Leaf 端口账</span>
         </div>
         <button
           type="button"
           onClick={() => setInput(DEFAULTS)}
-          className="text-xs text-gray-400 transition hover:text-gray-700"
+          className="text-xs text-gray-500 transition hover:text-gray-900"
         >
           重置
         </button>
@@ -133,7 +152,7 @@ export function EthernetPlanner() {
               type="checkbox"
               checked={input.dualHomed}
               onChange={(e) => set('dualHomed', e.target.checked)}
-              className="h-4 w-4 rounded border-gray-300"
+              className="h-4 w-4 shrink-0 rounded border-gray-300 accent-brand-600"
             />
             服务器双上行到两台 leaf（leaf 按偶数成对）
           </label>
@@ -141,30 +160,26 @@ export function EthernetPlanner() {
 
         <div className="space-y-3">
           <div className="grid grid-cols-2 gap-3">
-            <div className="rounded-xl bg-brand-50 px-3 py-3 text-center">
-              <div className="text-xs font-medium text-brand-700">leaf 交换机</div>
-              <div className="mt-1 text-2xl font-bold text-brand-900">{result.leafCount} 台</div>
-              <div className="mt-0.5 text-[11px] text-brand-700">
-                每台可下行 {result.downlinksPerLeaf} 口
-              </div>
-            </div>
-            <div className="rounded-xl bg-violet-50 px-3 py-3 text-center">
-              <div className="text-xs font-medium text-violet-700">spine 交换机</div>
-              <div className="mt-1 text-2xl font-bold text-violet-900">{result.spineCount} 台</div>
-              <div className="mt-0.5 text-[11px] text-violet-700">
-                端口用掉 {(result.spineUtil * 100).toFixed(0)}%
-              </div>
-            </div>
+            <Stat
+              label="leaf 交换机"
+              value={`${result.leafCount} 台`}
+              hint={`每台可下行 ${result.downlinksPerLeaf} 口`}
+            />
+            <Stat
+              label="spine 交换机"
+              value={`${result.spineCount} 台`}
+              hint={`端口用掉 ${(result.spineUtil * 100).toFixed(0)}%`}
+            />
           </div>
 
-          <div className={`rounded-xl px-3 py-3 ${VERDICT_STYLE[result.verdict.tone]}`}>
-            <div className="flex items-baseline justify-between">
+          <div className={`rounded-lg border px-3 py-3 ${VERDICT_STYLE[result.verdict.tone]}`}>
+            <div className="flex items-baseline justify-between gap-2">
               <span className="text-xs font-medium">收敛比（下行 : 上行）</span>
-              <span className="rounded bg-white/60 px-1.5 py-0.5 text-[11px] font-semibold">
+              <span className="shrink-0 rounded bg-white/70 px-1.5 py-0.5 text-[11px] font-medium">
                 {result.verdict.label}
               </span>
             </div>
-            <div className="mt-1 text-2xl font-bold">
+            <div className="mt-1 font-mono text-2xl font-medium tracking-tight">
               {formatRatio(result.oversubscription)}
             </div>
             <div className="mt-1 text-[11px]">
@@ -173,7 +188,7 @@ export function EthernetPlanner() {
             </div>
           </div>
 
-          <dl className="divide-y divide-gray-100 rounded-xl border border-gray-200 px-3 text-sm">
+          <dl className="divide-y divide-gray-100 rounded-lg border border-gray-200 px-3 text-sm">
             {[
               ['接入端口总数', `${formatNumber(result.accessPorts)} 个`],
               ['接入线缆', `${formatNumber(result.accessCables)} 根`],
@@ -181,14 +196,14 @@ export function EthernetPlanner() {
               ['下行口余量', `${formatNumber(result.sparePorts)} 个`],
               ['东西向对分带宽', formatGbps(result.bisectionGbps)],
             ].map(([label, value]) => (
-              <div key={label} className="flex justify-between py-2">
-                <dt className="text-gray-500">{label}</dt>
-                <dd className="font-mono text-gray-800">{value}</dd>
+              <div key={label} className="flex justify-between gap-3 py-2">
+                <dt className="text-gray-600">{label}</dt>
+                <dd className="font-mono text-gray-900">{value}</dd>
               </div>
             ))}
           </dl>
 
-          <ul className="space-y-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-900">
+          <ul className="space-y-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-900">
             {result.notes.map((note) => (
               <li key={note} className="flex gap-1.5">
                 <span className="shrink-0">·</span>
