@@ -175,13 +175,24 @@ TcpExtTCPLostRetransmit              23441         0.0
 # TCPTimeouts 41 万次 —— 每次至少 200ms，正好对上"偶发超时"。`,
     },
     {
-      cmd: 'iperf3 -c 10.10.0.51 -t 5',
-      output: `Connecting to host 10.10.0.51, port 5201
-[  5] local 10.10.1.103 port 51422 connected to 10.10.0.51 port 5201
-[ ID] Interval           Transfer     Bitrate         Retr
-[  5]   0.00-5.00   sec  13.1 GBytes  22.4 Gbits/sec  118
+      cmd: 'iperf -c 10.10.0.51 -t 5 -P 4',
+      output: `------------------------------------------------------------
+Client connecting to 10.10.0.51, TCP port 5001
+TCP window size:  325 KByte (default)
+------------------------------------------------------------
+[  3] local 10.10.1.103 port 51421 connected with 10.10.0.51 port 5001
+[  4] local 10.10.1.103 port 51422 connected with 10.10.0.51 port 5001
+[  5] local 10.10.1.103 port 51423 connected with 10.10.0.51 port 5001
+[  6] local 10.10.1.103 port 51424 connected with 10.10.0.51 port 5001
+[ ID] Interval       Transfer     Bandwidth
+[  3]  0.0- 5.0 sec  3.28 GBytes  5.63 Gbits/sec
+[  4]  0.0- 5.0 sec  3.27 GBytes  5.62 Gbits/sec
+[  5]  0.0- 5.0 sec  3.28 GBytes  5.64 Gbits/sec
+[  6]  0.0- 5.0 sec  3.27 GBytes  5.61 Gbits/sec
+[SUM]  0.0- 5.0 sec  13.1 GBytes  22.4 Gbits/sec
 
-# 大块流能跑到 22.4 Gbps，接近线速 —— 带宽本身没问题。
+# 用 iperf2 而不是 iperf3：多线程才不会被单核限住。
+# 大块流合计 22.4 Gbps，接近 25G 线速 —— 带宽本身没问题。
 # 这也解释了为什么监控看着"利用率只有 30%"却在丢包：业务是小包，瓶颈是 PPS 不是带宽。`,
     },
     {
@@ -206,7 +217,7 @@ TcpExtTCPLostRetransmit              23441         0.0
 | `rx_missed_errors` / `rx_no_buffer_count` 在涨 | 确认丢在**收方向、网卡 ring 层** |
 | `softnet_stat` 第 1 行 dropped 与 squeezed 都在涨，其余行为 0 | 确认**收包全压在 CPU0** |
 | `ethtool -l` 显示 `Combined: 1`（硬件支持 63） | **根因**：只启用了 1 个队列，RSS 散不开 |
-| `iperf3` 大流能跑 22.4 Gbps | 印证带宽不是瓶颈，PPS 才是 |
+| `iperf -P 4` 大流合计能跑 22.4 Gbps | 印证带宽不是瓶颈，PPS 才是 |
 
 **根因**：网卡多队列只启用了 1 个，所有收包中断与软中断集中在 CPU0，
 该核 `%soft` 饱和后来不及回收 rx 描述符，网卡开始丢包，触发大量 TCP 超时重传，
@@ -268,7 +279,7 @@ ping 每秒发几个包、每个包几十字节。这台机器的问题只在**�
   options={[
     { text: 'ping 全通且 RTT 很低', correct: true },
     { text: '带宽利用率只有 30%', correct: true },
-    { text: 'iperf3 单流能跑到 22.4 Gbps', correct: true },
+    { text: 'iperf 大流能跑到 22.4 Gbps', correct: true },
     { text: 'rx_missed_errors 有 41 万', feedback: '这个不是误导，它正是关键证据。' },
   ]}
   explain={<>三个「正常」指标都建立在大包或低速探测上，而故障只在高 PPS 的小包负载下出现。这也是为什么监控看板上一切正常、业务却在超时 —— 看板缺的是 PPS 和 softnet 丢包这两条曲线。</>}
@@ -280,4 +291,4 @@ ping 每秒发几个包、每个包几十字节。这台机器的问题只在**�
 - `rx_missed` + `crc 为 0` = 主机侧跟不上，不是物理层
 - `softnet_stat` 只有第一行有数 = 收包挤在一个核上
 - `ethtool -l` 是这类问题的收官命令：硬件支持多队列，但没启用
-- ping 通、带宽利用率低、iperf3 跑满，这三件事都**不能**证明网络健康
+- ping 通、带宽利用率低、iperf 跑满，这三件事都**不能**证明网络健康

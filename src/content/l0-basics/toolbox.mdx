@@ -137,14 +137,51 @@ tcpdump -i bond0 -nn 'udp port 4791' -c 20
 
 | 工具 | 测什么 | 注意 |
 | --- | --- | --- |
-| `iperf3` | TCP/UDP 吞吐 | 默认测大块流，测不出 PPS 瓶颈 |
-| `iperf3 -u -l 64 -b 0` | 小包 PPS | 这才是打 PPS 的姿势 |
+| `iperf -c <ip> -P 8`（iperf2） | TCP 吞吐，**高速网卡首选** | 每条流一个真线程，能吃满多核 |
+| `iperf -u -c <ip> -l 64 -b 10G -P 8` | 小包 PPS | UDP 小包才打得出 PPS 瓶颈 |
+| `iperf3 -c <ip> -P 8` | TCP 吞吐 | 界面好看，但线程模型有坑，见下 |
 | `qperf` / `sockperf` | 延迟（含 RDMA） | 关注 P99 而不是平均 |
 | `ib_send_bw` / `ib_write_lat` | RDMA 带宽与延迟 | L2 会专门讲 |
 
-<Callout type="warn" title="单条流测不出集群带宽">
-`iperf3` 单条流受单核和窗口限制，25G 以上的网卡经常测不满。加 `-P 8` 开多流，
-再把结果和 `ethtool -S` 的计数对照，才知道是链路上限还是单流上限。
+<Callout type="warn" title="40G 以上别用 iperf3 —— 它压不满">
+`iperf3` 在 **3.16 之前是单线程**的：`-P 8` 只是在同一个线程里轮着跑 8 条流，
+所有收发和校验都挤在一个核上。单核处理 TCP 的天花板大致在 20～30 Gbps，
+所以 40G / 100G 网卡上用 iperf3 测出来的"上限"往往是**那个核的上限**，不是网卡的。
+典型症状：结果卡在某个数字上不动，同时 `mpstat -P ALL 1` 显示某个核 100%。
+
+`iperf` (iperf2) 从设计上就是多线程 —— `-P N` 起 N 个真线程，散到 N 个核上，
+这才是 40G 以上唯一靠得住的姿势：
+
+```bash
+# 服务端（注意 iperf2 默认端口是 5001，iperf3 是 5201）
+iperf -s
+
+# 客户端：8 条流，每 2 秒报一次，-e 打开增强统计（含重传、CPU 占用）
+iperf -c 10.10.1.103 -P 8 -t 30 -i 2 -e
+
+# 看 [SUM] 行，不要看单条流
+```
+
+如果环境里只有 iperf3，替代姿势是**起多个进程**、每个进程绑不同核和不同端口，再手工求和：
+
+```bash
+# 服务端起 4 个实例
+for p in 5201 5202 5203 5204; do iperf3 -s -p $p -D; done
+
+# 客户端 4 个进程分别绑核
+for i in 0 1 2 3; do
+  taskset -c $((i+2)) iperf3 -c 10.10.1.103 -p $((5201+i)) -t 30 &
+done; wait
+```
+
+无论用哪个，都要把结果和 `ethtool -S` 的计数、`mpstat -P ALL 1` 的 `%soft` 对照，
+才知道瓶颈是链路、是单流窗口，还是压测工具自己的 CPU。
+</Callout>
+
+<Callout type="note" title="iperf3 3.16 之后呢？">
+`iperf3` 3.16（2023 年）加入了多线程，每条流一个线程，情况好了很多。
+但生产机上装的往往是发行版自带的老版本 —— **先 `iperf3 --version` 看一眼**。
+低于 3.16 就直接换 iperf2，不要在参数上浪费时间。
 </Callout>
 
 ## 60 秒网络体检清单
@@ -172,7 +209,7 @@ ip route; ip neigh                    # 8. 路由与 ARP 是否正常
   options={[
     { text: 'ethtool -S 看网卡计数，配合 /proc/net/softnet_stat 看软中断丢弃', correct: true },
     { text: 'ping 加 tcpdump', feedback: 'ping 能确认可达性，抓包能看现象，但都不直接给出丢在哪一层的计数。' },
-    { text: 'iperf3 打满带宽看结果', feedback: '这测的是上限，不能定位丢包层级。' },
+    { text: 'iperf 打满带宽看结果', feedback: '这测的是上限，不能定位丢包层级。' },
     { text: 'top 看 CPU 占用', feedback: '能提示 CPU 瓶颈，但不能区分丢包位置。' },
   ]}
   explain={<>分层计数器是定位丢包的唯一可靠手段：网卡侧看 ethtool -S 的 rx_missed / rx_errors，软中断侧看 softnet_stat 第 2、3 列，协议栈侧看 nstat 的各类 drop。</>}
@@ -197,4 +234,5 @@ ip route; ip neigh                    # 8. 路由与 ARP 是否正常
 - `ss -tim` 看单连接，`ss -lnt` 看 accept 队列，`ss -s` 看全局分布
 - `nstat` 只打印有变化的计数器，天然适合"清零 → 复现 → 再看"
 - 抓包四要素：过滤、限量、只抓包头、落盘
+- 压测选 `iperf`(2.x) 而不是老版 `iperf3`：多线程才吃得满 40G 以上的网卡
 - 记住 60 秒体检的八条命令，比记住一百个参数有用

@@ -289,7 +289,7 @@ export const tracks: Track[] = [
           '第二层：连接与队列（ss -ti、ss -lnt）',
           '第三层：协议栈计数器（nstat、netstat -s、sar -n）',
           '第四层：抓包（tcpdump 过滤表达式、抓多长、怎么落盘）',
-          '压测工具：iperf3、qperf、sockperf 各自的适用场景',
+          '压测工具：iperf(2.x) 多线程为何优于 iperf3、qperf/sockperf 的适用场景',
           '60 秒网络体检清单',
         ],
         refs: [REF_SYSPERF, repo('os/os.md')],
