@@ -7,11 +7,11 @@ export const Route = createRootRoute({
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1, viewport-fit=cover' },
-      { title: 'Netpath — 网络运维工程师成长路径' },
+      { title: '网络成长路径' },
       {
         name: 'description',
         content:
-          '网络运维工程师的在线交互式学习项目：从 Linux 协议栈与报文路径出发，走过 K8s 容器网络、InfiniBand 与 RoCE 高性能网络，再到以太网与计算网的容量规划。',
+          '一条从零到值班的网络成长路径：从 Linux 协议栈与报文路径出发，走过代理隧道、K8s 容器网络、InfiniBand 与 RoCE 高性能网络，再到以太网与计算网的容量规划。',
       },
     ],
     links: [
@@ -45,7 +45,7 @@ function RootLayout() {
               <img src="/logo.svg" alt="" width={26} height={26} className="h-6.5 w-6.5 shrink-0" />
               <span className="text-[15px] font-semibold tracking-[-0.02em]">Netpath</span>
               <span className="hidden border-l border-line pl-2.5 text-xs text-mute sm:inline">
-                网络运维工程师成长路径
+                网络成长路径
               </span>
             </Link>
             <nav className="-mr-1 flex items-center gap-0.5 overflow-x-auto text-sm [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
@@ -75,7 +75,7 @@ function RootLayout() {
           <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
             <div className="eyebrow">Netpath</div>
             <p className="mt-3 max-w-3xl text-sm leading-relaxed text-body">
-              网络运维工程师成长路径，从 Linux 协议栈走到 K8s 容器网络、RDMA 高性能网络与容量规划。
+              网络成长路径，从 Linux 协议栈走到 K8s 容器网络、RDMA 高性能网络与容量规划。
               内容基于 k8s-in-action 部署手册、The Kubernetes Networking Guide、NVIDIA DGX SuperPOD
               参考架构与 Systems Performance (2nd Edition) 整理。
             </p>

@@ -1660,10 +1660,11 @@ export function getDepth(trackId: string, lessonId: string): LessonDepth {
   return DEPTH[`${trackId}/${lessonId}`] ?? 'core'
 }
 
-/* ---------- 岗位路线 ---------- */
+/* ---------- 完整学习路径 ---------- */
 
-/** 路线里的一段，把一条长清单切成看得懂的几步 */
-export interface RoleStage {
+/** 路径里的一段，把一条长清单切成看得懂的几步 */
+export interface PathStage {
+  id: string
   title: string
   /** 一句话说明这一段解决什么 */
   hint: string
@@ -1671,293 +1672,175 @@ export interface RoleStage {
   lessons: string[]
 }
 
-export interface RolePath {
-  id: string
-  /** 岗位名 */
-  title: string
-  /** 同一类岗位的其它叫法 */
-  alias: string
-  /** 一句话点出这个岗位的处境 */
-  tagline: string
-  /** 这条线为什么这么排 */
-  desc: string
-  /** 走完能做什么 */
-  outcome: string[]
-  stages: RoleStage[]
+/** 这条路径整体是什么、走完能做什么 —— 首页那张说明卡的文案 */
+export const FULL_PATH_META = {
+  tagline: '从一次 curl 到给整个集群值班',
+  desc:
+    '一条线走到底，不分岗位、不做裁剪。顺序按「先看懂 → 再动手 → 后算账」排：' +
+    '每一段都建在上一段之上，动手和闯关紧跟在对应概念后面，标着「深入」的课全部往后压。' +
+    '零基础可以直接从第一节开始，有底子的挑着段跳也不会断。',
+  outcome: [
+    '接到「网络慢」，能一路查到是主机、交换机还是应用本身',
+    '看穿容器那层封装：Service 的 VIP、CNI 的每一跳与出入口治理',
+    '把一条 RDMA 链路从网卡打通到 NCCL，并判断 busbw 合不合格',
+    '把「要跑千卡训练」翻译成端口数、地址段与线缆根数',
+  ],
 }
 
 /**
- * 按岗位切四条主线。
+ * 完整学习路径：54 节课排成一条线，切成十五段。
  *
- * 54 节课平铺出来没人知道从哪下手，而"零经验新手"这个身份太笼统 ——
- * 架构师需要的是算账与选型，运维需要的是排障手感，两者的必修课重叠不到一半。
- * 所以按岗位裁剪：每条线只保留这个岗位真正会用到的课，并切成几段推进。
+ * 顺序不等于目录顺序 —— 目录按主题分阶段，这条线按「学得动」排：
  *
- * 四条线都从 L0 起步（术语和指标是共同地基），之后分叉。
- * 网络运维那条覆盖最广 —— 这张网整个是他的地盘 —— 但仍然是裁剪过的，
- * 机内互联、GPU 专项与那些加速卸载专题都不在上面。
+ * 1. 概念在前，工具在后，闯关收尾。先知道包往哪走，再学看它的命令，
+ *    最后接一台真出问题的机器，一段才算学完。
+ * 2. 标着「深入」的课往后压。内核栈调优（中断、队列、offload）原本排在 L0 中段，
+ *    对刚入门的人太重，挪到 RDMA 前面当引子 —— 那里正好要回答「内核这条路的极限在哪」。
+ * 3. 门槛低、当天就能用上的先来。代理与隧道整段提到容器网络之前：
+ *    集群在跳板机后面，连不上就什么都做不了，而它只需要 L0 的底子。
+ * 4. 跨阶段的课按主题就近合并。给 Pod 插网卡（L4 的 SR-IOV / MacVLAN）
+ *    和次级 CNI 讲的是同一件事，排在一起；两条改数据路径的路（eBPF/XDP、DPDK）
+ *    则和 GPU、存储专项一起放进「按需取用」那段。
+ * 5. 算账放最后。规划要用到前面全部的数字，先有概念才算得出端口与线缆。
  */
-export const ROLE_PATHS: RolePath[] = [
+export const FULL_PATH: PathStage[] = [
   {
-    id: 'architect',
-    title: '解决方案架构师',
-    alias: '方案工程师 · 售前',
-    tagline: '客户要的是一份能落地、也能报价的方案',
-    desc:
-      '你不必亲手敲每一条命令，但必须听得懂需求背后的数字：端口、收敛比、rail 数、线缆根数。' +
-      '这条线把动手排障的部分压到最少，重点放在技术底牌与规划算账，最后补上方案里绕不开的几个配套话题。',
-    outcome: [
-      '把「要跑千卡训练」翻译成 rail 数、交换机台数与光模块数量',
-      '在 IB、RoCE 与 Spectrum-X 之间说清各自的代价，而不是只报品牌',
-      '看一眼现有拓扑就知道哪一层会先成为瓶颈',
-    ],
-    stages: [
-      {
-        title: '术语与数字',
-        hint: '先把指标口径统一，谈方案时才不会被带偏',
-        lessons: [
-          'l0-basics/first-look',
-          'l0-basics/metrics-units',
-          'l0-basics/switching-routing',
-        ],
-      },
-      {
-        title: '高性能网络的技术底牌',
-        hint: '知道每种互联快在哪、代价是什么',
-        lessons: [
-          'l2-hpc/why-rdma',
-          'l2-hpc/pcie-topology',
-          'l2-hpc/nvlink',
-          'l2-hpc/infiniband',
-          'l2-hpc/roce',
-          'l2-hpc/topology-rail',
-        ],
-      },
-      {
-        title: '把需求写成端口数与线缆数',
-        hint: '这条线的主课，两个计算器都在这一段',
-        lessons: [
-          'l3-planning/requirements',
-          'l3-planning/ethernet-plan',
-          'l3-planning/ip-plan',
-          'l3-planning/fabric-plan',
-          'l3-planning/ib-vs-roce',
-        ],
-      },
-      {
-        title: '方案绕不开的配套',
-        hint: '客户一定会问的几件事：容器平台、存储直通、卸载方案',
-        lessons: [
-          'l1-k8s/k8s-model',
-          'l4-advanced/gpudirect',
-          'l4-advanced/nvme-of',
-          'l4-advanced/dpu',
-        ],
-      },
+    id: 'p01-map',
+    title: '先把网络当成一件事看',
+    hint: '不碰命令行，先建一张地图：一次访问经过哪些角色、三个指标怎么读、二层三层各管什么。',
+    lessons: [
+      'l0-basics/first-look',
+      'l0-basics/metrics-units',
+      'l0-basics/switching-routing',
     ],
   },
   {
-    id: 'compute-ops',
-    title: '集群运维工程师',
-    // 标题去掉了"计算"二字，GPU / AI 这个场景挪到副标题里点明
-    alias: '服务工程师 · GPU 集群交付',
-    tagline: '集群交付之后，出事第一个被找的是你',
-    desc:
-      '这条线偏手上功夫：先能把「网络慢」定位到具体一层，再吃透 K8s 容器网络那套看似魔法的机制，' +
-      '最后打通网卡到 NCCL 的整条链路。AI 集群的报障绝大多数落在这三段里，四个闯关也都排进来了。',
-    outcome: [
-      '接到「训练变慢了」，能一路查到是网卡、交换机还是 NCCL 参数',
-      '讲清 Pod 到 Pod 的每一跳，并知道每跳用什么命令看',
-      '用 perftest 与 nccl-tests 给出「链路正不正常」的量化结论',
-    ],
-    stages: [
-      {
-        title: '排障基本功',
-        hint: 'L0 全部，最后一节是闯关：一台「网络慢」的机器',
-        lessons: [
-          'l0-basics/first-look',
-          'l0-basics/metrics-units',
-          'l0-basics/packet-journey',
-          'l0-basics/switching-routing',
-          'l0-basics/tcp-behavior',
-          'l0-basics/toolbox',
-          'l0-basics/quest-slow-host',
-        ],
-      },
-      {
-        title: '上手就用的远程工具',
-        hint: '跳板机后面的集群怎么连，第一周就会用到',
-        lessons: ['l5-tunnel/ssh-tunnels', 'l5-tunnel/ssh-advanced'],
-      },
-      {
-        title: 'K8s 容器网络',
-        hint: '从四条铁律推到 Service 与 DNS，收尾是 Pod 不通的闯关',
-        lessons: [
-          'l1-k8s/k8s-model',
-          'l1-k8s/cni',
-          'l1-k8s/service',
-          'l1-k8s/dns-policy',
-          'l1-k8s/quest-pod-unreachable',
-        ],
-      },
-      {
-        title: 'GPU 集群的高速链路',
-        hint: '从 PCIe 亲和一路打到 busbw 判读',
-        lessons: [
-          'l2-hpc/pcie-topology',
-          'l2-hpc/why-rdma',
-          'l2-hpc/roce',
-          'l2-hpc/perftest',
-          'l2-hpc/k8s-rdma',
-          'l2-hpc/nccl',
-          'l2-hpc/quest-slow-allreduce',
-        ],
-      },
-      {
-        title: '长期值班',
-        hint: '把一次性的排查沉淀成指标与 SOP',
-        lessons: ['l4-advanced/observability', 'l4-advanced/oncall'],
-      },
+    id: 'p02-packet',
+    title: '跟着一个包走完全程',
+    hint: '有了地图再走一遍路：包在主机里经过哪些队列，TCP 又为什么忽快忽慢。',
+    lessons: ['l0-basics/packet-journey', 'l0-basics/tcp-behavior'],
+  },
+  {
+    id: 'p03-first-debug',
+    title: '第一次自己查',
+    hint: '工具认全，然后接一台真的「网络慢」的机器 —— 这一关过了，前面的概念才算落地。',
+    lessons: ['l0-basics/toolbox', 'l0-basics/quest-slow-host'],
+  },
+  {
+    id: 'p04-reach',
+    title: '先学会连上机器',
+    hint: '集群在跳板机后面，端口转发和代理是第一周就要用的手艺，门槛也最低，只需要 L0 的底子。',
+    lessons: [
+      'l5-tunnel/proxy-basics',
+      'l5-tunnel/ssh-tunnels',
+      'l5-tunnel/ssh-advanced',
+      'l5-tunnel/gost-toolbox',
     ],
   },
   {
-    id: 'storage-ops',
-    title: '存储运维工程师',
-    alias: '分布式存储 · 数据平台',
-    tagline: '存储的瓶颈，多半不在盘上',
-    desc:
-      '存储流量是长连接、大包、对丢包和抖动最敏感的一类流量，问题往往出在网络侧。' +
-      '这条线先补主机侧的收发路径与内核栈，再看 RDMA 与无损以太网怎么撑住 NVMe-oF 和 GPUDirect Storage，' +
-      '最后是存储网段怎么划、怎么直通进容器。',
-    outcome: [
-      '说清一次读写请求在主机侧经过哪些队列，哪一段最容易堆积',
-      '判断存储网该走 TCP 还是 RDMA，并说清 RoCE 无损配置的代价',
-      '给存储网划好独立网段，并把它直通到 Pod 里',
-    ],
-    stages: [
-      {
-        title: '从主机侧看存储流量',
-        hint: '内核栈那一节对存储尤其关键：中断、队列与 offload',
-        lessons: [
-          'l0-basics/first-look',
-          'l0-basics/metrics-units',
-          'l0-basics/switching-routing',
-          'l0-basics/packet-journey',
-          'l0-basics/tcp-behavior',
-          'l0-basics/kernel-stack',
-          'l0-basics/toolbox',
-          'l0-basics/quest-slow-host',
-        ],
-      },
-      {
-        title: '存储走 RDMA 之后',
-        hint: 'NVMe-oF 与 GDS 的底座，都压在 RoCE 这一层上',
-        lessons: [
-          'l2-hpc/why-rdma',
-          'l2-hpc/roce',
-          'l2-hpc/perftest',
-          'l4-advanced/nvme-of',
-          'l4-advanced/gpudirect',
-        ],
-      },
-      {
-        title: '存储网怎么划',
-        hint: '独立网段、独立 VLAN，以及接入层的收敛比该留多少',
-        lessons: ['l3-planning/ip-plan', 'l3-planning/ethernet-plan'],
-      },
-      {
-        title: '接进容器平台',
-        hint: '把存储网直通给 Pod，绕开 overlay 那一层封装',
-        lessons: [
-          'l1-k8s/k8s-model',
-          'l4-advanced/sriov-macvlan',
-          'l1-k8s/secondary-cni',
-          'l4-advanced/observability',
-        ],
-      },
+    id: 'p05-vpn',
+    title: '把分散的机器连成一张网',
+    hint: '从两台机器之间的隧道扩到一整张虚拟网：WireGuard 打底，Tailscale 免打洞，Pritunl 管人。',
+    lessons: ['l5-tunnel/wireguard', 'l5-tunnel/tailscale', 'l5-tunnel/pritunl'],
+  },
+  {
+    id: 'p06-restricted',
+    title: '受限网络下怎么办',
+    hint: '先选型，再配客户端分流与整网段透明网关，最后一关是隧道昨天还好、今天不通了。',
+    lessons: [
+      'l5-tunnel/restricted-network',
+      'l5-tunnel/clash-rules',
+      'l5-tunnel/transparent-gateway',
+      'l5-tunnel/traffic-shaping',
+      'l5-tunnel/quest-proxy-broken',
     ],
   },
   {
-    id: 'net-ops',
-    title: '网络运维工程师',
-    alias: '网络工程师 · 数据中心网络',
-    tagline: '这张网整个是你的地盘，从接入口一直到 spine',
-    desc:
-      '四条线里覆盖最广的一条：转发与 TCP 行为要吃透，代理、VPN 与透明网关是日常工具，' +
-      'K8s 那层 overlay 要能看穿，RoCE 的无损配置要会调，最后还得出得了规划、值得了班。' +
-      '仍然是裁剪过的 —— 机内互联（PCIe / NVLink）、GPU 专项与那些加速卸载专题都不在上面。',
-    outcome: [
-      '任何一段"不通"或"变慢"，都能定位到具体某一跳、某一层',
-      '把内网服务、跨地域机器与整个网段的出口流量安排妥当',
-      '看穿容器那层封装：Service 的 VIP、Ingress 的入口与 overlay 的每一跳',
+    id: 'p07-container',
+    title: '容器网络：先手搓，再看 K8s',
+    hint: '四条铁律讲清目标，netns 与 veth 亲手搭一遍它就不再是魔法，然后看 CNI 有哪几种实现。',
+    lessons: ['l1-k8s/k8s-model', 'l1-k8s/netns-veth', 'l1-k8s/cni'],
+  },
+  {
+    id: 'p08-service',
+    title: '服务是怎么被访问到的',
+    hint: 'Service 的 VIP、集群内的 DNS、裸金属的 LoadBalancer 与南北入口 —— 集群里最常报障的一段。',
+    lessons: [
+      'l1-k8s/service',
+      'l1-k8s/dns-policy',
+      'l1-k8s/metallb',
+      'l1-k8s/ingress-egress',
     ],
-    stages: [
-      {
-        title: '协议栈与转发',
-        hint: 'L0 全部八节，这条线的其余部分都建在这上面',
-        lessons: [
-          'l0-basics/first-look',
-          'l0-basics/metrics-units',
-          'l0-basics/switching-routing',
-          'l0-basics/packet-journey',
-          'l0-basics/tcp-behavior',
-          'l0-basics/kernel-stack',
-          'l0-basics/toolbox',
-          'l0-basics/quest-slow-host',
-        ],
-      },
-      {
-        title: '远程接入与隧道',
-        hint: '日常工具箱：端口转发、组网、企业 VPN 与整网段分流',
-        lessons: [
-          'l5-tunnel/proxy-basics',
-          'l5-tunnel/ssh-tunnels',
-          'l5-tunnel/ssh-advanced',
-          'l5-tunnel/gost-toolbox',
-          'l5-tunnel/wireguard',
-          'l5-tunnel/tailscale',
-          'l5-tunnel/pritunl',
-          'l5-tunnel/transparent-gateway',
-          'l5-tunnel/quest-proxy-broken',
-        ],
-      },
-      {
-        title: '容器网络这层封装',
-        hint: '从手搓 netns 到 MetalLB 与 Ingress，L1 基本整段吃下',
-        lessons: [
-          'l1-k8s/netns-veth',
-          'l1-k8s/k8s-model',
-          'l1-k8s/cni',
-          'l1-k8s/service',
-          'l1-k8s/metallb',
-          'l1-k8s/kube-proxy-ebpf',
-          'l1-k8s/ingress-egress',
-          'l1-k8s/dns-policy',
-          'l1-k8s/quest-pod-unreachable',
-        ],
-      },
-      {
-        title: '机房里的高性能网络',
-        hint: '无损以太网那套参数与 IB 的差别，得能自己调、自己测',
-        lessons: [
-          'l2-hpc/why-rdma',
-          'l2-hpc/roce',
-          'l2-hpc/infiniband',
-          'l2-hpc/topology-rail',
-          'l2-hpc/perftest',
-        ],
-      },
-      {
-        title: '规划与值班',
-        hint: '算得出端口与地址，也把排障沉淀成指标和 SOP',
-        lessons: [
-          'l3-planning/ethernet-plan',
-          'l3-planning/ip-plan',
-          'l4-advanced/observability',
-          'l4-advanced/oncall',
-        ],
-      },
+  },
+  {
+    id: 'p09-container-deep',
+    title: '看穿封装，再排一次障',
+    hint: 'kube-proxy 三代实现与 eBPF 替换，给 Pod 插第二张网卡，收尾是 Pod 之间不通的闯关。',
+    lessons: [
+      'l1-k8s/kube-proxy-ebpf',
+      'l4-advanced/sriov-macvlan',
+      'l1-k8s/secondary-cni',
+      'l1-k8s/quest-pod-unreachable',
     ],
+  },
+  {
+    id: 'p10-bypass',
+    title: '主机的极限，与绕开内核的理由',
+    hint: '先把内核栈调到头，再看 RDMA 省掉了哪几步；机内的 PCIe 与 NVLink 决定网卡能不能跑满。',
+    lessons: [
+      'l0-basics/kernel-stack',
+      'l2-hpc/why-rdma',
+      'l2-hpc/pcie-topology',
+      'l2-hpc/nvlink',
+    ],
+  },
+  {
+    id: 'p11-rdma',
+    title: 'IB 与无损以太网',
+    hint: '两套体系各讲一遍，然后在两台机器之间把第一条 RDMA 链路真的打通。',
+    lessons: ['l2-hpc/infiniband', 'l2-hpc/roce', 'l2-hpc/perftest'],
+  },
+  {
+    id: 'p12-collective',
+    title: '把 RDMA 交给集群',
+    hint: '网卡进 Pod、rail 怎么接线、busbw 怎么读，收尾是 AllReduce 只有理论值一半的闯关。',
+    lessons: [
+      'l2-hpc/k8s-rdma',
+      'l2-hpc/topology-rail',
+      'l2-hpc/nccl',
+      'l2-hpc/quest-slow-allreduce',
+    ],
+  },
+  {
+    id: 'p13-topics',
+    title: 'GPU、存储与卸载专项',
+    hint: '按需取用的一段：显存直通、远端盘、集合通信库、卸载到卡上，以及自己改数据路径的两条路。',
+    lessons: [
+      'l4-advanced/gpudirect',
+      'l4-advanced/nvme-of',
+      'l4-advanced/mpi',
+      'l4-advanced/dpu',
+      'l4-advanced/ebpf-xdp',
+      'l4-advanced/dpdk',
+    ],
+  },
+  {
+    id: 'p14-planning',
+    title: '把需求写成一张采购单',
+    hint: '前面所有的账在这里汇总：端口数、收敛比、地址段、rail 数、线缆根数，最后是那道选型题。',
+    lessons: [
+      'l3-planning/requirements',
+      'l3-planning/ethernet-plan',
+      'l3-planning/ip-plan',
+      'l3-planning/fabric-plan',
+      'l3-planning/ib-vs-roce',
+    ],
+  },
+  {
+    id: 'p15-oncall',
+    title: '长期值班',
+    hint: '把一次性的排查沉淀成看板、告警，和别人能照着执行的流程。',
+    lessons: ['l4-advanced/observability', 'l4-advanced/oncall'],
   },
 ]
 
@@ -2015,24 +1898,21 @@ export function getLesson(trackId: string, lessonId: string) {
   }
 }
 
-export interface RolePathItem {
+export interface PathItem {
   track: Track
   lesson: Lesson
   key: string
-  /** 在整条路线里的序号，从 1 开始，跨段连续 */
+  /** 在整条路径里的序号，从 1 开始，跨段连续 */
   index: number
 }
 
 /**
- * 解析一条岗位路线：把课程 key 换成课程对象，编上跨段连续的序号，并汇总时长。
+ * 解析完整路径：把课程 key 换成课程对象，编上跨段连续的序号，并汇总时长。
  * 写错 key 的条目直接丢掉，不让首页因为一个笔误崩掉。
  */
-export function getRolePath(roleId: string) {
-  const role = ROLE_PATHS.find((r) => r.id === roleId)
-  if (!role) return undefined
-
+function resolvePath() {
   let index = 0
-  const stages = role.stages.map((stage) => {
+  const stages = FULL_PATH.map((stage) => {
     const items = stage.lessons
       .map((key) => {
         const [t, l] = key.split('/')
@@ -2041,7 +1921,7 @@ export function getRolePath(roleId: string) {
         index += 1
         return { track: found.track, lesson: found.lesson, key, index }
       })
-      .filter((x): x is RolePathItem => Boolean(x))
+      .filter((x): x is PathItem => Boolean(x))
     return {
       stage,
       items,
@@ -2051,13 +1931,16 @@ export function getRolePath(roleId: string) {
 
   const items = stages.flatMap((s) => s.items)
   return {
-    role,
+    meta: FULL_PATH_META,
     stages,
     items,
     lessonCount: items.length,
     minutes: items.reduce((sum, i) => sum + i.lesson.minutes, 0),
   }
 }
+
+/** 整站只有这一条路径，解析一次就够 */
+export const learningPath = resolvePath()
 
 /** 解析出「建议先学」的课程列表 */
 export function getPrereqs(trackId: string, lessonId: string) {
@@ -2086,31 +1969,30 @@ export function lessonKey(trackId: string, lessonId: string) {
 }
 
 /**
- * 在一条岗位路线里找相邻课程 —— 沿路线阅读时，「下一课」要跳路线的下一节，
- * 而不是目录里的下一节（那两者经常不是同一节，路线本来就是跨阶段跳的）。
+ * 在完整路径里找相邻课程 —— 「下一课」跳的是路径的下一节，而不是目录里的下一节。
+ * 这两者经常不是同一节：路径本来就跨阶段排，深入的课也被往后压了。
  *
- * 返回 undefined 有两种情况：roleId 不认识，或这一节没排进这条路线。
+ * 路径覆盖全部课程，所以正常情况下总能命中；万一某个 key 写错被丢掉了，
+ * 返回 undefined，调用方退回目录顺序。
  */
-export function getRoleNeighbors(roleId: string, trackId: string, lessonId: string) {
-  const path = getRolePath(roleId)
-  if (!path) return undefined
-
+export function getPathNeighbors(trackId: string, lessonId: string) {
   const key = lessonKey(trackId, lessonId)
-  const at = path.items.findIndex((item) => item.key === key)
+  const at = learningPath.items.findIndex((item) => item.key === key)
   if (at === -1) return undefined
 
   return {
-    path,
-    current: path.items[at],
-    /** 这一节属于路线里的哪一段 */
-    stage: path.stages.find((s) => s.items.some((i) => i.key === key))?.stage,
-    prev: path.items[at - 1],
-    next: path.items[at + 1],
+    path: learningPath,
+    current: learningPath.items[at],
+    /** 这一节属于路径里的哪一段 */
+    stage: learningPath.stages.find((s) => s.items.some((i) => i.key === key))?.stage,
+    prev: learningPath.items[at - 1],
+    next: learningPath.items[at + 1],
   }
 }
 
 export const stats = {
   trackCount: tracks.length,
+  stageCount: learningPath.stages.length,
   lessonCount: allLessons.length,
   readyCount: allLessons.filter(({ lesson }) => lesson.status === 'ready').length,
   labCount: allLessons.filter(({ lesson }) => lesson.kind === 'lab' || lesson.kind === 'quest')
