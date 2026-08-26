@@ -251,10 +251,10 @@ function LessonPage() {
                 </div>
               </div>
               <ol className="mt-3 space-y-3 text-sm">
-                {nav.path.stages.map(({ stage, items }, index) => (
-                  <li key={stage.id}>
+                {nav.path.steps.map(({ track: t, items }, index) => (
+                  <li key={t.id}>
                     <div className="px-2 text-[11px] font-medium text-mute">
-                      {index + 1}. {stage.title}
+                      第 {index + 1} 步 · {t.title}
                     </div>
                     <ol className="mt-1 space-y-0.5">
                       {items.map((item) => (
@@ -263,7 +263,6 @@ function LessonPage() {
                             trackId={item.track.id}
                             lessonId={item.lesson.id}
                             title={item.lesson.title}
-                            level={item.track.level}
                             active={item.key === key}
                             done={progress.done.includes(item.key)}
                           />
@@ -310,13 +309,13 @@ function LessonPage() {
 }
 
 /**
- * 路径提示条：告诉读者「你走到整条路径的第几节、这一段在讲什么」。
+ * 路径提示条：告诉读者「你走到整条路径的第几节、现在在哪一步」。
  * 课程不在路径里（只可能是 key 写错）时什么都不渲染，页面照常读。
  */
 function PathBanner({ nav }: { nav: ReturnType<typeof getPathNeighbors> }) {
   if (!nav) return null
 
-  const { path, current, stage } = nav
+  const { path, current } = nav
   const percent = Math.round((current.index / path.lessonCount) * 100)
 
   return (
@@ -324,8 +323,7 @@ function PathBanner({ nav }: { nav: ReturnType<typeof getPathNeighbors> }) {
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
         <span className="font-medium text-ink">学习路径</span>
         <span className="font-mono text-[11px] text-mute">
-          {current.index} / {path.lessonCount}
-          {stage && ` · ${stage.title}`}
+          {current.index} / {path.lessonCount} · {current.track.title}
         </span>
         <Link to="/" className="ml-auto text-mute transition hover:text-ink">
           看全程 →

@@ -4,8 +4,8 @@ import {
   DEPTH_STYLE,
   KIND_LABEL,
   KIND_STYLE,
-  LEVEL_CHIP,
   type PathItem,
+  type Track,
   getDepth,
   learningPath,
   stats,
@@ -19,13 +19,12 @@ export const Route = createFileRoute('/')({
 /**
  * 首页就是那一条路径本身。
  *
- * 版式与 storpath / kubepath 对齐：框架段 → 入口卡 → 一段一张卡的阶梯 → 结尾一句话。
- * 每一段是一张卡，卡头带徽标、「第 N 步」、段标题与自己的进度；
- * 段里每一行课带标题和一句话说明，右侧最多一个标签加时长。
+ * 版式与 storpath / kubepath 对齐：框架段 → 入口卡 → 一步一张卡的阶梯 → 结尾一句话。
  *
- * 这里先后砍掉了两样东西：四个岗位标签（选岗位本身就是一道题），
- * 以及底下那个折叠的「全部课程」目录（路径已经是全集，同一批课列两遍只会让人怀疑
- * 两份清单不一样）。按主题读的入口没有丢 —— 每段卡头的标题就链到它所属的分类页。
+ * 这里先后砍掉了三样东西：四个岗位标签（选岗位本身就是一道题）、
+ * 底下那个折叠的「全部课程」目录（路径已经是全集，同一批课列两遍只会让人怀疑两份清单不一样），
+ * 以及那层十七段的 stage 结构 —— 它让目录和路径各有一套顺序，两个事实来源要同步。
+ * 现在**一步就是一个分类**，五步走完就是全部 50 节课，卡头直接链到分类页。
  */
 function Home() {
   const progress = useProgress()
@@ -40,7 +39,7 @@ function Home() {
     <div className="space-y-10">
       <section>
         <div className="eyebrow">
-          {stats.lessonCount} lessons · {stats.stageCount} stages · 约{' '}
+          {stats.lessonCount} lessons · {stats.stepCount} steps · 约{' '}
           {Math.round(path.minutes / 60)} hours
         </div>
         <h1 className="display-2xl mt-3">{path.meta.tagline}</h1>
@@ -75,14 +74,13 @@ function Home() {
       </section>
 
       <section className="space-y-4">
-        {path.stages.map(({ stage, items, minutes }, index) => (
-          <Stage
-            key={stage.id}
-            step={index + 1}
-            title={stage.title}
-            hint={stage.hint}
-            meta={`${items.length} 节 · ${minutes} 分钟`}
+        {path.steps.map(({ track, items, minutes }, index) => (
+          <Step
+            key={track.id}
+            index={index + 1}
+            track={track}
             items={items}
+            minutes={minutes}
             doneSet={doneSet}
           />
         ))}
@@ -103,27 +101,21 @@ function Home() {
 }
 
 /**
- * 一段就是一张卡。
- *
- * 徽标取这一段里出现最多的那个分类，段标题链到它的分类页 ——
- * 五个分类都能从这条路径上直接进去，不必再单列一份目录。
+ * 一步就是一张卡 —— 一步等于一个分类，卡头链到它的分类页。
  */
-function Stage({
-  step,
-  title,
-  hint,
-  meta,
+function Step({
+  index,
+  track,
   items,
+  minutes,
   doneSet,
 }: {
-  step: number
-  title: string
-  hint: string
-  meta: string
+  index: number
+  track: Track
   items: PathItem[]
+  minutes: number
   doneSet: Set<string>
 }) {
-  const track = dominantTrack(items)
   const done = items.filter((item) => doneSet.has(item.key)).length
 
   return (
@@ -135,17 +127,19 @@ function Stage({
           </span>
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-baseline gap-x-2">
-              <span className="eyebrow">第 {step} 步</span>
+              <span className="eyebrow">第 {index} 步</span>
               <Link
                 to="/tracks/$trackId"
                 params={{ trackId: track.id }}
                 className="text-[15px] font-semibold tracking-[-0.02em] hover:underline"
               >
-                {title}
+                {track.title}
               </Link>
-              <span className="font-mono text-[11px] text-mute">{meta}</span>
+              <span className="font-mono text-[11px] text-mute">
+                {track.subtitle} · {items.length} 节 · {minutes} 分钟
+              </span>
             </div>
-            <p className="mt-1 text-xs leading-relaxed text-body">{hint}</p>
+            <p className="mt-1 text-xs leading-relaxed text-body">{track.hint}</p>
           </div>
           <span className="shrink-0 font-mono text-xs text-mute">
             {done}/{items.length}
@@ -154,9 +148,9 @@ function Stage({
       </header>
 
       <ol className="divide-y divide-line">
-        {items.map((item, index) => (
+        {items.map((item, i) => (
           <li key={item.key}>
-            <Row item={item} index={index + 1} stageTrackId={track.id} doneSet={doneSet} />
+            <Row item={item} index={i + 1} doneSet={doneSet} />
           </li>
         ))}
       </ol>
@@ -168,12 +162,10 @@ function Stage({
 function Row({
   item,
   index,
-  stageTrackId,
   doneSet,
 }: {
   item: PathItem
   index: number
-  stageTrackId: string
   doneSet: Set<string>
 }) {
   const isDone = doneSet.has(item.key)
@@ -203,13 +195,7 @@ function Row({
         {isDone ? '✓' : index}
       </span>
       <span className="min-w-0 flex-1">
-        <span className="block truncate text-sm text-ink">
-          {/* 这一段里混进来的外分类课单独标出来，否则看不出它为什么排在这儿 */}
-          {item.track.id !== stageTrackId && (
-            <span className={`mr-1.5 ${LEVEL_CHIP}`}>{item.track.level}</span>
-          )}
-          {item.lesson.title}
-        </span>
+        <span className="block truncate text-sm text-ink">{item.lesson.title}</span>
         <span className="block truncate text-xs text-mute">{item.lesson.summary}</span>
       </span>
       {tag && (
@@ -222,12 +208,4 @@ function Row({
       <span className="shrink-0 font-mono text-[11px] text-mute">{item.lesson.minutes}m</span>
     </Link>
   )
-}
-
-/** 这一段里出现最多的那个分类 —— 用来定卡头的徽标与标题链接 */
-function dominantTrack(items: PathItem[]) {
-  const count = new Map<string, number>()
-  for (const item of items) count.set(item.track.id, (count.get(item.track.id) ?? 0) + 1)
-  const winner = [...count.entries()].sort((a, b) => b[1] - a[1])[0][0]
-  return items.find((item) => item.track.id === winner)!.track
 }

@@ -24,8 +24,6 @@ const LEGACY_TRACK: Record<string, string> = {
   'l0-basics/toolbox': 'ethernet',
   'l0-basics/quest-slow-host': 'ethernet',
   'l3-planning/ethernet-plan': 'ethernet',
-  'l4-advanced/observability': 'ethernet',
-  'l4-advanced/oncall': 'ethernet',
   'l5-tunnel/proxy-basics': 'gfw',
   'l5-tunnel/restricted-network': 'gfw',
   'l5-tunnel/clash-rules': 'gfw',
@@ -59,6 +57,8 @@ const LEGACY_TRACK: Record<string, string> = {
   'l1-k8s/quest-pod-unreachable': 'k8s',
   'l2-hpc/k8s-rdma': 'k8s',
   'l4-advanced/ebpf-xdp': 'k8s',
+  'l4-advanced/observability': 'k8s',
+  'l4-advanced/oncall': 'k8s',
   'l4-advanced/sriov-macvlan': 'k8s',
   'l3-planning/ip-plan': 'k8s',
 }

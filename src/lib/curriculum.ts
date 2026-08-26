@@ -53,6 +53,8 @@ export interface Track {
   title: string
   subtitle: string
   goal: string
+  /** 一句话说明这一步解决什么 —— 首页路径卡头用 */
+  hint: string
   groups: LessonGroup[]
   lessons: Lesson[]
 }
@@ -114,6 +116,7 @@ export const tracks: Track[] = [
     title: '科学上网',
     subtitle: '看得到一手资料 · 一切的前置',
     goal: '网络方向的一手资料绝大部分在海外：内核提交记录、RFC、各家设计文档与厂商 KB。这一段不解决任何网络原理问题，但它决定了后面每一节你能读到什么。先学会诊断，再搭一条自己的线，最后把流量分好。',
+    hint: '一手资料几乎都在海外。这件事不解决，后面每一节能读到的东西都打折。',
     groups: [
       {
         id: 'gfw-diagnose',
@@ -272,6 +275,7 @@ export const tracks: Track[] = [
     title: '访问集群',
     subtitle: '跳板机、端口转发与组网',
     goal: '集群不会直接暴露在公网上。这一段解决「怎么连上去」：SSH 的三种端口转发与配置固化，以及需要把一堆机器连成一张网时该选哪个 VPN 方案。',
+    hint: '集群在跳板机后面，连不上就什么都做不了 —— 门槛最低，入职第一周就用得上。',
     groups: [
       {
         id: 'access-ssh',
@@ -350,6 +354,7 @@ export const tracks: Track[] = [
     title: '以太网与协议栈',
     subtitle: 'Linux 协议栈、观测与端口账',
     goal: '所有网络问题的地基。搞清一个包从应用到网线要经过哪些环节，每个环节能用什么命令看，延迟、带宽、PPS 三个指标各自受什么限制，以及一套接入网该怎么算端口。',
+    hint: '所有网络问题的地基：一个包从应用走到网线要经过哪些环节，每一环能用什么命令看。',
     groups: [
       {
         id: 'eth-start',
@@ -367,7 +372,7 @@ export const tracks: Track[] = [
         id: 'eth-path',
         title: '走通一个包',
         hint: '从 send() 到网线，中间每一跳都能被观测和调整。',
-        lessons: ['packet-journey', 'tcp-behavior', 'kernel-stack'],
+        lessons: ['packet-journey', 'tcp-behavior'],
       },
       {
         id: 'eth-practice',
@@ -376,16 +381,10 @@ export const tracks: Track[] = [
         lessons: ['toolbox', 'quest-slow-host'],
       },
       {
-        id: 'eth-plan',
-        title: '接入网的端口账',
-        hint: '给定节点数和网卡规格，算出交换机台数、线缆数与收敛比。',
-        lessons: ['ethernet-plan'],
-      },
-      {
-        id: 'eth-ops',
-        title: '长期运维',
-        hint: '把一次性的排查沉淀成指标、看板和别人能照着执行的流程。',
-        lessons: ['observability', 'oncall'],
+        id: 'eth-tune',
+        title: '主机侧的旋钮与端口账',
+        hint: '把内核栈调到头，再算一次接入网的端口与收敛比 —— 两件事都是后面高性能网络的前提。',
+        lessons: ['kernel-stack', 'ethernet-plan'],
       },
     ],
     lessons: [
@@ -583,48 +582,6 @@ export const tracks: Track[] = [
         ],
         refs: [REF_SUPERPOD, REF_STORPATH],
       },
-      {
-        id: 'observability',
-        title: '网络可观测性：指标、流日志与抓包',
-        summary: '把"网络好不好"变成可以画在看板上、能告警的具体数字。',
-        kind: 'concept',
-        status: 'ready',
-        minutes: 30,
-        objectives: [
-          '列出必须采集的网络指标及其告警阈值',
-          '用流量可见性工具定位一次跨服务调用失败',
-          '设计一套在故障时真的能用的抓包流程',
-        ],
-        outline: [
-          '主机侧指标：丢包、重传、队列、PPS',
-          '网卡与交换机侧：PFC 计数、ECN 标记、端口错误',
-          'RDMA 专属计数器怎么看',
-          '流量可见性：Hubble 与 conntrack 视角',
-          '抓包工程化：什么时候抓、抓多少、存哪里',
-          '看板设计：先看什么后看什么',
-        ],
-        refs: [repo('o11y/'), repo('network/cilium/README.md')],
-      },
-      {
-        id: 'oncall',
-        title: '网络值班手册：SOP 与容量复盘',
-        summary: '把前面所有知识固化成别人也能照着执行的流程，这才是工程师的产出物。',
-        kind: 'concept',
-        status: 'ready',
-        minutes: 25,
-        objectives: [
-          '写出一份别人能照着执行的网络故障处置 SOP',
-          '主持一次不追责的网络故障复盘',
-          '建立变更前的检查清单与回滚方案',
-        ],
-        outline: [
-          '常见告警的处置 SOP 模板',
-          '分层排障法：从 CLI 到看板到抓包',
-          '变更管理：窗口、双人复核、回滚',
-          '故障复盘：时间线、根因、改进项',
-          '容量复盘：端口用尽与地址用尽的提前量',
-        ],
-      },
     ],
   },
   {
@@ -633,18 +590,19 @@ export const tracks: Track[] = [
     title: '高性能网络',
     subtitle: '机内互联、RDMA 与网络库',
     goal: 'AI 训练与高性能存储的主战场。先看机内：PCIe 决定网卡能不能跑满、NVLink 决定 GPU 之间有多快；再看机间：RDMA 为什么快、无损以太网靠什么撑住；最后是上层网络库与整套计算网的规划账。',
+    hint: 'AI 训练与高性能存储的主战场：为什么要绕开内核，以及怎么把一条链路打通到 NCCL。',
     groups: [
       {
-        id: 'hpc-intra',
-        title: '机内互联',
-        hint: 'PCIe 决定网卡能不能跑满，NVLink 决定 GPU 之间有多快。机间的账建立在这两笔账之上。',
-        lessons: ['pcie-topology', 'nvlink'],
+        id: 'hpc-bypass',
+        title: '为什么要绕开内核',
+        hint: 'RDMA 省掉了内核路径上的哪几步；机内的 PCIe 与 NVLink 决定网卡能不能跑满。',
+        lessons: ['why-rdma', 'pcie-topology', 'nvlink'],
       },
       {
         id: 'hpc-rdma',
-        title: 'RDMA 与无损以太网',
-        hint: '为什么快、IB 与 RoCE 差在哪、无损靠什么撑住，以及 RoCE 绕不开的那套主机侧选路配置。',
-        lessons: ['why-rdma', 'infiniband', 'roce', 'policy-routing'],
+        title: 'IB 与无损以太网',
+        hint: '两套体系各讲一遍，再补上 RoCE 绕不开的那套主机侧选路配置 —— 不配它就会走错卡。',
+        lessons: ['infiniband', 'roce', 'policy-routing'],
       },
       {
         id: 'hpc-handson',
@@ -1092,7 +1050,8 @@ export const tracks: Track[] = [
     level: 'K8S',
     title: 'K8s 网络',
     subtitle: '容器网络与高性能网络接入',
-    goal: '容器网络看起来像魔法，拆开只有几层封装。这一段从四条铁律推到 Service、Ingress 与 NetworkPolicy，最后把高性能网络接进集群：给 Pod 划地盘、插第二张网卡、把 RDMA 交给它。',
+    goal: '容器网络看起来像魔法，拆开只有几层封装。这一段从四条铁律推到 Service、Ingress 与 NetworkPolicy，再把高性能网络接进集群：给 Pod 划地盘、插第二张网卡、把 RDMA 交给它。整条路的收尾也在这里 —— 把前面全部的排查手法沉淀成看板、告警与值班流程。',
+    hint: '容器网络看起来像魔法，拆开只有几层封装。把物理网与 RDMA 接进集群，最后收尾到值班。',
     groups: [
       {
         id: 'k8s-dataplane',
@@ -1117,6 +1076,12 @@ export const tracks: Track[] = [
         title: '排障',
         hint: 'Pod 之间不通，按层收敛。',
         lessons: ['quest-pod-unreachable'],
+      },
+      {
+        id: 'k8s-ops',
+        title: '长期值班',
+        hint: '整条路走完了，把一次性的排查沉淀成看板、告警和别人能照着执行的流程。',
+        lessons: ['observability', 'oncall'],
       },
     ],
     lessons: [
@@ -1448,6 +1413,48 @@ export const tracks: Track[] = [
         ],
         refs: [REF_TKNG],
       },
+      {
+        id: 'observability',
+        title: '网络可观测性：指标、流日志与抓包',
+        summary: '把"网络好不好"变成可以画在看板上、能告警的具体数字。',
+        kind: 'concept',
+        status: 'ready',
+        minutes: 30,
+        objectives: [
+          '列出必须采集的网络指标及其告警阈值',
+          '用流量可见性工具定位一次跨服务调用失败',
+          '设计一套在故障时真的能用的抓包流程',
+        ],
+        outline: [
+          '主机侧指标：丢包、重传、队列、PPS',
+          '网卡与交换机侧：PFC 计数、ECN 标记、端口错误',
+          'RDMA 专属计数器怎么看',
+          '流量可见性：Hubble 与 conntrack 视角',
+          '抓包工程化：什么时候抓、抓多少、存哪里',
+          '看板设计：先看什么后看什么',
+        ],
+        refs: [repo('o11y/'), repo('network/cilium/README.md')],
+      },
+      {
+        id: 'oncall',
+        title: '网络值班手册：SOP 与容量复盘',
+        summary: '把前面所有知识固化成别人也能照着执行的流程，这才是工程师的产出物。',
+        kind: 'concept',
+        status: 'ready',
+        minutes: 25,
+        objectives: [
+          '写出一份别人能照着执行的网络故障处置 SOP',
+          '主持一次不追责的网络故障复盘',
+          '建立变更前的检查清单与回滚方案',
+        ],
+        outline: [
+          '常见告警的处置 SOP 模板',
+          '分层排障法：从 CLI 到看板到抓包',
+          '变更管理：窗口、双人复核、回滚',
+          '故障复盘：时间线、根因、改进项',
+          '容量复盘：端口用尽与地址用尽的提前量',
+        ],
+      },
     ],
   },
 ]
@@ -1480,7 +1487,7 @@ export const PREREQ: Record<string, string[]> = {
   'ethernet/toolbox': ['ethernet/packet-journey'],
   'ethernet/quest-slow-host': ['ethernet/toolbox'],
   'ethernet/ethernet-plan': ['ethernet/metrics-units'],
-  'ethernet/observability': ['ethernet/toolbox'],
+  'k8s/observability': ['ethernet/toolbox', 'k8s/cni'],
 
   // 高性能网络：机内 → 原理 → 主机侧选路 → 动手 → 网络库 → 卸载 → 规划
   'hpc/pcie-topology': ['ethernet/metrics-units'],
@@ -1526,7 +1533,7 @@ export const DEPTH: Record<string, LessonDepth> = {
   'ethernet/metrics-units': 'intro',
   'ethernet/switching-routing': 'intro',
   'ethernet/kernel-stack': 'deep',
-  'ethernet/oncall': 'intro',
+  'k8s/oncall': 'intro',
   'k8s/k8s-model': 'intro',
   'k8s/kube-proxy-ebpf': 'deep',
   'k8s/ebpf-xdp': 'deep',
@@ -1563,18 +1570,20 @@ export function getDepth(trackId: string, lessonId: string): LessonDepth {
 
 /* ---------- 完整学习路径 ---------- */
 
-/** 路径里的一段，把一条长清单切成看得懂的几步 */
-export interface PathStage {
-  id: string
-  title: string
-  /** 一句话说明这一段解决什么 */
-  hint: string
-  /** 课程 key，按学习顺序排列 */
-  lessons: string[]
-}
+/**
+ * 路径不再是一份单独维护的清单。
+ *
+ * 早先这里有一张 `FULL_PATH`，把课程重新切成十七段、顺序自成一套 ——
+ * 于是站里有了两个事实来源：目录一个顺序，路径另一个顺序。
+ * 代价是每改一节课都要同步两处，正文里的「上一节 / 下一节」也经常指错人。
+ *
+ * 现在**目录就是路径**：五个分类依次是五步，每步内部按 `groups[].lessons` 走。
+ * 原来那十七段里真正有价值的是排序决定（内核栈往后压、代理隧道提前、算账放最后），
+ * 这些已经折进各自分类的分组里，跟着课程本身走。
+ */
 
 /** 首页顶部那段框架文案 —— 与 storpath / kubepath 用同一种口吻：一句标题 + 一段路线概述 */
-export const FULL_PATH_META = {
+export const PATH_META = {
   tagline: '从查得到资料，到给整个集群值班。',
   intro:
     '这是一条网络工程师的成长路线。50 节课排成一条线：先解决「查得到一手资料」这件事，' +
@@ -1582,141 +1591,6 @@ export const FULL_PATH_META = {
     '一路走到 RDMA、GPU 集群与容器网络，最后能替业务算出端口数与线缆数，也扛得住值班。' +
     '没有分岔，也不用挑，从第一节往下走就行。',
 }
-
-/**
- * 完整学习路径：54 节课排成一条线，切成十五段。
- *
- * 顺序不等于目录顺序 —— 目录按主题分阶段，这条线按「学得动」排：
- *
- * 1. 概念在前，工具在后，闯关收尾。先知道包往哪走，再学看它的命令，
- *    最后接一台真出问题的机器，一段才算学完。
- * 2. 标着「深入」的课往后压。内核栈调优（中断、队列、offload）原本排在 L0 中段，
- *    对刚入门的人太重，挪到 RDMA 前面当引子 —— 那里正好要回答「内核这条路的极限在哪」。
- * 3. 门槛低、当天就能用上的先来。代理与隧道整段提到容器网络之前：
- *    集群在跳板机后面，连不上就什么都做不了，而它只需要 L0 的底子。
- * 4. 跨阶段的课按主题就近合并。给 Pod 插网卡（L4 的 SR-IOV / MacVLAN）
- *    和次级 CNI 讲的是同一件事，排在一起；两条改数据路径的路（eBPF/XDP、DPDK）
- *    则和 GPU、存储专项一起放进「按需取用」那段。
- * 5. 算账放最后。规划要用到前面全部的数字，先有概念才算得出端口与线缆。
- */
-export const FULL_PATH: PathStage[] = [
-  {
-    id: 'p01-why',
-    title: '先解决「看得到资料」这件事',
-    hint: '一手资料在海外，这一段决定你后面每一节能读到什么。先学会把「打不开」分成四类，再搞懂代理到底是什么。',
-    lessons: ['gfw/restricted-network', 'gfw/proxy-basics'],
-  },
-  {
-    id: 'p02-line',
-    title: '自己搭一条稳定的线',
-    hint: '选机器、选线路、选协议，再把流量分好 —— 先有稳的出口，再谈分流规则，顺序反了两个变量会搅在一起。',
-    lessons: ['gfw/vps-anytls', 'gfw/clash-rules', 'gfw/quest-proxy-broken'],
-  },
-  {
-    id: 'p03-access',
-    title: '连上远端机器',
-    hint: '集群在跳板机后面。端口转发是第一周就要用的手艺，机器多了再谈组网选型。',
-    lessons: ['access/ssh', 'access/vpn'],
-  },
-  {
-    id: 'p04-map',
-    title: '把网络当成一件事看',
-    hint: '到这里才开始讲原理。不碰命令行，先建一张地图：一次访问经过哪些角色、三个指标怎么读、二层三层各管什么。',
-    lessons: [
-      'ethernet/first-look',
-      'ethernet/metrics-units',
-      'ethernet/switching-routing',
-    ],
-  },
-  {
-    id: 'p05-packet',
-    title: '跟着一个包走完全程',
-    hint: '有了地图再走一遍路：包在主机里经过哪些队列，TCP 又为什么忽快忽慢。',
-    lessons: ['ethernet/packet-journey', 'ethernet/tcp-behavior'],
-  },
-  {
-    id: 'p06-debug',
-    title: '第一次自己查',
-    hint: '工具认全，然后接一台真的「网络慢」的机器 —— 这一关过了，前面的概念才算落地。',
-    lessons: ['ethernet/toolbox', 'ethernet/quest-slow-host'],
-  },
-  {
-    id: 'p07-tune',
-    title: '主机侧的旋钮与端口账',
-    hint: '把内核栈调到头，再算一次接入网的端口与收敛比 —— 两件事都是后面高性能网络的前提。',
-    lessons: ['ethernet/kernel-stack', 'ethernet/ethernet-plan'],
-  },
-  {
-    id: 'p08-bypass',
-    title: '为什么要绕开内核',
-    hint: 'RDMA 省掉了内核路径上的哪几步；机内的 PCIe 与 NVLink 决定网卡能不能跑满。',
-    lessons: ['hpc/why-rdma', 'hpc/pcie-topology', 'hpc/nvlink'],
-  },
-  {
-    id: 'p09-rdma',
-    title: 'IB 与无损以太网',
-    hint: '两套体系各讲一遍，再补上 RoCE 绕不开的那套主机侧选路配置 —— 多网卡机器不配它就会走错卡。',
-    lessons: ['hpc/infiniband', 'hpc/roce', 'hpc/policy-routing'],
-  },
-  {
-    id: 'p10-link',
-    title: '打通并验收一条链路',
-    hint: '先在两台裸机之间跑出线速，再看整套拓扑该怎么接才不浪费带宽。',
-    lessons: ['hpc/perftest', 'hpc/topology-rail'],
-  },
-  {
-    id: 'p11-lib',
-    title: '上层网络库',
-    hint: 'NCCL 与 MPI 才是真正搬数据的那一层，busbw 是整条链路的体检报告。收尾是 AllReduce 只有一半的闯关。',
-    lessons: ['hpc/nccl', 'hpc/mpi', 'hpc/quest-slow-allreduce'],
-  },
-  {
-    id: 'p12-offload',
-    title: 'GPU、存储与卸载',
-    hint: '按需取用的一段：显存直通、远端盘、卸载到卡上，以及干脆自己接管数据路径。',
-    lessons: ['hpc/gpudirect', 'hpc/nvme-of', 'hpc/dpu', 'hpc/dpdk'],
-  },
-  {
-    id: 'p13-plan',
-    title: '把需求写成一张采购单',
-    hint: '前面所有的账在这里汇总：rail 数、交换机台数、线缆根数，最后是那道 IB / RoCE / Spectrum-X 的选型题。',
-    lessons: ['hpc/requirements', 'hpc/fabric-plan', 'hpc/ib-vs-roce'],
-  },
-  {
-    id: 'p14-container',
-    title: '容器网络：先手搓，再看 K8s',
-    hint: '四条铁律讲清目标，netns 与 veth 亲手搭一遍它就不再是魔法，然后看 CNI 有哪几种实现。',
-    lessons: ['k8s/k8s-model', 'k8s/netns-veth', 'k8s/cni', 'k8s/ebpf-xdp'],
-  },
-  {
-    id: 'p15-service',
-    title: '服务是怎么被访问到的',
-    hint: 'Service 的 VIP 怎么落地、裸金属怎么给 LoadBalancer、南北入口与策略 —— 集群里最常报障的一段。',
-    lessons: [
-      'k8s/service',
-      'k8s/kube-proxy-ebpf',
-      'k8s/metallb',
-      'k8s/ingress-egress',
-      'k8s/dns-policy',
-    ],
-  },
-  {
-    id: 'p16-k8s-hpc',
-    title: '划地盘，把网卡插进去',
-    hint: '地址规划是一次性决定、长期后悔的事；然后把物理网直通给 Pod，最后把 RDMA 也交给它。',
-    lessons: ['k8s/ip-plan', 'k8s/sriov-macvlan', 'k8s/secondary-cni', 'k8s/k8s-rdma'],
-  },
-  {
-    id: 'p17-oncall',
-    title: '闯关与长期值班',
-    hint: '最后一关是 Pod 之间不通；通关之后，把一次性的排查沉淀成看板、告警和别人能照着执行的流程。',
-    lessons: [
-      'k8s/quest-pod-unreachable',
-      'ethernet/observability',
-      'ethernet/oncall',
-    ],
-  },
-]
 
 /* ---------- 派生查询 ---------- */
 
@@ -1776,37 +1650,31 @@ export interface PathItem {
   track: Track
   lesson: Lesson
   key: string
-  /** 在整条路径里的序号，从 1 开始，跨段连续 */
+  /** 在整条路径里的序号，从 1 开始，跨步连续 */
   index: number
 }
 
 /**
- * 解析完整路径：把课程 key 换成课程对象，编上跨段连续的序号，并汇总时长。
- * 写错 key 的条目直接丢掉，不让首页因为一个笔误崩掉。
+ * 把五个分类摊成一条线：每个分类是一步，步内按分组顺序排课，序号跨步连续。
  */
 function resolvePath() {
   let index = 0
-  const stages = FULL_PATH.map((stage) => {
-    const items = stage.lessons
-      .map((key) => {
-        const [t, l] = key.split('/')
-        const found = getLesson(t, l)
-        if (!found) return undefined
-        index += 1
-        return { track: found.track, lesson: found.lesson, key, index }
-      })
-      .filter((x): x is PathItem => Boolean(x))
+  const steps = tracks.map((track) => {
+    const items = orderedLessons(track).map((lesson) => {
+      index += 1
+      return { track, lesson, key: lessonKey(track.id, lesson.id), index }
+    })
     return {
-      stage,
+      track,
       items,
       minutes: items.reduce((sum, i) => sum + i.lesson.minutes, 0),
     }
   })
 
-  const items = stages.flatMap((s) => s.items)
+  const items = steps.flatMap((s) => s.items)
   return {
-    meta: FULL_PATH_META,
-    stages,
+    meta: PATH_META,
+    steps,
     items,
     lessonCount: items.length,
     minutes: items.reduce((sum, i) => sum + i.lesson.minutes, 0),
@@ -1843,11 +1711,8 @@ export function lessonKey(trackId: string, lessonId: string) {
 }
 
 /**
- * 在完整路径里找相邻课程 —— 「下一课」跳的是路径的下一节，而不是目录里的下一节。
- * 这两者经常不是同一节：路径本来就跨阶段排，深入的课也被往后压了。
- *
- * 路径覆盖全部课程，所以正常情况下总能命中；万一某个 key 写错被丢掉了，
- * 返回 undefined，调用方退回目录顺序。
+ * 在完整路径里找相邻课程，并给出它在整条线上的位置。
+ * 路径覆盖全部课程，正常情况下总能命中；命不中就返回 undefined，调用方退回目录顺序。
  */
 export function getPathNeighbors(trackId: string, lessonId: string) {
   const key = lessonKey(trackId, lessonId)
@@ -1857,8 +1722,6 @@ export function getPathNeighbors(trackId: string, lessonId: string) {
   return {
     path: learningPath,
     current: learningPath.items[at],
-    /** 这一节属于路径里的哪一段 */
-    stage: learningPath.stages.find((s) => s.items.some((i) => i.key === key))?.stage,
     prev: learningPath.items[at - 1],
     next: learningPath.items[at + 1],
   }
@@ -1866,7 +1729,7 @@ export function getPathNeighbors(trackId: string, lessonId: string) {
 
 export const stats = {
   trackCount: tracks.length,
-  stageCount: learningPath.stages.length,
+  stepCount: learningPath.steps.length,
   lessonCount: allLessons.length,
   readyCount: allLessons.filter(({ lesson }) => lesson.status === 'ready').length,
   labCount: allLessons.filter(({ lesson }) => lesson.kind === 'lab' || lesson.kind === 'quest')
