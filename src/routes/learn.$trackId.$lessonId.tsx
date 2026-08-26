@@ -6,15 +6,11 @@ import {
   KIND_LABEL,
   KIND_STYLE,
   LEVEL_CHIP,
-  type Lesson,
-  ROLE_PATHS,
-  type Track,
   getDepth,
   getFlatNeighbors,
   getLesson,
+  getPathNeighbors,
   getPrereqs,
-  getRoleNeighbors,
-  getRolePath,
   groupedLessons,
   lessonKey,
 } from '#/lib/curriculum'
@@ -24,20 +20,11 @@ import { LessonKeyContext } from '#/components/lesson-context'
 import { mdxComponents } from '#/components/mdx-components'
 
 export const Route = createFileRoute('/learn/$trackId/$lessonId')({
-  /**
-   * ?role=<岗位路线 id> —— 沿岗位路线阅读时带上，页面据此改「下一课」的目标与右侧目录。
-   * 认不出的值直接丢掉，URL 被手改坏也不会让页面挂掉。
-   */
-  validateSearch: (search: Record<string, unknown>): { role?: string } => {
-    const role = typeof search.role === 'string' ? search.role : undefined
-    return role && ROLE_PATHS.some((r) => r.id === role) ? { role } : {}
-  },
   component: LessonPage,
 })
 
 function LessonPage() {
   const { trackId, lessonId } = Route.useParams()
-  const { role } = Route.useSearch()
   const found = getLesson(trackId, lessonId)
   const progress = useProgress()
 
@@ -62,11 +49,12 @@ function LessonPage() {
   const prereqs = getPrereqs(track.id, lesson.id)
   const depth = getDepth(track.id, lesson.id)
 
-  // 在路线上就按路线走，不在路线上（或没带 role）就退回全站线性顺序
-  const roleNav = role ? getRoleNeighbors(role, track.id, lesson.id) : undefined
-  const { prev, next } = roleNav ?? getFlatNeighbors(track.id, lesson.id)
-  /** 路线模式下所有课内链接都要把 role 带上，否则点一下就掉出路线 */
-  const search = roleNav ? { role } : {}
+  /**
+   * 「上一课 / 下一课」跟着完整路径走 —— 路径的顺序和目录顺序经常不一样，
+   * 而路径才是我们希望读者走的那条线。路径里找不到（key 写错）才退回目录顺序。
+   */
+  const nav = getPathNeighbors(track.id, lesson.id)
+  const { prev, next } = nav ?? getFlatNeighbors(track.id, lesson.id)
 
   return (
     <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_15rem] lg:gap-10">
@@ -97,7 +85,7 @@ function LessonPage() {
           )}
         </nav>
 
-        <RoleBanner roleNav={roleNav} role={role} track={track} lesson={lesson} />
+        <PathBanner nav={nav} />
 
         <header className="mt-4 border-b border-line pb-6">
           <div className="flex flex-wrap items-center gap-2">
@@ -226,17 +214,12 @@ function LessonPage() {
             <Link
               to="/learn/$trackId/$lessonId"
               params={{ trackId: next.track.id, lessonId: next.lesson.id }}
-              search={search}
               className="rounded-sm bg-canvas px-4 py-2.5 text-sm font-medium text-ink shadow-card transition hover:shadow-float"
             >
               下一课：{next.lesson.title} →
             </Link>
           ) : (
-            roleNav && (
-              <span className="text-sm text-mute">
-                这是「{roleNav.path.role.title}」路线的最后一节 🎉
-              </span>
-            )
+            nav && <span className="text-sm text-mute">这是整条路径的最后一节 🎉</span>
           )}
         </div>
 
@@ -245,7 +228,6 @@ function LessonPage() {
             <Link
               to="/learn/$trackId/$lessonId"
               params={{ trackId: prev.track.id, lessonId: prev.lesson.id }}
-              search={search}
               className="text-sm text-mute transition hover:text-ink"
             >
               ← {prev.lesson.title}
@@ -256,19 +238,24 @@ function LessonPage() {
 
       <aside className="mt-12 lg:mt-0">
         <div className="sticky top-20 max-h-[calc(100vh-6rem)] overflow-y-auto rounded-md bg-canvas px-3 py-4 shadow-card">
-          {roleNav ? (
-            /* 路线模式：右栏换成整条路线，不然读者看不到自己在跨阶段的哪一步 */
+          {nav ? (
+            /*
+              右栏是整条路径，不是当前阶段的目录 —— 路径跨阶段排，
+              只列本阶段的话，读者看不到自己走到整条线的哪一步。
+            */
             <>
               <div className="px-2">
-                <div className="eyebrow">{roleNav.path.role.title}</div>
+                <div className="eyebrow">学习路径</div>
                 <div className="mt-1 font-mono text-[11px] text-mute">
-                  第 {roleNav.current.index} / {roleNav.path.lessonCount} 节
+                  第 {nav.current.index} / {nav.path.lessonCount} 节
                 </div>
               </div>
               <ol className="mt-3 space-y-3 text-sm">
-                {roleNav.path.stages.map(({ stage, items }) => (
-                  <li key={stage.title}>
-                    <div className="px-2 text-[11px] font-medium text-mute">{stage.title}</div>
+                {nav.path.steps.map(({ track: t, items }, index) => (
+                  <li key={t.id}>
+                    <div className="px-2 text-[11px] font-medium text-mute">
+                      第 {index + 1} 步 · {t.title}
+                    </div>
                     <ol className="mt-1 space-y-0.5">
                       {items.map((item) => (
                         <li key={item.key}>
@@ -276,8 +263,6 @@ function LessonPage() {
                             trackId={item.track.id}
                             lessonId={item.lesson.id}
                             title={item.lesson.title}
-                            level={item.track.level}
-                            search={{ role }}
                             active={item.key === key}
                             done={progress.done.includes(item.key)}
                           />
@@ -306,7 +291,6 @@ function LessonPage() {
                             trackId={track.id}
                             lessonId={item.id}
                             title={item.title}
-                            search={{}}
                             active={item.id === lesson.id}
                             done={progress.done.includes(lessonKey(track.id, item.id))}
                           />
@@ -325,54 +309,24 @@ function LessonPage() {
 }
 
 /**
- * 路线模式的提示条：告诉读者「你正走在哪条线上、走到第几节」，并给一个退出口。
- * 没带 role 时什么都不渲染，按目录顺序阅读的人不受影响。
+ * 路径提示条：告诉读者「你走到整条路径的第几节、现在在哪一步」。
+ * 课程不在路径里（只可能是 key 写错）时什么都不渲染，页面照常读。
  */
-function RoleBanner({
-  roleNav,
-  role,
-  track,
-  lesson,
-}: {
-  roleNav: ReturnType<typeof getRoleNeighbors>
-  role?: string
-  track: Track
-  lesson: Lesson
-}) {
-  if (!role) return null
+function PathBanner({ nav }: { nav: ReturnType<typeof getPathNeighbors> }) {
+  if (!nav) return null
 
-  // URL 上带了 role，但这一节没排进那条路线 —— 只可能是手改地址进来的
-  if (!roleNav) {
-    const path = getRolePath(role)
-    if (!path) return null
-    return (
-      <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-sm bg-warn-soft px-3.5 py-2.5 text-xs">
-        <span className="text-warn-deep">这一节没排进「{path.role.title}」路线</span>
-        <Link to="/" className="ml-auto text-warn-deep underline underline-offset-2">
-          回到路线 →
-        </Link>
-      </div>
-    )
-  }
-
-  const { path, current, stage } = roleNav
+  const { path, current } = nav
   const percent = Math.round((current.index / path.lessonCount) * 100)
 
   return (
     <div className="mt-4 rounded-sm bg-canvas px-3.5 py-2.5 shadow-card">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
-        <span className="font-medium text-ink">{path.role.title} 路线</span>
+        <span className="font-medium text-ink">学习路径</span>
         <span className="font-mono text-[11px] text-mute">
-          {current.index} / {path.lessonCount}
-          {stage && ` · ${stage.title}`}
+          {current.index} / {path.lessonCount} · {current.track.title}
         </span>
-        <Link
-          to="/learn/$trackId/$lessonId"
-          params={{ trackId: track.id, lessonId: lesson.id }}
-          search={{}}
-          className="ml-auto text-mute transition hover:text-ink"
-        >
-          退出路线
+        <Link to="/" className="ml-auto text-mute transition hover:text-ink">
+          看全程 →
         </Link>
       </div>
       <div className="mt-2 h-1 overflow-hidden rounded-full bg-soft-2">
@@ -388,7 +342,6 @@ function SidebarLink({
   lessonId,
   title,
   level,
-  search,
   active,
   done,
 }: {
@@ -396,7 +349,6 @@ function SidebarLink({
   lessonId: string
   title: string
   level?: string
-  search: { role?: string }
   active: boolean
   done: boolean
 }) {
@@ -404,7 +356,6 @@ function SidebarLink({
     <Link
       to="/learn/$trackId/$lessonId"
       params={{ trackId, lessonId }}
-      search={search}
       className={`flex gap-1.5 rounded-sm px-2 py-1.5 text-[13px] leading-snug transition ${
         active ? 'bg-soft-2 font-medium text-ink' : 'text-body hover:bg-soft'
       }`}

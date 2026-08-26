@@ -1,0 +1,475 @@
+## 三个方案，三个不同的问题
+
+"给集群组个 VPN"这句话底下藏着三种完全不同的需求，选错了会付很久的运维代价：
+
+| 你的问题 | 选 |
+| --- | --- |
+| 几台服务器要互联，成员基本不变 | **裸 WireGuard** |
+| 设备到处跑、都在 NAT 后、成员常变 | **Tailscale** |
+| 不接受控制面在第三方 | **Headscale**（开源协调服务器）自建 |
+| 几十上百人按权限接入，要 SSO 与审计 | **Pritunl** |
+| 要兼容既有 OpenVPN 客户端 / 受限平台 | **Pritunl** |
+| 要和传统网络设备、云网关做 IPsec 对接 | **Pritunl** |
+
+一句话判断标准：**这是"连通性问题"还是"身份与合规问题"？**
+前者用轻量方案，后者才值得引入一套系统。三个方案下面各讲一遍，重点在各自的取舍和高频故障。
+
+---
+
+# 一、WireGuard：连通性的最小解
+
+## 设计上做减法
+
+WireGuard 的所有特点都来自一个决定：**不给选择**。
+
+| 传统 VPN（IPsec / OpenVPN） | WireGuard |
+| --- | --- |
+| 一堆加密套件，需要协商 | **只有一套**：Curve25519 + ChaCha20-Poly1305 + BLAKE2s |
+| 复杂的握手与重协商 | 1-RTT 握手（Noise_IK） |
+| 几十万行代码 | 约 4000 行，在内核里 |
+| TCP 或 UDP，可配 | **只有 UDP** |
+| 有连接状态、有登录 | 无状态，公钥即身份 |
+
+代价是不灵活：套件被攻破就得整体升版本。收益是**攻击面小到可以审计完**，
+而且性能能跑到接近线速 —— 它就在内核里，不像 OpenVPN 要在用户态来回拷贝。
+
+还有一个安静的特性：**对未通过认证的包一律不回应**。所以对外扫端口扫不出 WireGuard，
+`nmap` 看到的就是一个没人应答的 UDP 端口。
+
+## Cryptokey Routing：公钥就是路由表
+
+这是理解 WireGuard 唯一需要真正想清楚的概念。它没有"用户"，只有一张对应表：
+
+```
+公钥 A  ←→  AllowedIPs 10.0.0.2/32, 192.168.50.0/24
+公钥 B  ←→  AllowedIPs 10.0.0.3/32
+```
+
+**`AllowedIPs` 有两个作用，方向相反：**
+
+| 方向 | 含义 |
+| --- | --- |
+| **出方向** | 目的地址落在这个范围里 → 用这个 peer 的公钥加密并发给它 |
+| **入方向** | 从这个 peer 解密出来的包，源地址必须落在这个范围里，否则丢弃 |
+
+也就是说它既是**路由表**又是**访问控制表**。这一条解释了 90% 的 WireGuard 故障。
+
+<Callout type="trap" title="AllowedIPs 不对称 = 单向通">
+一端写 `AllowedIPs = 10.0.0.0/24`，另一端只写 `AllowedIPs = 10.0.0.2/32`，
+结果是**去得了回不来**（或反之），而且**没有任何报错** —— 包在入方向校验时被静默丢掉。
+
+排查方法：两端各跑一次 `wg show`，把 `allowed ips` 抄下来对照。
+再看 `transfer` 那一行：如果一端只有 `sent` 在涨、`received` 是 0，方向就定位到了。
+</Callout>
+
+## 最小可用配置
+
+私钥永不外传，只交换公钥：
+
+```bash
+umask 077
+wg genkey | tee privatekey | wg pubkey > publickey
+```
+
+```ini
+# 服务端 /etc/wireguard/wg0.conf
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <服务端私钥>
+
+[Peer]
+PublicKey = <客户端公钥>
+AllowedIPs = 10.0.0.2/32
+```
+
+```ini
+# 客户端 /etc/wireguard/wg0.conf
+[Interface]
+Address = 10.0.0.2/24
+PrivateKey = <客户端私钥>
+
+[Peer]
+PublicKey = <服务端公钥>
+Endpoint = vpn.example.com:51820
+AllowedIPs = 10.0.0.0/24
+PersistentKeepalive = 25
+```
+
+```bash
+wg-quick up wg0                        # 起
+wg show                                # 看状态
+systemctl enable --now wg-quick@wg0    # 开机自启
+```
+
+注意两处不对称：
+
+- **只有服务端写 `ListenPort`**，客户端不需要（它主动出去，用随机源端口）
+- **只有客户端写 `Endpoint`**，服务端不需要 —— 它靠收到的认证包**自动学习**对方地址。
+  这就是 WireGuard 的漫游能力：客户端从 WiFi 切到 4G，IP 变了，隧道不断
+
+`PersistentKeepalive` 的规则是：WireGuard 默认**完全静默**，没有流量时一个包都不发，
+NAT 表项超时后外面就再也进不来了。所以**在 NAT 后面、且需要被对方主动连接的那一端**
+配 `PersistentKeepalive = 25`（比多数 NAT 的 UDP 超时短）。公网固定地址的一侧不需要。
+
+`wg-quick` 不只是起接口，它还**按 `AllowedIPs` 自动装路由** —— 所以
+`AllowedIPs = 0.0.0.0/0` 的效果是"所有流量都进隧道"（用 fwmark + 策略路由实现，
+避免把发给对端 `Endpoint` 自己的包也送进隧道形成死循环）。
+
+## MTU：必须算的一笔账
+
+WireGuard 把原包塞进 UDP，外层开销是固定的：
+
+```
+IPv4 外层：20（IP）+ 8（UDP）+ 16（WG 头）+ 16（Poly1305 认证标签）= 60 字节
+IPv6 外层：40（IP）+ 8（UDP）+ 16（WG 头）+ 16（认证标签）      = 80 字节
+```
+
+所以物理 MTU 1500 时：只走 IPv4 是 `1500 − 60 = 1440`，可能走 IPv6 是
+`1500 − 80 = 1420` —— **`wg-quick` 的默认值就是按后者算的**，保守但安全。
+外层路径本身 MTU 更小（PPPoE 拨号常见 1492）还要再减。
+
+<Callout type="warn" title="又是那个「小包通、大包卡」">
+MTU 配大了的症状很有辨识度：ping 通、SSH 能登、`curl` 小接口正常，
+一传大文件或返回大 JSON 就**卡住**。任何封装隧道（后面 K8s 的 overlay 也一样）都是这个症状。
+
+验证方法是发不允许分片的大包：
+
+```bash
+# 隧道内测：1420 − 28 = 1392
+ping -M do -s 1392 10.0.0.1
+```
+
+不通就往下调，直到通为止，然后把这个值写进配置的 `MTU =`。
+</Callout>
+
+## 访问对端整个内网
+
+服务端不只做隧道端点，还要转发：
+
+```ini
+[Interface]
+Address = 10.0.0.1/24
+ListenPort = 51820
+PrivateKey = <私钥>
+PostUp   = sysctl -w net.ipv4.ip_forward=1
+PostUp   = iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE
+```
+
+客户端把要访问的内网段加进 `AllowedIPs`（`10.0.0.0/24, 192.168.50.0/24`）。
+想让全部出网流量都从服务端走，就写 `0.0.0.0/0, ::/0`，并且别忘了配 `DNS =`，
+否则 DNS 还在用本地的。
+
+<Callout type="trap" title="隧道通了但访问不了对端内网的其它机器">
+检查三件事，顺序别乱：
+
+1. 客户端的 `AllowedIPs` 里**有没有那个内网段**（没有 = 包压根不进隧道）
+2. 服务端 `net.ipv4.ip_forward` 是不是 1（没开 = 收到了不转发）
+3. 有没有 `MASQUERADE`（没有 = 内网机器收到源地址是 10.0.0.x 的包，不知道往哪回）
+
+三件事各自都会造成"隧道显示正常但业务不通"，而 `wg show` 全都看不出来。
+</Callout>
+
+<PacketPathExplorer only={["wireguard"]} />
+
+## 排障：三行看完就够
+
+```
+peer: yyyyy
+  endpoint: 203.0.113.5:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 43 seconds ago
+  transfer: 1.24 GiB received, 3.81 GiB sent
+```
+
+| 看哪一行 | 说明什么 |
+| --- | --- |
+| **latest handshake** | 没有这一行 = 从没握手成功（网络不通、端口被封、公钥配错） |
+| **transfer** | 只有一个方向在涨 = `AllowedIPs` 不对称或对端没回 |
+| **allowed ips** | 两端对照，这是最高频的配错项 |
+
+握手都建立不起来时按顺序排除：
+
+```bash
+nc -zvu vpn.example.com 51820                  # UDP 端口通不通（TCP 工具在这没用）
+tcpdump -i eth0 -nn udp port 51820 -c 10       # 服务端确认包收到了
+wg show wg0 public-key                         # 最常见：把私钥当公钥贴上去了
+```
+
+<Callout type="note" title="UDP 被整体阻断时 WireGuard 无解">
+WireGuard 只跑 UDP，也**不会自动降级到 TCP**。有些网络（酒店、部分企业出口）
+把 UDP 全封了，这时候唯一的办法是在外面再套一层 TCP 隧道，或者改用本身就走 TCP 的方案。
+
+Tailscale 用 DERP 中继解决了这个问题 —— 下面就讲。
+</Callout>
+
+---
+
+# 二、Tailscale：把密钥分发自动化
+
+## 手工 WireGuard 的成本在哪
+
+上面的配置只有两个节点。加到 10 个节点、要两两直连呢？
+
+```
+每个节点要认识另外 9 个 peer  →  10 × 9 = 90 个隧道端点配置
+新增 1 个节点                 →  要改 10 台机器的配置
+```
+
+传统办法是退回**中心辐射**（hub-and-spoke）：所有人连一台集中器。代价是绕路 ——
+纽约的客户端访问纽约的服务器，却要先跑一趟旧金山的集中器，延迟付两遍。
+
+Tailscale 的解法是：**把"交换配置"这件事自动化，把"传数据"这件事保持点对点。**
+
+```
+        控制面（中心辐射，只传密钥和策略，几乎没有流量）
+                  ┌─────────────┐
+                  │  协调服务器  │
+                  └──┬───┬───┬──┘
+                  ┌──▼─┐┌─▼──┐┌▼───┐
+                  │节点││节点││节点│
+                  └──┬─┘└─┬──┘└┬───┘
+                     └────┼────┘
+        数据面（全互联网格，WireGuard 直连）
+```
+
+控制面是中心辐射的，但这不重要，因为**它几乎不承载流量**；数据面才是网格，
+处理能力随节点数一起增长，不存在集中器那样的吞吐天花板。数据面用的是 WireGuard
+的用户态实现（`wireguard-go`），不依赖内核模块，容器和各种奇怪平台上都能跑。
+
+## 协调服务器是个"公钥投递箱"
+
+官方原话是 "a shared drop box for public keys"：每个节点自己生成密钥对，
+上传**公钥** + 当前能被访问到的地址，下载同域内其它节点的公钥和地址，用它们配置本地 WireGuard。
+
+**私钥永远不离开节点。** 所以协调服务器看得到公钥、节点地址、域归属和 ACL 策略，
+看不到私钥，因此也无法解密任何流量。身份认证外包给 IdP（OAuth2 / OIDC / SAML）——
+它已经掌握了你的用户列表、密码和 2FA，不需要再维护第二套账号体系。
+
+## NAT 穿透与 DERP 兜底
+
+节点在咖啡馆、在 4G、在层层 NAT 后面，两边都没有开放端口。Tailscale 走的是
+**STUN / ICE** 那套标准技术（而不是 UPnP），收益是**不需要在防火墙上开任何入向端口**。
+
+有些网络直接封禁 UDP，STUN/ICE 无能为力。这时候会退到 **DERP**
+（Designated Encrypted Relay for Packets）：
+
+| 特点 | 说明 |
+| --- | --- |
+| 角色 | 相当于 ICE 里的 TURN，但用 **HTTPS 流 + WireGuard 密钥** |
+| 触发条件 | **兜底**，直连打不通时才用 |
+| 能否解密 | **不能** —— 私钥不离开节点，它只转发已加密的字节 |
+| 附带好处 | 等于给 WireGuard 补上了它原生没有的 TCP 回退 |
+
+```bash
+tailscale status      # 每个 peer 是直连（direct）还是走中继（relay）
+tailscale netcheck    # NAT 类型、UDP 是否可用、各 DERP 的 RTT
+tailscale ping nas    # 测某个节点实际走的哪条路
+```
+
+<Callout type="tip" title="性能不对时先看是不是在走 DERP">
+中继会明显增加延迟。`tailscale status` 里如果某个 peer 一直标着 `relay`，
+就该查为什么打不通直连：出口是不是封了 UDP、是不是对称 NAT，
+或者干脆给其中一端开个公网端口（出口节点尤其值得这么做）。
+
+`tailscale netcheck` 会直接报告 UDP 是否可用、NAT 是否 hairpinning、各 DERP 的 RTT，
+比猜快得多。
+</Callout>
+
+## ACL 与接入遗留网络
+
+网格架构没有集中的卡点，策略就**在每一个节点上执行**：解密时把不允许的入向连接丢掉。
+还有一层更彻底的保护：**协调服务器只会把"允许访问你"的那些节点的公钥发给你** ——
+未获授权的机器连发起请求的资格都没有。
+
+策略用 HuJSON 集中维护，以**身份**为单位而不是以 IP 为单位：
+
+```jsonc
+{
+  "acls": [
+    { "action": "accept", "src": ["group:sre"], "dst": ["tag:prod:22,6443"] },
+    { "action": "accept", "src": ["tag:ci"],    "dst": ["tag:registry:443"] },
+    // 其余默认拒绝
+  ],
+}
+```
+
+不可能给所有设备都装客户端（打印机、老服务器、网络设备），两个开关解决：
+
+```bash
+tailscale up --advertise-routes=192.168.50.0/24    # 子网路由器：整段内网接进来
+tailscale up --accept-routes                       # 其它节点要显式接受
+tailscale up --advertise-exit-node                 # 出口节点：所有出网流量从这台走
+```
+
+两者都要在管理后台**批准**，避免任意节点自己宣告路由。
+
+<Callout type="warn" title="子网路由器是端到端加密的唯一例外">
+子网路由器要**解密**流量再转发进物理内网，所以从它到内网设备的那一段是明文的。
+
+这不是缺陷而是必然 —— 内网里那台老设备不会说 WireGuard。但要意识到：
+**子网路由器是一个信任集中点**，它的补丁、访问控制和监控都要按边界网关的标准来做，
+而不是按普通节点。
+</Callout>
+
+---
+
+# 三、Pritunl：当问题变成身份与合规
+
+## 什么时候需要一套"VPN 系统"
+
+前两个方案解决的是**连通性**。企业场景里还有一类需求和连通性无关：
+
+| 需求 | WireGuard 裸配 | Tailscale | Pritunl |
+| --- | --- | --- | --- |
+| 谁能连、谁不能连 | 手工发密钥 | ACL + IdP | **组织与用户模型** |
+| 离职回收 | 手工删 peer | IdP 联动 | **后台点一下 / SSO 联动** |
+| 谁在什么时候连过 | 无 | 有日志 | **审计事件可导 SIEM** |
+| 强制 MFA | 无 | 靠 IdP | **内置 TOTP / 推送 / 设备认证** |
+| 给不懂技术的人发配置 | 手工 | 装客户端登录 | **邮件发 profile** |
+| 兼容既有 OpenVPN 客户端 | 不兼容 | 不兼容 | **兼容** |
+
+## 架构：MongoDB 是协调层
+
+Pritunl 有一个和其它方案很不一样的设计：**所有节点间通信都通过 MongoDB**，
+节点之间不直接通信。带来两个特性：**节点间不需要开防火墙互通**、**所有节点地位相等**，
+任何一个挂了其它的照常独立工作。
+
+<Callout type="warn" title="MongoDB 才是这套方案里真正的单点">
+很多人部署时按文档装个单机 MongoDB 就上线了，然后把精力全花在 VPN 节点的冗余上 ——
+方向反了。
+
+- MongoDB 用**副本集**（至少 3 节点），不要单机
+- **备份策略**要覆盖它：证书、用户、组织全在里面，丢了等于全部重来
+- VPN 节点反而好办：多装几台指向同一个 MongoDB 就是集群
+</Callout>
+
+## 对象模型与协议分工
+
+配置是三层结构，理解它就会配了：
+
+```
+组织（Organization）           ← 一组用户，比如「研发部」「外包」
+  └─ 用户（User）              ← 一个人一个，生成独立证书
+服务器（Server）               ← 一个 VPN 实例：监听端口、地址池、路由
+  └─ 挂载组织                  ← 决定哪些人能连这个服务器
+```
+
+关键点是**服务器和组织是多对多的**：一台"生产内网"服务器可以只挂运维组织，
+一台"测试环境"服务器同时挂研发和外包。换句话说 ——
+**权限边界靠"哪个组织挂在哪台服务器上"来划**。
+
+三种协议各管一段：**人接入用 WireGuard（性能）或 OpenVPN（兼容性，含 Chromebook
+这类受限平台）；网对网用 IPsec**（对端多半是传统设备或云网关）。
+
+<Callout type="tip" title="别默认下发 0.0.0.0/0">
+下发默认路由意味着**客户端的全部流量都走 VPN**：你的出口带宽要承载所有人的日常上网、
+用户体验变差、出口 IP 被滥用的风险落到你头上。
+
+**只下发真正需要的内网段**（分流模式）是绝大多数场景的正解 ——
+和 [Mihomo 分流规则](/learn/gfw/clash-rules) 里"该直连的直连"是同一个道理。
+只有明确要"统一出口审计"时才下发默认路由，而那需要单独评估带宽与合规。
+</Callout>
+
+## 核心价值：账号生命周期交给 IdP
+
+接上 SSO（SAML / Google Workspace / Okta / Entra / Duo / Radius）之后：
+
+| 事件 | 效果 |
+| --- | --- |
+| 新员工入职 | IdP 里加人 → 自动能连 |
+| 转岗 | 改 IdP 组 → 权限跟着变 |
+| **离职** | **IdP 停用 → VPN 立刻连不上** |
+
+这是它相对"手工发 WireGuard 配置"最大的差别：
+**手工发的密钥，人走了你得记得删；接了 SSO，停用账号就自动失效。**
+
+<Callout type="warn" title="SSO 在 Enterprise 档 —— 选型前先对照功能与档次">
+| 档次 | 关键能力 |
+| --- | --- |
+| **Community（免费）** | **一台服务器**，用户与设备数不限 |
+| **Premium** | 端口转发、gateway link 与失效切换、配置同步、邮件发密钥 |
+| **Enterprise** | **SSO、TPM/Secure Enclave 认证、自动故障切换、复制、VXLAN、站点互联与 IPsec、多云对等、高级审计、多管理员、API** |
+
+最容易踩的就是这条：**"接 SSO 做账号生命周期管理"往往正是选 Pritunl 的初衷**，
+而它在 Enterprise 档。如果预算只批了免费版，Pritunl 相对裸 WireGuard 的核心优势基本不存在。
+</Callout>
+
+<Callout type="trap" title="它会动主机防火墙">
+Pritunl 有"动态防火墙"设计，会自己往 iptables 里加规则。这意味着：
+
+- 你的主机加固脚本和它可能**互相覆盖** —— 和
+  [Pod 不通那一关](/learn/k8s/quest-pod-unreachable) 里安全加固规则拦掉 VXLAN 是同一类问题
+- 排查"连上了但访问不了内网"时，要同时看 **Pritunl 的路由配置**和**主机 iptables/nftables**
+- SELinux 策略同理
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="vpn-1"
+  question="WireGuard 里 AllowedIPs 的作用是什么？"
+  options={[
+    { text: '既决定出方向的包发给哪个 peer，也决定入方向允许该 peer 使用哪些源地址', correct: true },
+    { text: '只是路由表，指明目的地址走哪个 peer', feedback: '漏了入方向的校验作用 —— 这正是「单向通」故障的根源。' },
+    { text: '只是访问控制列表', feedback: '它同时也是出方向的路由依据。' },
+    { text: '给 peer 分配 IP 地址', feedback: '地址分配在 [Interface] 的 Address 里，AllowedIPs 不做分配。' },
+  ]}
+  explain={<>这就是 Cryptokey Routing：公钥是身份，AllowedIPs 同时充当路由表和 ACL。两端写得不对称就会出现去得了回不来，而且没有任何报错 —— 入方向的包被静默丢弃。两端各跑 wg show 对照 allowed ips 是最快的排查法。</>}
+/>
+
+<Quiz
+  id="vpn-2"
+  question="tailscale status 显示某个节点一直标着 relay。这意味着什么？"
+  options={[
+    { text: '直连没打通，流量在走 DERP 中继，延迟会明显偏高', correct: true },
+    { text: '连接更安全了', feedback: '加密强度不变 —— 中继看不到内容，但也没有额外的安全收益。' },
+    { text: '节点离线', feedback: '离线会显示 offline，走中继说明它是通的。' },
+    { text: 'ACL 拒绝了直连', feedback: 'ACL 控制的是能否通信，不决定走直连还是中继。' },
+  ]}
+  explain={<>DERP 是兜底路径。用 tailscale netcheck 查根因：常见是出口封了 UDP 或对称 NAT。DERP 用 HTTPS 流承载，因此也顺带给 WireGuard 补上了它原生没有的 TCP 回退能力。</>}
+/>
+
+<Quiz
+  id="vpn-3"
+  question="团队五十人要按权限接入内网，希望离职后自动失效。选型时最该先确认什么？"
+  options={[
+    { text: 'Pritunl 的 SSO 属于 Enterprise 档 —— 没有它，相对裸 WireGuard 的核心优势就不存在', correct: true },
+    { text: 'MongoDB 用哪个版本', feedback: '重要但不是选型的决定因素，副本集配置属于部署阶段的事。' },
+    { text: '客户端用 WireGuard 还是 OpenVPN 协议', feedback: '两个都支持，按性能与兼容性挑即可，不影响选型成败。' },
+    { text: '能不能下发 0.0.0.0/0', feedback: '技术上都能，而且多数场景恰恰不该下发。' },
+  ]}
+  explain={<>先把「必须有的功能」列出来对照档次：SSO、审计、复制、API、站点互联都在 Enterprise。选型的根本判断是「这是连通性问题还是身份与合规问题」—— 是后者才值得引入一套系统，而系统的价值恰恰锁在付费档里。</>}
+/>
+
+## 这节课的落点
+
+**WireGuard**
+
+- 只有一套加密算法、只走 UDP、约 4000 行代码在内核里；未认证的包一律不回应
+- **Cryptokey Routing**：公钥是身份，`AllowedIPs` 同时是路由表和入方向 ACL；
+  两端不对称 = 单向通且无报错，这是最高频的故障
+- 只有服务端写 `ListenPort`，只有客户端写 `Endpoint`（服务端自动学习，因此支持漫游）
+- NAT 后面需要被主动连接的一侧配 `PersistentKeepalive = 25`
+- MTU：IPv4 减 60、IPv6 减 80，`wg-quick` 默认 1420；症状是"小包通、大包卡"
+- 访问对端内网要三件套：客户端 `AllowedIPs` 含该网段 + 服务端 `ip_forward` + `MASQUERADE`
+- 排障只看三行：`latest handshake`、`transfer`、`allowed ips`
+
+**Tailscale**
+
+- 控制面中心辐射（只传密钥与策略），数据面全互联网格；**私钥永不离开节点**
+- NAT 穿透用 STUN/ICE 而不是 UPnP，不需要开放任何入向端口
+- **DERP 是兜底中继**，用 HTTPS 承载，读不到内容，顺带补上 WireGuard 缺的 TCP 回退
+- ACL 以身份为单位中心定义、每个节点执行；未授权节点连公钥都拿不到
+- `subnet router` 是端到端加密的**唯一例外**，按边界网关的标准对待它
+- 排障三条：`status`（直连还是中继）、`netcheck`（NAT 与 DERP 体检）、`ping`
+
+**Pritunl**
+
+- 判断标准：**这是连通性问题还是身份与合规问题** —— 后者才值得上一套系统
+- **MongoDB 是协调层也是真正的单点**：节点间零防火墙需求，但它要副本集 + 备份
+- 对象模型：**组织 × 服务器的挂载关系就是权限边界**
+- 路由**只下发必要内网段**，别默认给 `0.0.0.0/0`
+- 核心价值是账号生命周期交给 IdP，但 **SSO、审计、复制都在 Enterprise 档**
+- 它会动主机防火墙，与主机加固脚本可能互相覆盖，排障要两边一起看

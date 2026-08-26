@@ -1,0 +1,330 @@
+## 一个只在多网卡机器上出现的怪现象
+
+GPU 节点上八张 200G 网卡，地址配好了，`ping` 全通。然后开始出怪事：
+
+```bash
+# 从 mlx5_3 对应的网卡打，带宽只有别人的一半
+$ ib_send_bw -d mlx5_3 -x 3 10.10.3.20
+...
+ 65536      1000        0.00               11043.21           0.176691
+
+# 或者更直接的：这条命令根本不该有结果
+$ ping -I ens6f1 10.10.3.20      # 从第 4 张卡的网段 ping
+64 bytes from 10.10.3.20: icmp_seq=1 ttl=64 time=0.089 ms
+#   ↑ 明明 ens6f1 不在这个网段上，为什么通？
+```
+
+单机测什么都正常，一上多卡就开始"能通但不对"。根因不在网卡，不在交换机，
+在 **Linux 处理多网卡的默认方式**。
+
+## 根因：IP 属于主机，不属于网卡
+
+这是 Linux 网络最反直觉的一条设计，叫 **weak host model**：
+
+> 一个 IP 地址配在哪张网卡上，只决定它从哪儿"宣告"自己；
+> 内核认为**主机上的所有 IP 都是这台主机的**，任何一张网卡收到发给其中任一 IP 的包都会处理。
+
+两个直接后果：
+
+| 现象 | 名字 | 表现 |
+| --- | --- | --- |
+| 别人 ARP 询问 IP-A，IP-B 所在的网卡也会应答 | **ARP flux** | 对端把 IP-A 学到了错误的 MAC 上，流量走错网卡 |
+| 收包从 eth1 进来，回包按主路由表从 eth0 出去 | **非对称路由** | 有状态设备（防火墙、部分交换机）直接丢掉回包 |
+
+这两件事在单网卡机器上永远不会发生 —— 所以大多数人是在配 RoCE 的时候第一次撞见它。
+
+<Callout type="note" title="RDMA 不走内核栈，为什么还受这个影响">
+数据平面确实不走内核栈，但**建连不是**。RoCEv2 的地址解析（`rdma_cm`）要查内核路由表
+才能决定用哪个 RDMA 设备、哪个源地址、哪个 GID index。
+
+所以路由选错 → 设备选错 → 要么直接连不上，要么连上了但走的不是你以为的那张卡。
+`ib_send_bw` 显示的带宽是真的，只是它测的不是你想测的那条链路。
+</Callout>
+
+## 第一个旋钮：rp_filter
+
+反向路径过滤（Reverse Path Filtering）会检查"这个源地址的包，从这张网卡进来合不合理"。
+三个取值：
+
+| 值 | 行为 | 多网卡场景下 |
+| --- | --- | --- |
+| `0` | 不检查 | 能用，但丢掉了一层防伪造保护 |
+| `1` | **严格**：回程路由必须正好指向收包的这张网卡 | **会丢包** —— 多网卡下回程路由常常指向别的卡 |
+| `2` | 松散：只要回程从任意一张网卡可达就放行 | **推荐** |
+
+```bash
+# 查当前值
+sysctl net.ipv4.conf.all.rp_filter net.ipv4.conf.ens6f1.rp_filter
+
+# 改成松散模式
+sysctl -w net.ipv4.conf.all.rp_filter=2
+sysctl -w net.ipv4.conf.default.rp_filter=2
+```
+
+<Callout type="trap" title="只改单张网卡不生效 —— 内核取的是两者的最大值">
+生效值是 `max(conf.all.rp_filter, conf.<dev>.rp_filter)`，不是网卡的值覆盖全局。
+
+所以 `conf.all` 是 `1` 时，把 `conf.ens6f1` 设成 `0` 完全没用，
+它仍然按严格模式过滤。**必须先把 `conf.all` 降下来**，再按需给个别网卡单独收紧。
+
+这条规则每年都要坑一批人，因为 `sysctl -a | grep rp_filter` 输出几十行，
+一眼看过去以为改对了。
+</Callout>
+
+## 第二个旋钮：arp_ignore 与 arp_announce
+
+这两个直接治 ARP flux。
+
+```bash
+# 只有目标 IP 就配在收包的这张网卡上，才应答 ARP
+sysctl -w net.ipv4.conf.all.arp_ignore=1
+# 发 ARP 请求时，源地址用本网段最合适的那个，而不是随便挑一个本机地址
+sysctl -w net.ipv4.conf.all.arp_announce=2
+```
+
+| 参数 | 默认 | 该设成 | 为什么 |
+| --- | --- | --- | --- |
+| `arp_ignore` | `0`（任意网卡都替所有本机 IP 应答） | `1` | 阻止对端把 IP 学到错误的 MAC 上 |
+| `arp_announce` | `0`（源地址随便挑） | `2` | 阻止对端的 ARP 表被本机自己污染 |
+
+`1` / `2` 这一组是多网卡机器的标准配法。它和 `rp_filter=2` 是配套的：
+前者管"别人怎么认识我"，后者管"我怎么接受别人的包"。
+
+## 第三步：一张卡一张路由表
+
+前两步解决了 ARP 和收包，还剩**回包从哪张网卡出去**。默认只有一张主路由表，
+所有回包都按它选路 —— 这就是非对称路由的来源。
+
+解法是**策略路由**：给每张网卡一张自己的路由表，再用 `ip rule` 按源地址把包送进对应的表。
+
+```bash
+# 一次性给表起名字，后面用名字比用数字好读
+cat >> /etc/iproute2/rt_tables <<'EOF'
+101 rail0
+102 rail1
+EOF
+
+# rail0：ens6f0，地址 10.10.0.10/24，网关 10.10.0.1
+ip route add 10.10.0.0/24 dev ens6f0 src 10.10.0.10 table rail0
+ip route add default via 10.10.0.1 dev ens6f0 table rail0
+ip rule add from 10.10.0.10/32 table rail0 priority 1001
+
+# rail1：ens6f1，地址 10.10.1.10/24，网关 10.10.1.1
+ip route add 10.10.1.0/24 dev ens6f1 src 10.10.1.10 table rail1
+ip route add default via 10.10.1.1 dev ens6f1 table rail1
+ip rule add from 10.10.1.10/32 table rail1 priority 1002
+```
+
+规则的意思是：**凡是源地址为 10.10.1.10 的包，一律查 rail1 这张表**。
+回包的源地址天然就是收包时的目的地址，所以它一定会从收包的那张卡出去 —— 对称了。
+
+验证不靠推理，让内核自己说：
+
+```bash
+# 指定源地址查路由，看内核选了哪张卡
+$ ip route get 10.10.1.20 from 10.10.1.10
+10.10.1.20 from 10.10.1.10 dev ens6f1 table rail1 uid 0
+
+# 不带 from 查的是主路由表，两者结果不同才是正常的
+$ ip route get 10.10.1.20
+10.10.1.20 via 10.0.0.1 dev eno1 src 10.0.0.10
+
+# 规则列表，priority 小的先匹配
+$ ip rule show
+0:      from all lookup local
+1001:   from 10.10.0.10 lookup rail0
+1002:   from 10.10.1.10 lookup rail1
+32766:  from all lookup main
+```
+
+<Callout type="tip" title="ip route get 是这一节最该记住的命令">
+多网卡机器上的路由表加起来常有几十条，外加十几条 `ip rule`，人工推理错误率极高。
+
+`ip route get <目的地> from <源地址>` 直接给出**内核真实的决策结果**：出口网卡、
+下一跳、命中了哪张表。任何"它到底走哪张卡"的争论，一条命令就能结束。
+</Callout>
+
+## 回到 RoCE：两种网段方案
+
+多 rail 的 GPU 节点有两种地址规划，代价完全不同：
+
+| 方案 | 每 rail 独立网段 | 全部 rail 同一网段 |
+| --- | --- | --- |
+| 例子 | rail0 `10.10.0.0/24`、rail1 `10.10.1.0/24`… | 八张卡都在 `10.10.0.0/21` |
+| ARP flux | **不会发生**（网段不重叠） | 必然发生，必须配 `arp_ignore/announce` |
+| 策略路由 | **可以不配** | **必须配** |
+| 地址消耗 | 每 rail 一段，规划表更长 | 一段搞定 |
+| 排障难度 | 低：看 IP 就知道是哪个 rail | 高：得查 ARP 表和路由才知道走了哪张卡 |
+
+**优先选每 rail 独立网段** —— DGX SuperPOD 参考架构就是这么划的，
+它用地址规划把这一整类问题消灭在发生之前。同网段方案省的那点地址，
+远远抵不上后面排障花的时间。
+
+已经是同网段的存量集群没法改怎么办：把这一节的三步全配上，
+并且**在验收清单里加一条** —— 每张卡单独跑一次 `ib_send_bw`，
+确认八次测出来的是八条不同的链路，而不是同一条测了八遍。
+
+```bash
+# 逐卡验收：设备名、GID index、源地址三者要对得上
+for i in 0 1 2 3 4 5 6 7; do
+  echo "=== mlx5_$i ==="
+  ibdev2netdev | grep "mlx5_$i "
+  show_gids mlx5_$i | grep v2 | head -2
+done
+```
+
+## 持久化：三种发行版写法
+
+手敲的 `ip rule` / `ip route` **重启就没了**，而且网卡重新拉起也会丢。三种常见写法：
+
+```yaml
+# netplan（Ubuntu Server）—— /etc/netplan/60-rails.yaml
+network:
+  version: 2
+  ethernets:
+    ens6f1:
+      addresses: [10.10.1.10/24]
+      routes:
+        - to: default
+          via: 10.10.1.1
+          table: 102
+        - to: 10.10.1.0/24
+          scope: link
+          table: 102
+      routing-policy:
+        - from: 10.10.1.10/32
+          table: 102
+```
+
+```ini
+# systemd-networkd —— /etc/systemd/network/60-rail1.network
+[Match]
+Name=ens6f1
+
+[Network]
+Address=10.10.1.10/24
+
+[Route]
+Gateway=10.10.1.1
+Table=102
+
+[RoutingPolicyRule]
+From=10.10.1.10/32
+Table=102
+```
+
+```bash
+# NetworkManager
+nmcli connection modify rail1 \
+  ipv4.routes "0.0.0.0/0 10.10.1.1 table=102" \
+  ipv4.routing-rules "priority 1002 from 10.10.1.10/32 table 102"
+```
+
+sysctl 那几项同样要落盘：
+
+```bash
+cat > /etc/sysctl.d/90-multinic.conf <<'EOF'
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.arp_ignore = 1
+net.ipv4.conf.all.arp_announce = 2
+EOF
+sysctl --system
+```
+
+<Callout type="warn" title="节点重装后最容易漏的就是这一份">
+这些配置不在任何应用的部署清单里，属于"装机时配一次、之后没人记得"的东西。
+节点故障重装、扩容加新节点时漏掉，症状就是**这一台的 busbw 明显低于其它节点**，
+而所有应用层配置看起来都一模一样。
+
+把它放进装机脚本或 Ansible playbook，并在验收清单里加一条 `ip rule show` 的比对。
+</Callout>
+
+## K8s 里是同一个坑
+
+给 Pod 插第二张网卡（MacVLAN / SR-IOV）之后，Pod 的 netns 里也是多网卡环境，
+同样的三个问题会原样重现一遍：Pod 里的默认路由指向主 CNI 的网卡，
+从次级网卡进来的流量回包会走主网卡出去。
+
+CNI 侧的对应做法：
+
+- Multus 的附加网络里通过 `ipam` 的 `routes` 给次级网卡下发明确路由
+- Spiderpool 提供了协调器（coordinator）专门处理这类多网卡路由，
+  它做的事本质上就是在 Pod netns 里配这套策略路由
+- 只有一个网段能用 `hostNetwork: true` 绕开整个问题 —— 代价是端口冲突
+
+## 排障顺序
+
+```bash
+# 1. 内核到底选了哪张卡（先问这个，别猜）
+ip route get <对端IP> from <本端IP>
+
+# 2. 规则和表在不在
+ip rule show
+ip route show table all | grep -v '^local'
+
+# 3. 对端把我的 IP 学到哪个 MAC 上了（在对端执行）
+ip neigh show | grep <本端IP>
+
+# 4. 过滤参数（注意看的是 all 那一行）
+sysctl -a 2>/dev/null | grep -E 'rp_filter|arp_ignore|arp_announce' | grep -v 'lo\.'
+
+# 5. RDMA 设备与网卡的对应关系有没有错位
+ibdev2netdev
+rdma link show
+```
+
+顺序是有讲究的：**先确认内核的决策，再去查它为什么这么决策**。
+反过来先翻配置文件，很容易在几十行路由里看花眼。
+
+## 检查点
+
+<Quiz
+  id="pr-1"
+  question="八卡 RoCE 节点上，把某张网卡的 rp_filter 设成 0 之后，丢包依旧。最可能的原因？"
+  options={[
+    { text: 'net.ipv4.conf.all.rp_filter 还是 1 —— 生效值取 all 与设备的最大值', correct: true },
+    { text: '需要重启网卡才生效', feedback: 'sysctl 立即生效，不需要重启接口。' },
+    { text: 'rp_filter 对 RDMA 流量无效', feedback: '控制面（建连、ARP、ICMP）走内核栈，一样受影响。' },
+    { text: '应该设成 1 而不是 0', feedback: '1 正是严格模式，多网卡下就是它在丢包。' },
+  ]}
+  explain={<>内核用 max(conf.all, conf.&lt;dev&gt;)，不是设备值覆盖全局。多网卡场景推荐把 all 设成 2（松散模式）：既允许非对称路由，又保留了一层防伪造保护，比直接设 0 更稳妥。</>}
+/>
+
+<Quiz
+  id="pr-2"
+  question="对端把本机 rail1 的 IP 学到了 rail0 网卡的 MAC 上，流量因此走错卡。该改哪个参数？"
+  options={[
+    { text: 'arp_ignore=1，让网卡只替配在自己身上的 IP 应答 ARP', correct: true },
+    { text: 'rp_filter=2', feedback: '那管的是收包方向的过滤，不影响 ARP 应答行为。' },
+    { text: '加一条 ip rule', feedback: '策略路由管的是出包选路，此时对端的 ARP 表已经错了。' },
+    { text: '把 MTU 调大', feedback: '与 MTU 无关。' },
+  ]}
+  explain={<>这就是 ARP flux：Linux 默认认为所有本机 IP 属于主机而非网卡，任一网卡都会替所有本机 IP 应答 ARP。配套还要把 arp_announce 设成 2，避免本机发出的 ARP 请求反过来污染对端表项。根治办法是每 rail 用独立网段。</>}
+/>
+
+<Quiz
+  id="pr-3"
+  question="新建 GPU 集群做地址规划，八个 rail 的网段该怎么划？"
+  options={[
+    { text: '每个 rail 一个独立网段，从源头上不产生 ARP flux 和非对称路由', correct: true },
+    { text: '八张卡共用一个大网段，省地址也省配置', feedback: '省下的地址远抵不上后面排障的时间：必须配全 arp_ignore/announce 和策略路由，且看 IP 无法判断走的是哪个 rail。' },
+    { text: '给八张卡配同一个 IP，靠 bonding 分担', feedback: 'rail-optimized 拓扑要求每张卡独立对应一个 rail，bond 起来就失去了 rail 的意义。' },
+    { text: '不配 IP，RDMA 不需要', feedback: 'RoCEv2 跑在 UDP/IP 之上，地址与 GID 都依赖 IP 配置。' },
+  ]}
+  explain={<>DGX SuperPOD 参考架构就是每 rail 独立网段。这是典型的用规划消灭问题：网段不重叠，ARP flux 不会发生，策略路由也可以不配，看一眼 IP 就知道流量在哪个 rail 上。存量的同网段集群只能靠这一节的三步补救。</>}
+/>
+
+## 这节课的落点
+
+- Linux 是 **weak host model**：IP 属于主机不属于网卡，多网卡下必然出现
+  **ARP flux** 与**非对称路由**
+- RDMA 数据面不走内核栈，但**建连要查内核路由表**选设备与 GID —— 路由选错就是设备选错
+- `rp_filter` 生效值是 **`max(all, dev)`**，多网卡场景把 `all` 设成 `2`（松散）
+- `arp_ignore=1` + `arp_announce=2` 是多网卡机器的标准配法，治的是"别人怎么认识我"
+- 策略路由三件套：**一张卡一张表**、`ip rule` 按源地址分流、`ip route get ... from ...` 验证
+- **`ip route get <目的> from <源>` 是本节最该记住的命令** —— 让内核直接告诉你结果，不要人工推理
+- 地址规划优先**每 rail 一个独立网段**，从源头消灭整类问题；同网段方案必须把三步配全
+- 配置要落盘（netplan / systemd-networkd / NetworkManager + `sysctl.d`），
+  否则**重装节点后症状就是这台机器 busbw 偏低**
+- K8s 里给 Pod 插第二张网卡是同一个坑，靠 Multus 的路由下发或 Spiderpool 的协调器解决

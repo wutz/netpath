@@ -1,0 +1,172 @@
+## 为什么把这件事放在第一节
+
+网络这个方向的一手资料，绝大部分在海外：内核邮件列表与 `git.kernel.org` 的提交记录、
+RFC 与 IETF 草案、Kubernetes 与 Cilium 的设计文档、NVIDIA 的参考架构白皮书、
+各家厂商的 KB 与故障公告、Stack Overflow 与 GitHub issue 里那些"和你一模一样的报错"。
+
+中文二手资料的问题不是翻译质量，是**时效与深度**：一篇讲 RoCE 调优的博客可能对应三年前的
+驱动版本，而你手上的卡是去年的。查一手资料不是讲究，是**能不能查到正确答案**的分水岭。
+
+所以这一整个分类排在最前面 —— 它不解决任何网络原理问题，
+但它决定了你后面每一节能读到什么。这一节先做的事是**诊断**：
+"打不开"有四种完全不同的原因，先分清楚，才知道要不要往下走。
+
+## 先做正确的诊断
+
+"打不开"是症状，不是原因。工程师能做的第一件有价值的事，是把它归到某一类：
+
+| 症状 | 表现 | 归类 |
+| --- | --- | --- |
+| 域名解析到了明显不对的地址 | `dig` 结果和权威 DNS 不一致 | **DNS 层面** |
+| TCP 连上了，TLS 握手时断 | `curl -v` 卡在握手后 `Connection reset` | **握手阶段被打断** |
+| SYN 发出去没人应 | `nc -zv` 超时，`traceroute` 在某跳后消失 | **地址不可达** |
+| 能连、能传，但极慢 | 吞吐只有几十 KB/s，重传率高 | **限速或丢包** |
+
+四类的处置方式完全不同，混在一起猜会浪费大量时间。
+
+## 一套诊断命令
+
+```bash
+# 1. DNS：换不同解析器对比，结果不一致就是解析层面的问题
+dig +short github.com @1.1.1.1
+dig +short github.com @8.8.8.8
+dig +short github.com                    # 本地/运营商 DNS
+# 用 DoH 拿一个可信参照
+curl -s 'https://cloudflare-dns.com/dns-query?name=github.com&type=A' \
+  -H 'accept: application/dns-json' | jq -r '.Answer[].data'
+
+# 2. TCP 可达性：先确认三次握手本身成不成
+nc -zv github.com 443
+# 在哪一跳消失
+traceroute -T -p 443 github.com
+
+# 3. TLS 握手：分辨是连不上还是握手被打断
+curl -vI --connect-timeout 5 https://github.com 2>&1 | tail -20
+openssl s_client -connect github.com:443 -servername github.com </dev/null 2>&1 | head -15
+
+# 4. 绕过 DNS 直接测某个 IP，用来验证"是 DNS 的问题还是 IP 的问题"
+curl -vI --resolve github.com:443:140.82.121.4 https://github.com
+
+# 5. 速度与稳定性
+curl -o /dev/null -w '%{speed_download}\n' https://speed.cloudflare.com/__down?bytes=10000000
+nstat -az | grep -iE 'retrans|timeout'
+```
+
+<Callout type="tip" title="第 4 条是最有价值的一条">
+`curl --resolve` 让你**跳过 DNS 直接指定 IP**。它把两个变量分开了：
+
+- `--resolve` 指定正确 IP 后能通 → 问题在 **DNS 解析**
+- 指定正确 IP 仍不通 → 问题在 **连接层**（地址不可达或握手被打断）
+
+一条命令把诊断范围砍掉一半。同样的思路适用于任何"域名相关"的疑难问题，
+不只是受限网络场景。
+</Callout>
+
+## 判断树
+
+```
+拉不下依赖 / 打不开文档
+   │
+   ├─ dig 各解析器结果不一致，或返回明显不对的地址
+   │     → DNS 层面：换加密 DNS（DoH/DoT），或让代理侧解析（socks5h）
+   │
+   ├─ nc -zv 超时、traceroute 在某跳后消失
+   │     → 地址层面：这个出口到该目标不可达，需要换出口
+   │
+   ├─ TCP 通但 TLS 握手阶段断开
+   │     → 握手阶段被打断：需要隧道把握手包裹在另一层里
+   │
+   └─ 都正常但极慢、重传高
+         → 限速或链路质量：换线路，或先确认不是自己这端的问题（L0 那套体检）
+```
+
+<Callout type="note" title="很多情况根本不需要隧道">
+在下结论之前先试镜像源——对开发者场景，这往往是**更快、更稳、也更省事**的答案：
+
+| 生态 | 镜像方案 |
+| --- | --- |
+| Go | `GOPROXY=https://goproxy.cn,direct` |
+| Python | `pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple` |
+| Node | `npm config set registry https://registry.npmmirror.com` |
+| Rust | `~/.cargo/config.toml` 里配 crates.io 镜像 |
+| 容器镜像 | 公司内部 Harbor / 镜像加速，或自建 pull-through cache |
+| 系统包 | 换 apt/yum 的镜像源 |
+
+镜像的好处是**没有额外链路、没有隧道可断、CI 里也能用**。
+只有镜像覆盖不到的场景（文档站点、issue 讨论、私有仓库、某些 SDK 下载）才需要往下走。
+</Callout>
+
+## 走到这一步才需要隧道
+
+判断树最后两条（地址不可达、握手被打断）落到同一个结论：**需要一条自己的出口**。
+
+到这里先停一下，把顺序理清楚 —— 后面两节分别解决两个问题：
+
+| 问题 | 在哪一节 |
+| --- | --- |
+| 出口本身怎么来：选机器、选线路、选协议、配服务端 | 下一节 |
+| 流量怎么分：什么走代理、什么直连、内网域名怎么办 | 再下一节 |
+
+顺序不能反。**先有一条稳的线，再谈分流规则** —— 线本身不稳的时候调规则，
+只会把两个变量搅在一起，怎么调都像是没效果。
+
+## 用途与边界
+
+<Callout type="warn" title="限定用途">
+这一阶段的内容面向**技术资料访问与问题排查**：拉依赖、看官方文档、读 issue 讨论、
+访问上游代码仓库。
+
+三条实际的纪律：
+
+- **遵守所在地法律法规与所在公司的网络与合规政策**，公司资产上的任何网络改动先走内部流程
+- **不要把它变成绕过公司安全管控的通道**：审计、DLP、零信任策略存在是有原因的，
+  绕过它们通常违反雇佣协议
+- **技术手段本身中立，用途不中立**。本站只讨论原理、配置与排障，不涉及其它用途
+</Callout>
+
+## 检查点
+
+<Quiz
+  id="rn-1"
+  question="pip install 一直超时。用 curl --resolve 指定正确 IP 后能正常访问。问题在哪一层？"
+  options={[
+    { text: 'DNS 解析 —— 本地解析到的地址不对', correct: true },
+    { text: 'TLS 握手被打断', feedback: '若是握手问题，指定正确 IP 后仍然会断。' },
+    { text: '目标 IP 不可达', feedback: '指定 IP 后能通，说明这个 IP 是可达的。' },
+    { text: '链路限速', feedback: '限速表现为慢而不是超时，而且换 IP 不会立刻变好。' },
+  ]}
+  explain={<>--resolve 把 DNS 与连接两个变量分开了：指定 IP 后能通 = 解析层面的问题。对策是换加密 DNS（DoH/DoT）或用 socks5h 让代理侧解析。当然，pip 这个具体场景先换镜像源更省事。</>}
+/>
+
+<Quiz
+  id="rn-2"
+  question="dig 结果和权威 DNS 一致、nc -zv 能连上 443，但 curl 每次都停在 TLS 握手后被重置。属于哪一类？"
+  options={[
+    { text: '握手阶段被打断 —— 需要一条把握手包裹在另一层里的隧道', correct: true },
+    { text: 'DNS 层面的问题', feedback: '解析结果和权威一致，DNS 这一层已经排除了。' },
+    { text: '地址不可达', feedback: 'nc -zv 成功说明三次握手本身没问题，地址是可达的。' },
+    { text: '链路限速', feedback: '限速表现为慢而不是在固定阶段被重置。' },
+  ]}
+  explain={<>四类症状的处置完全不同，这是唯一一类换 DNS 或换镜像源都救不了的：TCP 通、握手断，说明中间设备在看 TLS 握手里的明文信息（SNI）并据此干预。往下走才需要自己的出口。</>}
+/>
+
+<Quiz
+  id="rn-3"
+  question="团队 CI 需要长期稳定拉取境外依赖。最优先该做什么？"
+  options={[
+    { text: '搭内部镜像源或 pull-through 缓存，把依赖拉取变成内网请求', correct: true },
+    { text: '在每个 CI runner 上配代理', feedback: '可行但脆弱：隧道一断整条流水线红，而且每个 runner 都要维护。' },
+    { text: '让每个开发者本地下载后提交到仓库', feedback: '仓库会迅速膨胀，而且版本管理会失控。' },
+    { text: '给 CI 装 VPN 客户端', feedback: '同样是把稳定性押在一条隧道上。' },
+  ]}
+  explain={<>CI 要的是确定性。镜像源/缓存让依赖拉取变成内网请求，既快又不依赖任何隧道存活，还顺带解决了上游删包、限流的问题。代理只应作为镜像覆盖不到时的兜底。</>}
+/>
+
+## 这节课的落点
+
+- 一手资料在海外，所以这件事排在最前面 —— 它决定你后面每一节能读到什么
+- 先诊断再动手：分清 **DNS 层面 / 地址不可达 / 握手被打断 / 限速** 四类
+- `curl --resolve` 是性价比最高的一条命令，一步把 DNS 与连接问题分开
+- **开发者场景优先用镜像源**：Go/pip/npm/cargo/容器镜像都有成熟方案，比隧道更稳
+- 走到"需要隧道"这一步之后，**先解决出口本身（下一节），再解决分流规则（再下一节）**，顺序别反
+- 用途限定在技术资料访问，遵守当地法规与公司合规政策
