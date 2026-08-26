@@ -1,12 +1,10 @@
-import { type ReactNode, useState } from 'react'
+import type { ReactNode } from 'react'
 import { Link, createFileRoute } from '@tanstack/react-router'
 import {
   DEPTH_LABEL,
   DEPTH_STYLE,
   LEVEL_CHIP,
-  allLessons,
   getDepth,
-  groupedLessons,
   learningPath,
   lessonKey,
   stats,
@@ -37,17 +35,17 @@ function Progress({ percent }: { percent: number }) {
 /**
  * 首页就是那一条路径本身。
  *
- * 原来这里是四个岗位标签，各自给一份裁剪过的清单 —— 但选岗位本身就是一道题：
- * 刚入门的人还不知道自己会去哪个岗位，先被要求选一个，反而卡在了第一步。
- * 现在只留一条从头走到尾的完整路径，顺序按「学得动」排好，进来就能开始。
- * 五个分类的全量目录折叠在最底下，想按主题跳的人从那里进。
+ * 这里先后砍掉了两样东西。一是四个岗位标签 —— 选岗位本身就是一道题，
+ * 刚入门的人还不知道自己会去哪个岗位，先被要求选一个，反而卡在第一步。
+ * 二是底下那个折叠的「全部课程」目录 —— 路径已经收了全部课程，
+ * 同一批课在一页上列两遍，只会让人怀疑这两份清单是不是不一样。
+ *
+ * 现在页面上只有一条线。按主题归类的那个视角没有丢，收在结尾一行分类入口里，
+ * 通往 /tracks 各分类页。
  */
 function Home() {
   const progress = useProgress()
   const doneSet = new Set(progress.done)
-  const doneCount = allLessons.filter(({ track, lesson }) =>
-    doneSet.has(lessonKey(track.id, lesson.id)),
-  ).length
 
   return (
     <div>
@@ -69,7 +67,7 @@ function Home() {
       </header>
 
       <PathPanel doneSet={doneSet} />
-      <Catalog doneSet={doneSet} doneCount={doneCount} />
+      <TrackLinks doneSet={doneSet} />
     </div>
   )
 }
@@ -183,147 +181,47 @@ function PathPanel({ doneSet }: { doneSet: Set<string> }) {
         ))}
       </div>
 
-      <p className="mt-6 text-sm leading-relaxed text-mute">
-        路径的顺序和左边那枚分类标签不是一回事 —— 标签说的是课属于哪个主题，
-        顺序说的是什么时候学它最省力。想按主题通读，展开下面的全部课程。
-      </p>
     </>
   )
 }
 
 /**
- * 全部课程：五个分类，每个分类按小组展开。
+ * 结尾的分类入口。
  *
- * 和上面那条路径是同一批课，只是换个切法：路径按学习顺序排，这里按主题归类，
- * 也是 /tracks 各分类页的入口，所以不能省掉。默认折叠，只留一行「已完成 N/50」在外面。
+ * 上面那条路径已经是全部 50 节课，所以这里不再重列一遍课程，
+ * 只留五个分类的入口 —— 它们通往 /tracks 各分类页，是「按主题读」这个视角的去处，
+ * 顺带给出每个分类各自的进度。
  */
-function Catalog({ doneSet, doneCount }: { doneSet: Set<string>; doneCount: number }) {
-  const [open, setOpen] = useState(false)
-  const percent = Math.round((doneCount / stats.lessonCount) * 100)
-  // 跳过还没写正文的课，别把人送到大纲占位页上
-  const resume =
-    allLessons.find(
-      ({ track, lesson }) =>
-        lesson.status === 'ready' && !doneSet.has(lessonKey(track.id, lesson.id)),
-    ) ?? allLessons[0]
-
+function TrackLinks({ doneSet }: { doneSet: Set<string> }) {
   return (
-    <div className="mt-6 rounded-lg bg-canvas px-5 py-5 shadow-soft sm:px-6 sm:py-6">
-      <button
-        type="button"
-        onClick={() => setOpen(!open)}
-        aria-expanded={open}
-        className="flex w-full flex-wrap items-baseline gap-x-2 gap-y-1 text-left"
-      >
-        <span className="font-medium text-ink">全部课程</span>
-        <span className="font-mono text-[11px] text-mute">
-          {stats.trackCount} 个分类 · {stats.lessonCount} 节 · 约{' '}
-          {Math.round(stats.totalMinutes / 60)} 小时 · 已完成 {doneCount}/{stats.lessonCount}
-        </span>
-        <span className="ml-auto shrink-0 text-xs font-medium text-brand-600">
-          {open ? '收起' : '展开'}
-        </span>
-      </button>
-      <div className="mt-3 flex items-center gap-3">
-        <Progress percent={percent} />
-        <span className="shrink-0 font-mono text-[11px] text-mute">{percent}%</span>
-      </div>
+    <div className="mt-12 border-t border-line pt-6">
+      <p className="max-w-2xl text-sm leading-relaxed text-mute">
+        路径的顺序和每行左边那枚分类标签不是一回事 —— 标签说的是课属于哪个主题，
+        顺序说的是什么时候学它最省力。想按主题通读某一块，从这里进：
+      </p>
 
-      {!open && (
-        <p className="mt-3 text-sm leading-relaxed text-mute">
-          想按主题通读，或者只想直接切进某一块，就从这里进去。
-          分类是{' '}
-          <span className="font-mono">GFW → SSH → ETH → HPC → K8S</span>。
-        </p>
-      )}
-
-      {open && (
-        <>
-          <Link
-            to="/learn/$trackId/$lessonId"
-            params={{ trackId: resume.track.id, lessonId: resume.lesson.id }}
-            className={ctaClass}
-          >
-            {doneCount > 0 ? '继续学习' : '从第一课开始'}
-            <span className="text-white/60">·</span>
-            <span className="font-normal text-white/80">{resume.lesson.title}</span>
-          </Link>
-
-          <div className="mt-6 space-y-3">
-            {tracks.map((track) => {
-              const groups = groupedLessons(track)
-              const lessonCount = groups.reduce((sum, g) => sum + g.lessons.length, 0)
-              const trackDone = groups.reduce(
-                (sum, g) =>
-                  sum + g.lessons.filter((l) => doneSet.has(lessonKey(track.id, l.id))).length,
-                0,
-              )
-
-              return (
-                <article key={track.id} className="overflow-hidden rounded-md bg-canvas shadow-card">
-                  <header className="flex items-start gap-3 border-b border-line bg-soft px-4 py-3.5 sm:px-5">
-                    <span className="mt-0.5 shrink-0 rounded-xs bg-canvas px-2 py-1 font-mono text-xs text-ink shadow-hair">
-                      {track.level}
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-baseline gap-x-2">
-                        <Link
-                          to="/tracks/$trackId"
-                          params={{ trackId: track.id }}
-                          className="text-[15px] font-semibold tracking-[-0.02em] hover:underline"
-                        >
-                          {track.title}
-                        </Link>
-                        <span className="font-mono text-[11px] text-mute">{track.subtitle}</span>
-                      </div>
-                      <p className="mt-1 text-xs leading-relaxed text-body">{track.goal}</p>
-                    </div>
-                    <span className="shrink-0 font-mono text-xs text-mute">
-                      {trackDone}/{lessonCount}
-                    </span>
-                  </header>
-
-                  <ol className="divide-y divide-line">
-                    {groups.map(({ group, lessons, minutes }, groupIndex) => {
-                      const groupDone = lessons.filter((l) =>
-                        doneSet.has(lessonKey(track.id, l.id)),
-                      ).length
-                      const allDone = groupDone === lessons.length && lessons.length > 0
-
-                      return (
-                        <li key={group.id}>
-                          <Link
-                            to="/tracks/$trackId"
-                            params={{ trackId: track.id }}
-                            hash={group.id}
-                            className="flex items-start gap-3 px-4 py-2.5 transition hover:bg-soft sm:px-5"
-                          >
-                            <Marker done={allDone}>{groupIndex + 1}</Marker>
-                            <span className="min-w-0 flex-1">
-                              <span className="flex flex-wrap items-baseline gap-x-2">
-                                <span className="text-sm font-medium text-ink">{group.title}</span>
-                                <span className="font-mono text-[11px] text-mute">
-                                  {lessons.length} 节 · {minutes} 分钟
-                                </span>
-                              </span>
-                              <span className="mt-0.5 block text-xs leading-relaxed text-mute">
-                                {group.hint}
-                              </span>
-                            </span>
-                            <span className="mt-0.5 shrink-0 font-mono text-[11px] text-mute">
-                              {groupDone > 0 && !allDone && `${groupDone}/${lessons.length}`}
-                            </span>
-                          </Link>
-                        </li>
-                      )
-                    })}
-                  </ol>
-                </article>
-              )
-            })}
-          </div>
-        </>
-      )}
+      <ul className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+        {tracks.map((track) => {
+          const done = track.lessons.filter((l) => doneSet.has(lessonKey(track.id, l.id))).length
+          return (
+            <li key={track.id}>
+              <Link
+                to="/tracks/$trackId"
+                params={{ trackId: track.id }}
+                className="flex items-baseline gap-2 rounded-md bg-canvas px-4 py-3 shadow-card transition hover:shadow-float"
+              >
+                <span className={LEVEL_CHIP}>{track.level}</span>
+                <span className="min-w-0 flex-1 truncate text-sm font-medium text-ink">
+                  {track.title}
+                </span>
+                <span className="shrink-0 font-mono text-[11px] text-mute">
+                  {done}/{track.lessons.length}
+                </span>
+              </Link>
+            </li>
+          )
+        })}
+      </ul>
     </div>
   )
 }
