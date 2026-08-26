@@ -1,0 +1,425 @@
+## 一句话记法
+
+集群在跳板机后面，第一件要会的事就是端口转发。三个参数，`-L`、`-R`、`-D`，记混是常态。
+有一个特别好用的口诀：
+
+> **左边那一侧开新端口。**
+
+- `ssh -L 本地端口:目标:端口` —— 新端口开在**本地**（Local）
+- `ssh -R 远端端口:目标:端口` —— 新端口开在**远端**（Remote）
+- `ssh -D 本地端口` —— 新端口开在**本地**，而且是个 SOCKS5 代理
+
+再配一个顺序记法：`ssh -L local:remote`、`ssh -R remote:local` ——
+参数首字母和第一个地址的归属永远一致。
+
+下面这张图把所有形态放在一起，看完再往下读会顺很多：
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1100,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-tunnels-cheat-sheet-rev3.png"
+  alt="SSH 端口转发全形态速查图"
+  caption="SSH 端口转发速查图：本地转发、远程转发、动态转发及其变体。"
+  source="Ivan Velichko · iximiuz Labs, A Practical Guide to SSH Tunnels"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+<Callout type="note" title="本节的图与实验拓扑出处">
+本节的示意图与实验拓扑均引自 Ivan Velichko 的
+[A Practical Guide to SSH Tunnels](https://labs.iximiuz.com/tutorials/ssh-tunnels)（iximiuz Labs），
+图片版权归原作者所有。那篇教程配了可以直接上手的在线 playground，
+**强烈建议照着跑一遍** —— 本节侧重把它整理成中文的排障心智模型，动手环节以原文为准。
+</Callout>
+
+约定一套贯穿全节的拓扑（同样来自原文）：
+
+| 主机 | 地址 | 说明 |
+| --- | --- | --- |
+| `local` | 家里 `192.168.0.0/24` + 公网 `203.0.113.0/24` | 你的工作机 |
+| `remote` | `203.0.113.30`，同时在 `172.16.0.0/24` | 公网跳板 / 网关，`ssh remote` 可达 |
+| `private` | `172.16.0.40` | 只在 VPC 内部可达 |
+| `internal` | `192.168.0.10` | 只在家里网段可达 |
+
+## 本地转发 -L：把远端服务搬到本地
+
+最常用的一个。远端有个服务只监听 `localhost`，你在本地开一个端口去访问它：
+
+```bash
+ssh -f -N -L 8080:localhost:80 203.0.113.30
+curl localhost:8080
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-local-port-forwarding.png"
+  alt="SSH 本地端口转发示意图"
+  caption="-L：监听端口开在本地，流量在 SSH 服务器那一侧出隧道。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+这里的 `localhost:80` 是**在 remote 上解析**的 —— 它指的是 remote 自己的 80 端口。
+这一点是理解后面所有变体的关键：**冒号后面那个地址，永远由 sshd 那一侧解析。**
+
+`-f -N` 是长期挂隧道的标配：`-N` 不执行远程命令只做转发，`-f` 转到后台。
+
+把目标地址从 `localhost` 换成一个 remote 能访问到的地址，就变成了经跳板访问内网：
+
+```bash
+ssh -f -N -L 8081:172.16.0.40:80 203.0.113.30
+```
+
+这就是"用跳板机连数据库"的标准做法：本地连 `localhost:8081`，实际打到 VPC 里的 RDS。
+
+### -J 加 -L：访问第三台机器**自己的** loopback
+
+上面那招有个盲区：如果目标服务只监听在 `private` 自己的 `127.0.0.1` 上呢？
+remote 也连不上它。这时候要用 `-J`（ProxyJump）把 SSH 会话**终结在 private 上**：
+
+```bash
+ssh -f -N -J 203.0.113.30 -L 8082:localhost:9000 172.16.0.40
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-local-port-forwarding-jump-host.png"
+  alt="ProxyJump 配合本地端口转发示意图"
+  caption="-J 让会话终结在 private 上，于是 -L 里的 localhost 指的是 private 自己。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+差别就在这里：**`-J` 的跳板只负责中转字节，SSH 会话本身建立在最终主机上**，
+所以 `-L` 里的 `localhost` 解析成 `private` 自己。
+
+## 远程转发 -R：把本地服务暴露到远端
+
+方向反过来：你本地跑着一个服务，想让远端（或经由远端的其他人）访问：
+
+```bash
+ssh -f -N -R 0.0.0.0:8080:localhost:80 203.0.113.30
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-remote-port-forwarding.png"
+  alt="SSH 远程端口转发示意图"
+  caption="-R：监听端口开在远端网关上，流量回到本机出隧道。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+<Callout type="trap" title="-R 默认只绑 loopback，写了 0.0.0.0 也没用">
+这是 `-R` 最常见的挫败点：命令执行成功、没有任何报错，但别的机器就是连不上那个端口。
+
+原因是 sshd 默认只允许远程转发绑到它自己的 `127.0.0.1`。要绑 `0.0.0.0` 必须在
+**服务端** `/etc/ssh/sshd_config` 里打开：
+
+```
+GatewayPorts yes
+```
+
+改完 `systemctl reload sshd`。在服务端用 `ss -lnt | grep 8080` 确认监听地址到底是
+`127.0.0.1:8080` 还是 `0.0.0.0:8080` —— 一眼就能分辨是不是踩了这个坑。
+</Callout>
+
+同样，把源地址从 `localhost` 换成家里另一台设备（`ssh -f -N -R 0.0.0.0:8081:192.168.0.10:80 remote`），
+就能把内网设备暴露出去。这是最朴素的"内网穿透"：不需要公网 IP，
+只需要一台能 ssh 上去的公网机器。
+
+## 动态转发 -D：本机变成 SOCKS5 代理
+
+前面几种都要**事先知道目标地址**。`-D` 不需要 —— 它在本地开一个 SOCKS5 代理，
+目标地址由每个请求自己带：
+
+```bash
+ssh -f -N -D 1080 203.0.113.30
+curl --socks5-hostname localhost:1080 172.16.0.40:80
+curl --socks5-hostname localhost:1080 172.16.0.50:80   # 同一条隧道，不同目标
+```
+
+<Figure
+  src="https://labs.iximiuz.com/cdn-cgi/image/width=1000,quality=80,fit=scale-down,format=auto/content/files/tutorials/ssh-tunnels/__static__/ssh-dynamic-local-port-forwarding-rev2.png"
+  alt="SSH 动态端口转发示意图"
+  caption="-D：本机成为 SOCKS5 代理，出口在 SSH 服务器一侧，目标不固定。"
+  source="Ivan Velichko · iximiuz Labs"
+  href="https://labs.iximiuz.com/tutorials/ssh-tunnels"
+/>
+
+注意客户端**必须会说 SOCKS5**（所以 curl 要用 `--socks5-hostname`），
+[代理基础](/learn/gfw/proxy-basics) 那节讲过。浏览器可以直接配 SOCKS5 代理，
+命令行工具靠 `ALL_PROXY` 或 `proxychains`。
+
+看一遍完整路径，注意出口 IP 和 DNS 解析都发生在服务器那一侧：
+
+<PacketPathExplorer only={["ssh-socks"]} />
+
+## 汇总表
+
+| 命令 | 新端口开在 | 出口在 | 目标是否固定 |
+| --- | --- | --- | --- |
+| `ssh -L 8080:目标:端口` | 本地 | SSH 服务器侧 | 固定 |
+| `ssh -J 跳板 -L 8080:localhost:端口 最终主机` | 本地 | 最终主机自己 | 固定 |
+| `ssh -R 8080:目标:端口` | 远端 | 客户端侧 | 固定 |
+| `ssh -D 1080` | 本地 | SSH 服务器侧 | **不固定** |
+| `ssh -R 1080`（无目标，需 OpenSSH ≥ 7.6） | 远端 | 客户端侧 | **不固定** |
+
+## 把长命令收进 ~/.ssh/config
+
+上面这些命令都很长，每次敲一遍不现实：
+
+```sshconfig
+# 全局默认（放在文件开头）
+Host *
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 10m
+
+# 跳板机
+Host bastion
+  HostName bastion.example.com
+  User ops
+  IdentityFile ~/.ssh/id_ed25519_ops
+
+# 内网机器：一律经跳板机
+Host 10.20.*
+  User root
+  ProxyJump bastion
+
+# 具体某台，带端口转发
+Host db-prod
+  HostName 10.20.3.40
+  ProxyJump bastion
+  LocalForward 15432 localhost:5432
+```
+
+之后 `ssh db-prod` 就自动经跳板、自动建好本地 15432 转发，`ssh 10.20.3.99` 匹配通配符自动经跳板。
+
+两条匹配规则要记住：
+
+1. **从上往下匹配，每个参数取第一次出现的值** —— 所以希望全局生效的参数（上面那组保活与复用）
+   要放在**开头**，作为兜底的 `Host *` 才放最后。
+2. `Host` 是**别名**，`HostName` 才是真实地址，两者可以完全不同。
+
+<Callout type="tip" title="ssh -G 是排查配置的第一条命令">
+配置文件一长，"到底哪条规则生效了"就说不清。`ssh -G <host>`
+直接打印合并后的最终配置，不用自己推理匹配顺序。
+
+```bash
+ssh -G db-prod | grep -E 'hostname|user|proxyjump|localforward|controlpath'
+# 连不上时看它读了哪些文件、应用了哪些块
+ssh -vvv db-prod 2>&1 | grep -E 'Reading configuration|Applying options'
+```
+</Callout>
+
+## ProxyJump 与 ProxyCommand
+
+`-J` / `ProxyJump` 是现代写法，底层等价于老的 `ProxyCommand ssh -W`；多级跳板用逗号串起来
+（`ssh -J bastion1,bastion2 10.20.3.40`）。
+
+`ProxyCommand` 今天主要用在另一件事上：**`ssh` 不读 `HTTP_PROXY` 环境变量**，
+要走 SOCKS5 代理只能这么写：
+
+```sshconfig
+Host github.com
+  User git
+  ProxyCommand nc -x 127.0.0.1:1080 %h %p
+  # nc 版本不带 -x 时用 socat
+  # ProxyCommand socat - SOCKS4A:127.0.0.1:%h:%p,socksport=1080
+```
+
+这一条同时解决了 **`git clone git@github.com:...` 走代理**的问题 ——
+git 的 ssh 传输就是调用 `ssh`，配置在这里对它一样生效。
+占位符只要记三个：`%h` 目标主机名、`%p` 目标端口、`%r` 远程用户名。
+
+<Callout type="tip" title="多跳用 ProxyJump，不要用 ssh -A">
+Agent 转发（`ssh -A`）让你在跳板机上继续用本地的密钥。方便，但有风险：
+**跳板机的 root 可以劫持你的 agent socket，用你的密钥去连别的机器。**
+
+`ProxyJump` 的密钥交换只在本地进行，跳板机全程接触不到你的私钥 ——
+它只是个字节中转。这是 `-J` 相对老式"先登跳板再登目标"做法的一个安全优势。
+</Callout>
+
+## ControlMaster：第二次连接秒开
+
+每次 `ssh` 都要重新做 TCP 握手 + 密钥交换 + 认证，经跳板机时开销翻倍。
+连接复用把它降到接近零：第一次连接一两秒，之后**每次都是毫秒级**。
+对频繁执行远程命令的脚本（`ansible`、批量运维）收益尤其大。
+
+| 参数 | 作用 |
+| --- | --- |
+| `ControlMaster auto` | 没有主连接就建一个，有就复用 |
+| `ControlPath ~/.ssh/cm-%C` | 复用用的 socket 文件路径，`%C` 是定长哈希 |
+| `ControlPersist 10m` | 主连接在最后一个会话退出后继续保留 10 分钟 |
+
+```bash
+ls -l ~/.ssh/cm-*            # 当前有哪些复用连接
+ssh -O check db-prod         # 某台是否有活跃主连接
+ssh -O exit db-prod          # 主动关掉主连接
+```
+
+<Callout type="trap" title="ControlMaster 的三个坑">
+**① 主连接断了，所有复用会话一起断。** 网络抖动时的影响面比不复用更大。
+
+**② socket 路径太长会报错**：`ControlPath too long`。
+Unix socket 路径有长度限制（约 100 字节），主机名长时容易超 —— 用 `%C` 哈希，长度固定。
+
+**③ 改了配置不生效。** 因为复用的是旧主连接，新配置没被读取。
+改完配置记得 `ssh -O exit <host>` 关掉主连接。**这个坑很费时间** ——
+你以为配置没生效，其实是连接没重建。
+</Callout>
+
+## 让隧道长期活着：三层做法
+
+`-f -N` 只解决了"挂后台"，没解决"断了自动回来"。
+
+**第一层，保活：**
+
+```sshconfig
+Host tunnel-*
+  ServerAliveInterval 30      # 每 30 秒发一次心跳
+  ServerAliveCountMax 3       # 连续 3 次没回应就断开
+  ExitOnForwardFailure yes    # 端口绑定失败就退出，别留假隧道
+  TCPKeepAlive no
+```
+
+保活用 `ServerAliveInterval` 而不是 `TCPKeepAlive`：前者走 **SSH 协议层**的加密通道，
+中间设备无法伪造；后者是 TCP 层的明文探测，可能被中间设备欺骗性应答。
+
+**`ExitOnForwardFailure yes` 是最容易被忽略但最重要的一条**：
+默认情况下端口被占用或 `GatewayPorts` 没开时，ssh 照样连上、只是不转发 ——
+你会对着一个"进程还在"的假隧道排查很久。
+
+**第二层，自动重连：**
+
+```bash
+autossh -M 0 -f -N -L 8080:localhost:80 tunnel-host \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes
+```
+
+`-M 0` 表示不用 autossh 自己的监控端口，改为依赖 SSH 的保活机制 —— 这是现在的推荐用法。
+
+**第三层，systemd 模板单元** —— 生产环境的正解，开机自启 + 崩溃重启 + 日志统一：
+
+```ini
+# /etc/systemd/system/ssh-tunnel@.service
+[Unit]
+Description=SSH tunnel to %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tunnel
+ExecStart=/usr/bin/ssh -N %i \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes -o BatchMode=yes
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl enable --now ssh-tunnel@db-prod
+journalctl -u ssh-tunnel@db-prod -f
+```
+
+模板单元（`@` 形式）的好处是**一份文件管所有隧道**，`%i` 就是 `~/.ssh/config`
+里的主机别名，转发配置写在 config 里。
+
+<Callout type="warn" title="systemd 跑 ssh 的三个必须项">
+- **`BatchMode=yes`**：禁止任何交互提示。否则首次连接的主机指纹确认会让它一直挂着
+- **密钥必须免密码**，或者用 `ssh-agent` 的 systemd 集成
+- **`known_hosts` 要预先准备好**：以运行用户的身份先手工连一次，或者用 `ssh-keyscan` 预填
+
+```bash
+sudo -u tunnel ssh-keyscan -H bastion.example.com >> /home/tunnel/.ssh/known_hosts
+```
+
+漏掉任何一条，症状都是"服务起来了但隧道不通"，而 `systemctl status` 看着正常。
+</Callout>
+
+## 服务端：把隧道能力收紧
+
+一个能 ssh 上跳板机的账号，**默认就能把跳板机当代理访问它所在的整个网络**。
+生产跳板机应该给隧道用途单独建账号并收紧：
+
+```sshconfig
+# /etc/ssh/sshd_config
+Match User tunnel-only
+    AllowTcpForwarding local          # 只允许 -L，禁掉 -R
+    PermitOpen 10.20.3.40:5432        # 白名单：只能转发到这个目标
+    PermitTTY no
+    X11Forwarding no
+    AllowAgentForwarding no
+    ForceCommand /usr/sbin/nologin    # 不给 shell
+```
+
+```bash
+sshd -t && systemctl reload sshd      # 改完先语法检查再 reload
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `AllowTcpForwarding local/remote/no` | 分别控制 `-L` / `-R` 是否允许 |
+| `PermitOpen host:port` | **转发目标白名单**，可以写多个 |
+| `GatewayPorts no`（默认） | `-R` 只能绑 loopback |
+| `AllowAgentForwarding no` | 防止跳板机 root 劫持你的 agent |
+| `ForceCommand /usr/sbin/nologin` | 只能转发、不能执行命令 |
+
+给隧道用途单独建账号、只放通必要的目标，比事后审计有用得多。
+
+## 检查点
+
+<Quiz
+  id="ssh-1"
+  question="ssh -R 0.0.0.0:8080:localhost:80 gateway 执行成功，但从别的机器连 gateway:8080 不通。最可能的原因？"
+  options={[
+    { text: 'sshd 没开 GatewayPorts，远程转发只绑在 gateway 自己的 127.0.0.1 上', correct: true },
+    { text: '本地 80 端口没有服务在跑', feedback: '那会表现为连上后立刻断开或报错，而不是完全连不上监听端口。' },
+    { text: '需要用 -L 而不是 -R', feedback: '方向是对的：本地服务暴露到远端就是 -R。' },
+    { text: '防火墙一定拦了', feedback: '有可能，但先在服务端用 ss -lnt 看监听地址，GatewayPorts 是更常见的原因。' },
+  ]}
+  explain={<>在服务端敲 <code>ss -lnt | grep 8080</code>：显示 127.0.0.1:8080 就是这个坑。改 sshd_config 加 GatewayPorts yes 并 reload。这一条同样适用于不带目标地址的动态远程转发。</>}
+/>
+
+<Quiz
+  id="ssh-2"
+  question="要访问 private 主机上一个只监听 127.0.0.1:9000 的服务，而 private 只能经 bastion 到达。正确的命令是？"
+  options={[
+    { text: 'ssh -J bastion -L 8082:localhost:9000 private', correct: true },
+    { text: 'ssh -L 8082:private:9000 bastion', feedback: '这样 bastion 会去连 private:9000，但那个服务只监听 private 的 loopback，bastion 连不上。' },
+    { text: 'ssh -R 8082:localhost:9000 bastion', feedback: '方向反了，-R 是把本地服务暴露出去。' },
+    { text: 'ssh -D 1080 private', feedback: '动态转发能用，但前提是你已经能直连 private，题目里不能。' },
+  ]}
+  explain={<>关键是 -L 里冒号后面的地址由「SSH 会话终结在哪台机器」决定。-J 让会话终结在 private 上，localhost 才等于 private 自己。这是访问远端 loopback 服务的标准写法。</>}
+/>
+
+<Quiz
+  id="ssh-3"
+  question="改了 ~/.ssh/config 里某台主机的转发配置，重新 ssh 却发现没生效。最可能的原因？"
+  options={[
+    { text: 'ControlMaster 复用了旧的主连接，新配置没被读取，需要 ssh -O exit 关掉', correct: true },
+    { text: '配置文件语法错误', feedback: '语法错误会直接报错，而不是静默使用旧配置。' },
+    { text: '需要重启 sshd', feedback: '这是客户端配置，与服务端无关。' },
+    { text: '文件权限不对', feedback: '权限问题会有明确警告并拒绝读取。' },
+  ]}
+  explain={<>连接复用是很容易踩的坑：会话走的是已存在的主连接，压根没重新读配置。改完配置先 <code>ssh -O exit host</code>，再用 <code>ssh -G host</code> 确认最终生效的参数。</>}
+/>
+
+## 这节课的落点
+
+- 口诀：**左边那一侧开新端口**；`-L local:remote`、`-R remote:local`
+- `-L`/`-R` 里冒号后面的地址由 **sshd 那一侧**解析，这是所有变体的关键
+- 只监听 loopback 的远端服务要用 `-J` 把会话终结在目标机上
+- `-R` 默认只绑 loopback，绑 `0.0.0.0` 需要服务端 `GatewayPorts yes`
+- `-D` 是本地 SOCKS5，出口和 DNS 都在服务器侧；客户端必须会说 SOCKS5
+- `~/.ssh/config` 把长命令变成别名；**`Host` 是别名、`HostName` 才是真实地址**，
+  从上往下取第一次出现的值
+- **`ssh -G <host>` 是排查配置的第一条命令**，直接给出合并后的最终参数
+- **`ssh` 不读代理环境变量**，走 SOCKS5 要用 `ProxyCommand nc -x`；这同时解决 git over ssh
+- 多跳用 `ProxyJump` 而不是 `ssh -A` —— 私钥全程留在本地
+- `ControlMaster` 让第二次连接毫秒级；三个坑：主连接断则全断、路径过长（用 `%C`）、
+  **改配置后要 `ssh -O exit` 才生效**
+- 长期隧道三层：`ServerAliveInterval` + **`ExitOnForwardFailure yes`** → `autossh -M 0`
+  → **systemd 模板单元**（必须 `BatchMode=yes` + 免密钥 + 预填 `known_hosts`）
+- 服务端用 `Match User` 收紧：`AllowTcpForwarding local`、`PermitOpen` 白名单、
+  **`AllowAgentForwarding no`**

@@ -40,7 +40,7 @@ function Progress({ percent }: { percent: number }) {
  * 原来这里是四个岗位标签，各自给一份裁剪过的清单 —— 但选岗位本身就是一道题：
  * 刚入门的人还不知道自己会去哪个岗位，先被要求选一个，反而卡在了第一步。
  * 现在只留一条从头走到尾的完整路径，顺序按「学得动」排好，进来就能开始。
- * 六个阶段的全量目录折叠在最底下，想按主题跳的人从那里进。
+ * 五个分类的全量目录折叠在最底下，想按主题跳的人从那里进。
  */
 function Home() {
   const progress = useProgress()
@@ -63,7 +63,7 @@ function Home() {
         <h1 className="display-2xl mt-3">网络成长路径。</h1>
         <p className="mt-4 max-w-2xl text-[17px] leading-relaxed text-body">
           <span className="font-mono">{stats.lessonCount}</span> 节课排成一条线，
-          从「一次 curl 到底发生了什么」一直走到给整个 GPU 集群值班。
+          从「先能访问到一手资料」起步，一直走到给整个 GPU 集群值班。
           零基础按顺序往下走就行，不需要先想清楚自己要做哪个岗位。
         </p>
       </header>
@@ -184,7 +184,7 @@ function PathPanel({ doneSet }: { doneSet: Set<string> }) {
       </div>
 
       <p className="mt-6 text-sm leading-relaxed text-mute">
-        路径的顺序和左边那枚阶段标签不是一回事 —— 标签说的是课属于哪个主题，
+        路径的顺序和左边那枚分类标签不是一回事 —— 标签说的是课属于哪个主题，
         顺序说的是什么时候学它最省力。想按主题通读，展开下面的全部课程。
       </p>
     </>
@@ -192,10 +192,10 @@ function PathPanel({ doneSet }: { doneSet: Set<string> }) {
 }
 
 /**
- * 全部课程：六个阶段，每个阶段按小组展开。
+ * 全部课程：五个分类，每个分类按小组展开。
  *
  * 和上面那条路径是同一批课，只是换个切法：路径按学习顺序排，这里按主题归类，
- * 也是 /tracks 各阶段页的入口，所以不能省掉。默认折叠，只留一行「已完成 N/54」在外面。
+ * 也是 /tracks 各分类页的入口，所以不能省掉。默认折叠，只留一行「已完成 N/50」在外面。
  */
 function Catalog({ doneSet, doneCount }: { doneSet: Set<string>; doneCount: number }) {
   const [open, setOpen] = useState(false)
@@ -217,7 +217,7 @@ function Catalog({ doneSet, doneCount }: { doneSet: Set<string>; doneCount: numb
       >
         <span className="font-medium text-ink">全部课程</span>
         <span className="font-mono text-[11px] text-mute">
-          {stats.trackCount} 个阶段 · {stats.lessonCount} 节 · 约{' '}
+          {stats.trackCount} 个分类 · {stats.lessonCount} 节 · 约{' '}
           {Math.round(stats.totalMinutes / 60)} 小时 · 已完成 {doneCount}/{stats.lessonCount}
         </span>
         <span className="ml-auto shrink-0 text-xs font-medium text-brand-600">
@@ -232,7 +232,8 @@ function Catalog({ doneSet, doneCount }: { doneSet: Set<string>; doneCount: numb
       {!open && (
         <p className="mt-3 text-sm leading-relaxed text-mute">
           想按主题通读，或者只想直接切进某一块，就从这里进去。
-          分区是 <span className="font-mono">L0 → T → L1 → L2 → L3 → L4</span>。
+          分类是{' '}
+          <span className="font-mono">GFW → SSH → ETH → HPC → K8S</span>。
         </p>
       )}
 

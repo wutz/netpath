@@ -11,7 +11,7 @@ export const Route = createRootRoute({
       {
         name: 'description',
         content:
-          '一条从零到值班的网络成长路径：从 Linux 协议栈与报文路径出发，走过代理隧道、K8s 容器网络、InfiniBand 与 RoCE 高性能网络，再到以太网与计算网的容量规划。',
+          '一条从零到值班的网络成长路径：从科学上网与远程接入起步，走过 Linux 协议栈与报文路径、InfiniBand 与 RoCE 高性能网络，再到 K8s 容器网络与计算网的容量规划。',
       },
     ],
     links: [
@@ -75,7 +75,7 @@ function RootLayout() {
           <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
             <div className="eyebrow">Netpath</div>
             <p className="mt-3 max-w-3xl text-sm leading-relaxed text-body">
-              网络成长路径，从 Linux 协议栈走到 K8s 容器网络、RDMA 高性能网络与容量规划。
+              网络成长路径，从科学上网与远程接入起步，走过 Linux 协议栈、RDMA 高性能网络与 K8s 容器网络。
               内容基于 k8s-in-action 部署手册、The Kubernetes Networking Guide、NVIDIA DGX SuperPOD
               参考架构与 Systems Performance (2nd Edition) 整理。
             </p>
