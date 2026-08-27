@@ -42,8 +42,6 @@ export interface Lesson {
  * 每个分类都按「这是什么 → 动手做一遍 → 内部怎么实现的」三段推进，
  * 把 PCIe / NVLink / 内核栈 / kube-proxy / eBPF 这类深挖内容一律压到最后 ——
  * 它们不是入门必需品，是撞到具体瓶颈时才回来读的东西。
- * 唯一的例外是「访问集群」：那一段的概念课（VPN 组网选型）反而比实践课（SSH 端口转发）更进阶，
- * 机械套用规则会让门槛倒挂，所以保持 ssh → vpn。
  */
 export interface LessonGroup {
   id: string
@@ -108,9 +106,6 @@ const REF_SSH_TUNNELS: LessonRef = {
   label: 'A Practical Guide to SSH Tunnels — Ivan Velichko (iximiuz Labs)',
   href: 'https://labs.iximiuz.com/tutorials/ssh-tunnels',
 }
-const REF_WIREGUARD: LessonRef = { label: 'WireGuard', href: 'https://www.wireguard.com/' }
-const REF_TAILSCALE: LessonRef = { label: 'How Tailscale Works', href: 'https://tailscale.com/blog/how-tailscale-works' }
-const REF_PRITUNL: LessonRef = { label: 'Pritunl', href: 'https://pritunl.com/' }
 const REF_HAOEL: LessonRef = { label: '科学上网 — haoel', href: 'https://github.com/haoel/haoel.github.io' }
 const REF_ANYTLS: LessonRef = { label: 'anytls-go', href: 'https://github.com/anytls/anytls-go' }
 const REF_VERGE: LessonRef = { label: 'Clash Verge Rev', href: 'https://github.com/clash-verge-rev/clash-verge-rev' }
@@ -120,10 +115,10 @@ export const tracks: Track[] = [
   {
     id: 'gfw',
     level: 'GFW',
-    title: '科学上网',
+    title: '科学上网与隧道',
     subtitle: '看得到一手资料 · 一切的前置',
-    goal: '网络方向的一手资料绝大部分在海外：内核提交记录、RFC、各家设计文档与厂商 KB。这一段不解决任何网络原理问题，但它决定了后面每一节你能读到什么。先学会诊断，再搭一条自己的线，最后把流量分好。',
-    hint: '一手资料几乎都在海外。这件事不解决，后面每一节能读到的东西都打折。',
+    goal: '网络方向的一手资料绝大部分在海外：内核提交记录、RFC、各家设计文档与厂商 KB。这一段不解决任何网络原理问题，但它决定了后面每一节你能读到什么。先学会诊断，再搭一条自己的线、把流量分好；然后回头看两种代理到底怎么工作，并把同一套隧道思路用到 SSH 上 —— 后面每次连集群都要靠它。',
+    hint: '一手资料几乎都在海外，集群也在跳板机后面。这两件事不解决，后面每一节都打折。',
     groups: [
       {
         id: 'gfw-concept',
@@ -139,9 +134,9 @@ export const tracks: Track[] = [
       },
       {
         id: 'gfw-theory',
-        title: '原理：代理到底怎么工作',
-        hint: '线搭通了再回头看：配置里那些 http:// 与 socks5h:// 各自意味着什么。',
-        lessons: ['proxy-basics'],
+        title: '原理：代理与隧道怎么工作',
+        hint: '线搭通了再回头看：配置里那些 http:// 与 socks5h:// 各自意味着什么，以及同一套思路怎么用 SSH 手工搭一条。',
+        lessons: ['proxy-basics', 'ssh'],
       },
       {
         id: 'gfw-quest',
@@ -261,53 +256,9 @@ export const tracks: Track[] = [
         refs: [REF_VERGE, REF_HAOEL],
       },
       {
-        id: 'quest-proxy-broken',
-        title: '闯关：隧道昨天还好，今天不通了',
-        summary: '在模拟终端里从「浏览器打不开」一路查到具体哪一跳断了。',
-        kind: 'quest',
-        status: 'ready',
-        minutes: 30,
-        objectives: [
-          '按客户端 → 本地监听 → 隧道 → 出口逐段定位',
-          '区分 DNS 失败、监听没起、隧道断开与出口被封',
-          '给出可验证的结论与恢复步骤',
-        ],
-        outline: [
-          '目标一：确认本地代理端口是否在监听',
-          '目标二：确认隧道连接是否存活',
-          '目标三：确认出口侧能否访问目标',
-          '目标四：定位断点并说明修法',
-        ],
-        refs: [REF_ANYTLS, REF_HAOEL],
-      },
-    ],
-  },
-  {
-    id: 'access',
-    level: 'SSH',
-    title: '访问集群',
-    subtitle: '跳板机、端口转发与组网',
-    goal: '集群不会直接暴露在公网上。这一段解决「怎么连上去」：SSH 的三种端口转发与配置固化，以及需要把一堆机器连成一张网时该选哪个 VPN 方案。',
-    hint: '集群在跳板机后面，连不上就什么都做不了 —— 门槛最低，入职第一周就用得上。',
-    groups: [
-      {
-        id: 'access-ssh',
-        title: '端口转发',
-        hint: '第一周就会用到的手艺，门槛也最低 —— 只需要代理那两节的底子。',
-        lessons: ['ssh'],
-      },
-      {
-        id: 'access-vpn',
-        title: '组网',
-        hint: '三个方案对应三种不同的问题，选型比配置更重要。',
-        lessons: ['vpn'],
-      },
-    ],
-    lessons: [
-      {
         id: 'ssh',
         title: 'SSH 端口转发与配置固化：-L、-R、-D 与 ~/.ssh/config',
-        summary: '集群在跳板机后面，这是第一件要会的事。三个参数记混是常态，一个口诀就能分清。',
+        summary: '换一种隧道：不靠客户端软件，用 ssh 自己开一条。三个参数记混是常态，一个口诀就能分清。',
         kind: 'lab',
         status: 'ready',
         minutes: 45,
@@ -331,33 +282,24 @@ export const tracks: Track[] = [
         refs: [REF_SSH_TUNNELS, REF_HAOEL],
       },
       {
-        id: 'vpn',
-        title: 'VPN 组网三选一：WireGuard、Tailscale 与 Pritunl',
-        summary: '「给集群组个 VPN」底下藏着三种不同的需求。选错了会付很久的运维代价。',
-        kind: 'concept',
+        id: 'quest-proxy-broken',
+        title: '闯关：隧道昨天还好，今天不通了',
+        summary: '在模拟终端里从「浏览器打不开」一路查到具体哪一跳断了。',
+        kind: 'quest',
         status: 'ready',
-        minutes: 50,
+        minutes: 30,
         objectives: [
-          '按「连通性问题还是身份合规问题」在三个方案之间做出选型',
-          '配出一条可用的 WireGuard 隧道，并用三行输出定位单向通与 MTU 故障',
-          '说清 Tailscale 的控制面/数据面分工，以及 DERP 在什么时候接管',
+          '按客户端 → 本地监听 → 隧道 → 出口逐段定位',
+          '区分 DNS 失败、监听没起、隧道断开与出口被封',
+          '给出可验证的结论与恢复步骤',
         ],
         outline: [
-          '三个方案对应的三种问题，以及选型判断表',
-          'WireGuard：只有一套算法、只走 UDP、公钥即身份',
-          'Cryptokey Routing：AllowedIPs 同时是路由表和入方向 ACL',
-          '最小配置里的两处不对称：ListenPort 与 Endpoint',
-          'PersistentKeepalive 该配在哪一端',
-          'MTU 账：IPv4 减 60、IPv6 减 80，以及「小包通大包卡」',
-          '访问对端内网的三件套：AllowedIPs、ip_forward、MASQUERADE',
-          'Tailscale：协调服务器只是公钥投递箱，私钥不离开节点',
-          'STUN/ICE 穿透与 DERP 兜底，顺带补上 TCP 回退',
-          'ACL 以身份为单位；subnet router 是端到端加密的唯一例外',
-          'Pritunl：MongoDB 协调层与真正的单点',
-          '组织 × 服务器的挂载关系就是权限边界',
-          'SSO 做账号生命周期，但它在 Enterprise 档',
+          '目标一：确认本地代理端口是否在监听',
+          '目标二：确认隧道连接是否存活',
+          '目标三：确认出口侧能否访问目标',
+          '目标四：定位断点并说明修法',
         ],
-        refs: [REF_WIREGUARD, REF_TAILSCALE, REF_PRITUNL],
+        refs: [REF_ANYTLS, REF_HAOEL],
       },
     ],
   },
@@ -1461,11 +1403,8 @@ export const PREREQ: Record<string, string[]> = {
   'gfw/vps-anytls': ['gfw/restricted-network'],
   'gfw/clash-rules': ['gfw/vps-anytls'],
   'gfw/proxy-basics': ['gfw/clash-rules'],
-  'gfw/quest-proxy-broken': ['gfw/clash-rules', 'gfw/proxy-basics'],
-
-  // 访问集群：SSH 要先懂 SOCKS5，VPN 只要会看隧道两端
-  'access/ssh': ['gfw/proxy-basics'],
-  'access/vpn': ['access/ssh'],
+  'gfw/ssh': ['gfw/proxy-basics'],
+  'gfw/quest-proxy-broken': ['gfw/clash-rules', 'gfw/proxy-basics', 'gfw/ssh'],
 
   // 以太网：概念（地图与口径）→ 实践（工具、排障、端口账）→ 原理（协议栈内部）
   'ethernet/metrics-units': ['ethernet/first-look'],
@@ -1566,7 +1505,7 @@ export function getDepth(trackId: string, lessonId: string): LessonDepth {
  * 于是站里有了两个事实来源：目录一个顺序，路径另一个顺序。
  * 代价是每改一节课都要同步两处，正文里的「上一节 / 下一节」也经常指错人。
  *
- * 现在**目录就是路径**：五个分类依次是五步，每步内部按 `groups[].lessons` 走。
+ * 现在**目录就是路径**：四个分类依次是四步，每步内部按 `groups[].lessons` 走。
  * 原来那十七段里真正有价值的是排序决定（内核栈往后压、代理隧道提前、算账放最后），
  * 这些已经折进各自分类的分组里，跟着课程本身走。
  */
@@ -1575,8 +1514,8 @@ export function getDepth(trackId: string, lessonId: string): LessonDepth {
 export const PATH_META = {
   tagline: '从查得到资料，到给整个集群值班。',
   intro:
-    '这是一条网络工程师的成长路线。50 节课排成一条线：先解决「查得到一手资料」这件事，' +
-    '再学会连上跳板机后面的集群，然后是以太网、RDMA 与 GPU 集群、容器网络，' +
+    '这是一条网络工程师的成长路线。49 节课排成一条线：先解决「查得到一手资料、连得上集群」这件事，' +
+    '再从以太网走到 RDMA 与 GPU 集群、容器网络，' +
     '最后能替业务算出端口数与线缆数，也扛得住值班。' +
     '每一段都按同一种节奏推进 —— 先概念、再实践，最后才拆原理：' +
     '先知道这是什么，然后动手把命令敲一遍，撞到瓶颈时再回头看内核和硬件里发生了什么。' +

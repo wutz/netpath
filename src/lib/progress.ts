@@ -4,7 +4,8 @@
  */
 import { useSyncExternalStore } from 'react'
 
-const STORAGE_KEY = 'netpath:progress:v2'
+const STORAGE_KEY = 'netpath:progress:v3'
+const LEGACY_V2_KEY = 'netpath:progress:v2'
 const LEGACY_KEY = 'netpath:progress:v1'
 
 /**
@@ -65,13 +66,23 @@ const LEGACY_TRACK: Record<string, string> = {
 
 /** 合并掉的课映射到承接它的那一节；gost 与透明网关整节删除，不映射 */
 const LEGACY_MERGED: Record<string, string> = {
-  'l5-tunnel/ssh-tunnels': 'access/ssh',
-  'l5-tunnel/ssh-advanced': 'access/ssh',
-  'l5-tunnel/wireguard': 'access/vpn',
-  'l5-tunnel/tailscale': 'access/vpn',
-  'l5-tunnel/pritunl': 'access/vpn',
+  'l5-tunnel/ssh-tunnels': 'gfw/ssh',
+  'l5-tunnel/ssh-advanced': 'gfw/ssh',
   'l5-tunnel/traffic-shaping': 'gfw/vps-anytls',
+  // wireguard / tailscale / pritunl 曾合并成 access/vpn，那一节现已整节删除，不再映射
 }
+
+/**
+ * v2 → v3 的一次性迁移。
+ *
+ * 「访问集群」整个分类撤掉了：SSH 端口转发并进科学上网，VPN 组网选型整节删除。
+ * 只有 trackId 变了，lessonId 没动，所以 access/ssh 的完成记录能原样搬过去；
+ * access/vpn 没有承接者，直接丢弃。
+ */
+const V2_MOVED: Record<string, string> = {
+  'access/ssh': 'gfw/ssh',
+}
+const V2_DROPPED = new Set(['access/vpn'])
 
 /** 迁移一条 `track/lesson` 或 `track/lesson#quiz` 记录，认不出的返回 undefined */
 function migrateKey(key: string): string | undefined {
@@ -82,15 +93,37 @@ function migrateKey(key: string): string | undefined {
   if (merged) return merged + suffix
   const track = LEGACY_TRACK[lessonKey]
   if (!track) return undefined
-  return `${track}/${lessonKey.split('/')[1]}${suffix}`
+  return migrateKeyV2(`${track}/${lessonKey.split('/')[1]}${suffix}`)
+}
+
+/** v2 的 key 已经是 `trackId/lessonId` 形态，只需处理撤掉的那个分类 */
+function migrateKeyV2(key: string): string | undefined {
+  const hash = key.indexOf('#')
+  const lessonKey = hash === -1 ? key : key.slice(0, hash)
+  const suffix = hash === -1 ? '' : key.slice(hash)
+  if (V2_DROPPED.has(lessonKey)) return undefined
+  const moved = V2_MOVED[lessonKey]
+  return moved ? moved + suffix : key
+}
+
+function pickWith(list: unknown, fn: (key: string) => string | undefined): string[] {
+  if (!Array.isArray(list)) return []
+  return Array.from(
+    new Set(
+      list
+        .filter((k): k is string => typeof k === 'string')
+        .map(fn)
+        .filter((k): k is string => Boolean(k)),
+    ),
+  )
 }
 
 function migrate(old: Partial<ProgressState> | null): ProgressState {
-  const pick = (list: unknown) =>
-    Array.isArray(list)
-      ? Array.from(new Set(list.filter((k): k is string => typeof k === 'string').map(migrateKey).filter((k): k is string => Boolean(k))))
-      : []
-  return { done: pick(old?.done), quiz: pick(old?.quiz) }
+  return { done: pickWith(old?.done, migrateKey), quiz: pickWith(old?.quiz, migrateKey) }
+}
+
+function migrateV2(old: Partial<ProgressState> | null): ProgressState {
+  return { done: pickWith(old?.done, migrateKeyV2), quiz: pickWith(old?.quiz, migrateKeyV2) }
 }
 
 export interface ProgressState {
@@ -118,7 +151,13 @@ function read(): ProgressState {
       }
       return cache
     }
-    // 没有 v2 数据，尝试从 v1 迁移一次。v1 原样保留，回滚时还能用
+    // 没有 v3 数据，依次尝试 v2、v1。旧键原样保留，回滚时还能用
+    const v2 = window.localStorage.getItem(LEGACY_V2_KEY)
+    if (v2) {
+      cache = migrateV2(JSON.parse(v2) as Partial<ProgressState>)
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(cache))
+      return cache
+    }
     const legacy = window.localStorage.getItem(LEGACY_KEY)
     cache = migrate(legacy ? (JSON.parse(legacy) as Partial<ProgressState>) : null)
     if (legacy) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(cache))
