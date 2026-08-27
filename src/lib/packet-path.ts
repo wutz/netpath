@@ -482,62 +482,6 @@ export const SCENARIOS: Scenario[] = [
       },
     ],
   },
-  {
-    id: 'wireguard',
-    label: 'WireGuard 隧道',
-    summary: '应用完全不知道自己在用 VPN：它只是往一张普通网卡上发包。',
-    latency: '接近物理 RTT',
-    takeaway: 'WireGuard 的路由决策靠 AllowedIPs（Cryptokey Routing）：它既是「发给谁」也是「允许谁发来」，配错就静默丢包。',
-    hops: [
-      {
-        id: 'app-send',
-        title: '应用往对端内网地址发包',
-        detail: '应用调用一次普通的 `send()`，目的地址是 10.0.0.2 这种隧道内地址。没有任何 VPN 相关的 API。',
-        layer: 'app',
-        observe: 'ip route get 10.0.0.2',
-      },
-      {
-        id: 'wg-route',
-        title: '路由表把包交给 wg0',
-        detail: 'wg-quick 会按 AllowedIPs 自动装好路由。包进入 wg0 这张虚拟网卡后，才轮到 WireGuard 处理。',
-        layer: 'kernel',
-        observe: 'wg show;  ip -d link show wg0',
-        risk: '目的地址不在任何 peer 的 AllowedIPs 里 → 直接丢弃。这是最常见的「配置全对但不通」。',
-      },
-      {
-        id: 'wg-encrypt',
-        title: '查 Cryptokey Routing 表并加密',
-        detail: '按目的 IP 找到对应 peer 的公钥，用 ChaCha20-Poly1305 加密，封装成一个 UDP 报文发往该 peer 的 Endpoint。',
-        layer: 'kernel',
-        observe: 'wg show wg0 transfer   # 看每个 peer 的收发字节',
-        risk: '没给 wg0 减 MTU（典型 1420）→ 封装后超过物理 MTU，小包正常、大包卡死。',
-      },
-      {
-        id: 'udp-transit',
-        title: '以 UDP 穿过公网',
-        detail: '外层只有一个 UDP 报文（默认 51820），没有握手可辨识的连接状态，也没有明显的协议特征。',
-        layer: 'wire',
-        observe: 'tcpdump -i any -nn udp port 51820 -c 10',
-        risk: 'UDP 被整体阻断时 WireGuard 完全不通，而且它不会自动降级 —— 这种网络里要在外面再套一层 TCP 隧道。',
-      },
-      {
-        id: 'peer-verify',
-        title: '对端解密并按 AllowedIPs 校验来源',
-        detail: '解密后再反查一次：这个源地址是否属于该 peer 被允许的网段。不属于就丢掉。未通过认证的包一律不回应，所以 WireGuard 端口扫不出来。',
-        layer: 'peer',
-        observe: 'wg show   # latest handshake 时间是最有用的一行',
-        risk: '两端 AllowedIPs 不对称（一边写了 /24 一边只写 /32）→ 单向通、回不来。',
-      },
-      {
-        id: 'peer-deliver',
-        title: '交给对端协议栈或继续转发',
-        detail: '如果对端是子网路由器（subnet router / exit node），它会在这里做转发和 NAT，把流量送进真正的内网或公网。',
-        layer: 'peer',
-        observe: 'sysctl net.ipv4.ip_forward;  iptables -t nat -L POSTROUTING -n',
-        risk: '忘了开 ip_forward 或没配 MASQUERADE → 隧道通、但访问不了对端内网的其它机器。',
-      },
-    ],
-  },
 ]
 
 export function getScenario(id: string) {

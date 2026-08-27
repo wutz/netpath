@@ -5,63 +5,82 @@
 从「怎么才能看到一手资料」开始，走过 Linux 协议栈上一个包的每一跳，进入 InfiniBand 与 RoCE
 的高性能战场，拆开 K8s 容器网络的机制，最后学会把业务需求翻译成端口数、交换机台数和线缆数。
 
-## 五个分类，就是五步
+## 四个分类，就是四步
 
 | 步 | 分类 | 节数 | 内容 |
 | --- | --- | --- | --- |
-| 1 | **GFW** 科学上网 | 5 | 症状分类与诊断、HTTP/SOCKS5 代理、VPS 线路与 anytls 服务端、Mihomo 分流规则与旁路由、隧道排障闯关 |
-| 2 | **SSH** 访问集群 | 2 | SSH 端口转发与配置固化（`-L`/`-R`/`-D`、ProxyJump、ControlMaster）、WireGuard / Tailscale / Pritunl 三选一 |
-| 3 | **ETH** 以太网与协议栈 | 9 | 一次 curl 的全过程、带宽/PPS/延迟三指标、二三层转发、报文收发路径、TCP 行为、观测工具箱与闯关、内核栈调优、Spine-Leaf 端口账 |
-| 4 | **HPC** 高性能网络 | 18 | RDMA 原理、PCIe 拓扑与 NVLink、InfiniBand、RoCEv2 与无损以太网、**策略路由**、perftest、Rail 拓扑、NCCL/MPI、GPUDirect、NVMe-oF、DPU、DPDK、计算网规划与选型 |
-| 5 | **K8S** K8s 网络 | 16 | K8s 网络模型、netns/veth、CNI 数据平面、eBPF/XDP、Service、kube-proxy、MetalLB、Ingress、DNS/策略、地址规划、SR-IOV/次级 CNI、K8s RDMA、Pod 不通闯关、可观测性与值班手册 |
+| 1 | **GFW** 科学上网与隧道 | 6 | 症状分类与诊断、VPS 线路与 anytls 服务端、Mihomo 分流规则与旁路由、HTTP/SOCKS5 代理原理、SSH 端口转发与配置固化（`-L`/`-R`/`-D`、ProxyJump、ControlMaster）、隧道排障闯关 |
+| 2 | **ETH** 以太网与协议栈 | 9 | 一次 curl 的全过程、带宽/PPS/延迟三指标、二三层转发、观测工具箱与闯关、Spine-Leaf 端口账、报文收发路径、TCP 行为、内核栈调优 |
+| 3 | **HPC** 高性能网络 | 18 | RDMA 原理、InfiniBand、RoCEv2 与无损以太网、Rail 拓扑、**策略路由**、perftest、NCCL 与闯关、需求拆解与计算网规划选型、PCIe 与 NVLink、GPUDirect、MPI、NVMe-oF、DPU、DPDK |
+| 4 | **K8S** K8s 网络 | 16 | K8s 网络模型、CNI 数据平面、Service、MetalLB、Ingress、DNS/策略、地址规划、SR-IOV/次级 CNI、K8s RDMA、Pod 不通闯关、netns/veth 手搓、kube-proxy、eBPF/XDP、可观测性与值班手册 |
 
-共 5 个分类、**21 个小组**、**50 节课**（约 27 小时），**50 节全部有正文**。
+共 4 个分类、**15 个小组**、**49 节课**（约 26 小时），**49 节全部有正文**。
 动手环节 14 个：8 个实验 + 4 个命令行闯关 + 2 个规划计算器。
 
 ## 一条完整学习路径
 
-**目录就是路径** —— 五个分类依次是五步，每步内部按 `groups[].lessons` 的顺序走，
-50 节课全部在线上，没有分岔也不用挑。
+**目录就是路径** —— 四个分类依次是四步，每步内部按 `groups[].lessons` 的顺序走，
+49 节课全部在线上，没有分岔也不用挑。
 
 早先这里有一张单独维护的 `FULL_PATH`，把课程重新切成十七段、顺序自成一套。
 代价是站里有了两个事实来源：目录一个顺序、路径另一个顺序，每改一节课都要同步两处，
 正文里的「上一节 / 下一节」还经常指错人。现在那张表删掉了 ——
-它里面真正有价值的是排序决定，这些已经折进各自分类的分组里，跟着课程本身走：
+它里面真正有价值的是排序决定，这些已经折进各自分类的分组里，跟着课程本身走。
+
+### 分类之间：由外向内
 
 1. **能查到资料排第一。** 网络方向的一手资料几乎都在海外，这件事不解决，后面每一节能读到的东西都打折。
-2. **门槛低、当天用得上的先来。** 远程接入排在协议原理之前：集群在跳板机后面，连不上什么都做不了。
-3. **概念在前，工具在后，闯关收尾。** 先知道包往哪走，再学看它的命令，最后接一台真出问题的机器。
-4. **深入的课往后压。** 内核栈调优从「走通一个包」挪到了「主机侧的旋钮与端口账」，
-   和以太网端口账放在一起 —— 两件事都是后面高性能网络的前提。
-5. **算账与值班放最后。** 规划要用到前面全部的数字；可观测性与值班手册排在整条路的末尾（第 49、50 节），
-   因为它们本来就要覆盖容器网络与高性能网络两层。
+2. **门槛低、当天用得上的先来。** SSH 端口转发和代理并在第一步：集群在跳板机后面，连不上什么都做不了。
+3. **值班放最后。** 可观测性与值班手册排在整条路的末尾（第 48、49 节），因为它们本来就要覆盖容器网络与高性能网络两层。
+
+### 分类内部：先概念，再实践，最后原理
+
+每个分类都按同一种节奏推进，小组标题上直接写着 `概念：…` / `实践：…` / `原理：…`：
+
+| 段 | 讲什么 | 例子 |
+| --- | --- | --- |
+| **概念** | 这是什么、有哪几种、各管一段什么 | 二层与三层、RoCEv2 与无损以太网、K8s 四条铁律 |
+| **实践** | 动手把命令敲一遍、接一台真出问题的机器、算一次账 | 搭 anytls 出口与 Mihomo 分流、观测工具箱、perftest 与 NCCL |
+| **原理** | 内核和硬件里到底怎么实现的 | HTTP 代理与 SOCKS5、一个包的旅程、内核栈调优、PCIe/NVLink、kube-proxy |
+
+这条规则最直接的后果是**深挖类课程一律往后压**：以太网的报文收发路径与内核栈调优挪到工具箱和闯关之后，
+高性能网络的 PCIe / NVLink / GPUDirect / DPDK 全部排到打通链路并验收之后，
+K8s 的 netns 手搓、kube-proxy 三代实现、eBPF/XDP 也让位给「先把网卡插进 Pod」。
+科学上网那段同理：**HTTP 代理与 SOCKS5 的区别排到 Mihomo 配置之后** ——
+先照着把线搭通、把分流配好，再回头看配置里抄过的 `socks5` 与 `socks5h` 差在哪。
+它们不是入门必需品，是撞到具体瓶颈时才回来读的东西。
+
+一处看着像例外、其实不是的：科学上网那段的 `SSH 端口转发` 是实验课，却排在 `原理` 组里 ——
+因为 `ssh -D` 开的就是一个 SOCKS5 代理，`ProxyCommand` 又要靠代理知识才配得对，
+它本质上是「把代理原理换一种方式再做一遍」，跟 `HTTP 代理与 SOCKS5` 是同一段。
 
 `PREREQ` 里的每一条前置依赖都落在路径的更早位置，按顺序走不会遇到「建议先学」指向后面的课
-（这一点有脚本校验）。课程另按 `DEPTH` 标了「入门 / 深入」两端，标「深入」的赶时间可以先跳过。
+（`bun run check` 会校验这一点，顺便查分组里有没有漏课或重复引用）。
+课程另按 `DEPTH` 标了「入门 / 深入」两端，标「深入」的赶时间可以先跳过。
 
 ### 首页版式
 
-与 [storpath](https://storpath.wutz.dev/) 对齐：框架段 → 入口卡（`已完成 N/50` + 进度条 +
+与 [storpath](https://storpath.wutz.dev/) 对齐：框架段 → 入口卡（`已完成 N/49` + 进度条 +
 「开始学 · 第 1 节 …」）→ **一步一张卡**的阶梯 → 结尾一句话。
 
 每步一张卡：卡头是**分类徽标 + 「第 N 步」 + 分类名（链到 `/tracks/<id>`）+ 副标题 + 节数时长 + 本步进度**，
 下面一句话说明这一步解决什么；步内每行课是**步内序号 + 标题 + 一句话说明**，
 右侧最多一个标签（`实验` / `闯关` / `规划`，纯读的课若标了 `深入` 则占这个位置）加时长。
 
-**课程页的导航跟着这条线走**：「下一课 / 上一课」跨分类连续，右栏是整条路径按五步分组，
-顶部提示条显示「第 N / 50 节 + 当前分类」。
+**课程页的导航跟着这条线走**：「下一课 / 上一课」跨分类连续，右栏是整条路径按四步分组，
+顶部提示条显示「第 N / 49 节 + 当前分类」。
 
-> **进度存在浏览器 localStorage。** 课程按五个分类重切时 trackId 变了，
-> `progress.ts` 里有一张 v1 → v2 的一次性迁移表，老的完成记录会被搬过来，
-> 合并掉的课映射到承接它的那一节。
+> **进度存在浏览器 localStorage。** 每次改动分类划分 trackId 都会变，
+> `progress.ts` 里按版本各存了一张一次性迁移表（v1 → v2 → v3），老的完成记录会被搬过来：
+> 合并掉的课映射到承接它的那一节，整节删除的（VPN 组网）直接丢弃。
 
 线上地址：<https://netpath.wutz.dev>
 
 ## 交互形式
 
 - **检查点（Quiz）** —— 随堂单选/多选，选错给针对性反馈，答对写入本地进度
-- **路径推演（PacketPathExplorer）** —— 10 个场景（主机收发、同节点/跨节点 Pod、ClusterIP、
-  LoadBalancer、RoCE WRITE、GPUDirect RDMA、SSH 动态转发、WireGuard 隧道），
+- **路径推演（PacketPathExplorer）** —— 9 个场景（主机收发、同节点/跨节点 Pod、ClusterIP、
+  LoadBalancer、RoCE WRITE、GPUDirect RDMA、SSH 动态转发），
   逐跳展开，每跳都给出**观测命令**与**典型故障方式**
 - **配图（Figure）** —— 引用外部示意图时统一走这个组件，图注与来源链接位置固定，不给漏署名留余地
 - **命令行闯关（Terminal）** —— 模拟终端，预置真实的 `ethtool -S`、`softnet_stat`、NCCL 日志输出，
@@ -89,6 +108,7 @@ bun install
 bun run dev        # http://localhost:3002
 bun run build
 bun run typecheck
+bun run check      # 大纲自检：分组完整性 + 前置依赖不指向后面的课
 bun run deploy     # 手工部署到 Cloudflare Workers
 ```
 
@@ -125,14 +145,13 @@ netpath/
 │   │   ├── mdx-components.tsx      # MDX 全局组件表
 │   │   └── lesson-context.ts       # 当前课程 key，供交互组件写进度
 │   ├── content/                # 课程正文
-│   │   ├── gfw/                # 5 节 · 科学上网
-│   │   ├── access/             # 2 节 · 访问集群
+│   │   ├── gfw/                # 6 节 · 科学上网与隧道
 │   │   ├── ethernet/           # 9 节 · 以太网与协议栈
 │   │   ├── hpc/                # 18 节 · 高性能网络
 │   │   └── k8s/                # 16 节 · K8s 网络
 │   ├── routes/
 │   │   ├── __root.tsx
-│   │   ├── index.tsx                    # 首页：完整学习路径（五步，一步一张卡）
+│   │   ├── index.tsx                    # 首页：完整学习路径（四步，一步一张卡）
 │   │   ├── tracks.$trackId.tsx          # 分类详情
 │   │   ├── learn.$trackId.$lessonId.tsx # 课程页
 │   │   └── labs.tsx                     # 实验与闯关索引
@@ -145,9 +164,11 @@ netpath/
 ## 新增一节课
 
 1. 在 `src/lib/curriculum.ts` 对应分类里加一条 `Lesson`，写清 `objectives` 和 `outline`
-2. **把它的 id 加进某个 `groups[].lessons`** —— 学习顺序由这里决定，`Track.lessons` 只是课程池
+2. **把它的 id 加进某个 `groups[].lessons`** —— 学习顺序由这里决定，`Track.lessons` 只是课程池。
+   按「先概念、再实践、最后原理」挑分组：讲清概念的进 `概念：…`，动手敲命令或算账的进 `实践：…`，
+   拆内核与硬件实现的进 `原理：…`
    （零经验也能读的加进 `DEPTH` 标 `intro`，需要背景才看得懂的标 `deep`）
-3. 有强依赖时在 `PREREQ` 里登记，课程页会显示「建议先学」
+3. 有强依赖时在 `PREREQ` 里登记，课程页会显示「建议先学」；`bun run check` 会拦住指向后面的依赖
 4. 新增课程可先留 `'planned'` —— 课程页会自动渲染大纲占位，路径图上标记为「大纲」
 5. 正文写好后建 `src/content/<trackId>/<lessonId>.mdx`，把状态改成 `'ready'`
 6. 不需要再登记到别处 —— **分组顺序就是学习顺序**，加进 `groups[].lessons` 它就在首页那条线上了
@@ -216,10 +237,6 @@ MTU 必须端到端一致，任何一跳不一致都会导致大包被丢弃。
 - **代理与隧道** ——
   [A Practical Guide to SSH Tunnels](https://labs.iximiuz.com/tutorials/ssh-tunnels)（Ivan Velichko / iximiuz Labs，
   本站 SSH 那一节的示意图引自此文并已署名）、
-  [GOST](https://gost.run/)、
-  [WireGuard](https://www.wireguard.com/)、
-  [How Tailscale Works](https://tailscale.com/blog/how-tailscale-works)、
-  [Pritunl](https://pritunl.com/)、
   [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)、
   [anytls-go](https://github.com/anytls/anytls-go)、
   [科学上网 — haoel](https://github.com/haoel/haoel.github.io)
