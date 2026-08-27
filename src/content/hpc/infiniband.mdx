@@ -246,7 +246,7 @@ ibnetdiscover | grep -c '^Ca'
 # 5. 全网体检无错误
 ibdiagnet -r && grep -icE 'error' /var/tmp/ibdiagnet2/ibdiagnet2.log
 
-# 6. 点对点带宽达线速 90%（下一节）
+# 6. 点对点带宽达线速 90%（perftest 那节）
 # 7. 集群 busbw 达理论峰值 90%（NCCL 那节）
 ```
 

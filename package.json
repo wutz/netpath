@@ -10,6 +10,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "check": "bun scripts/check-curriculum.ts",
     "deploy": "bun run build && wrangler deploy",
     "cf-typegen": "wrangler types"
   },

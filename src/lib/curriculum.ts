@@ -37,6 +37,13 @@ export interface Lesson {
  * 分组承担两件事：把「循序渐进」显式写出来，以及**定义学习顺序** ——
  * 全站的课程顺序由 groups[].lessons 决定，Track.lessons 只是课程池，顺序无关。
  * 想调整顺序只改这里，不用挪 Lesson 对象。
+ *
+ * 分组顺序遵循一条规则：**先概念，再实践，最后原理**。
+ * 每个分类都按「这是什么 → 动手做一遍 → 内部怎么实现的」三段推进，
+ * 把 PCIe / NVLink / 内核栈 / kube-proxy / eBPF 这类深挖内容一律压到最后 ——
+ * 它们不是入门必需品，是撞到具体瓶颈时才回来读的东西。
+ * 唯一的例外是「访问集群」：那一段的概念课（VPN 组网选型）反而比实践课（SSH 端口转发）更进阶，
+ * 机械套用规则会让门槛倒挂，所以保持 ssh → vpn。
  */
 export interface LessonGroup {
   id: string
@@ -119,22 +126,16 @@ export const tracks: Track[] = [
     hint: '一手资料几乎都在海外。这件事不解决，后面每一节能读到的东西都打折。',
     groups: [
       {
-        id: 'gfw-diagnose',
-        title: '先诊断，再决定',
-        hint: '「打不开」有四种完全不同的原因。分错类，后面全是白费力气。',
+        id: 'gfw-concept',
+        title: '概念：先诊断，再决定',
+        hint: '「打不开」有四种完全不同的原因，代理也有两种。分错类，后面全是白费力气。',
         lessons: ['restricted-network', 'proxy-basics'],
       },
       {
-        id: 'gfw-build',
-        title: '搭一条自己的线',
-        hint: '先有一条稳的出口，再谈分流规则 —— 顺序反了两个变量会搅在一起。',
-        lessons: ['vps-anytls', 'clash-rules'],
-      },
-      {
-        id: 'gfw-quest',
-        title: '排障',
-        hint: '昨天还好、今天不通，从哪一层查起。',
-        lessons: ['quest-proxy-broken'],
+        id: 'gfw-practice',
+        title: '实践：搭一条自己的线',
+        hint: '先有一条稳的出口，再谈分流规则 —— 顺序反了两个变量会搅在一起，最后拿闯关验收。',
+        lessons: ['vps-anytls', 'clash-rules', 'quest-proxy-broken'],
       },
     ],
     lessons: [
@@ -353,38 +354,26 @@ export const tracks: Track[] = [
     level: 'ETH',
     title: '以太网与协议栈',
     subtitle: 'Linux 协议栈、观测与端口账',
-    goal: '所有网络问题的地基。搞清一个包从应用到网线要经过哪些环节，每个环节能用什么命令看，延迟、带宽、PPS 三个指标各自受什么限制，以及一套接入网该怎么算端口。',
+    goal: '所有网络问题的地基。先把地图和口径立起来：一次访问经过哪些角色，带宽、延迟、PPS 三个指标怎么算，二层三层各管什么；然后上手把命令敲一遍、接一台真出问题的机器、算一次接入网端口账；最后再回头拆开协议栈，看那些计数器究竟来自内核里的哪一段。',
     hint: '所有网络问题的地基：一个包从应用走到网线要经过哪些环节，每一环能用什么命令看。',
     groups: [
       {
-        id: 'eth-start',
-        title: '从这里开始',
-        hint: '先建立一张地图：一次访问经过哪些角色。',
-        lessons: ['first-look'],
-      },
-      {
-        id: 'eth-foundation',
-        title: '打地基',
-        hint: '三个指标的口径，加上二层三层各管什么。',
-        lessons: ['metrics-units', 'switching-routing'],
-      },
-      {
-        id: 'eth-path',
-        title: '走通一个包',
-        hint: '从 send() 到网线，中间每一跳都能被观测和调整。',
-        lessons: ['packet-journey', 'tcp-behavior'],
+        id: 'eth-concept',
+        title: '概念：先建立地图',
+        hint: '一次访问经过哪些角色、指标怎么算、二层三层各管什么 —— 先有词汇表，再谈别的。',
+        lessons: ['first-look', 'metrics-units', 'switching-routing'],
       },
       {
         id: 'eth-practice',
-        title: '动手排障',
-        hint: '工具认全，然后接一台真出问题的机器。',
-        lessons: ['toolbox', 'quest-slow-host'],
+        title: '实践：动手看真实的网络',
+        hint: '工具认全，接一台真出问题的机器，再算一次接入网的端口与收敛比。',
+        lessons: ['toolbox', 'quest-slow-host', 'ethernet-plan'],
       },
       {
-        id: 'eth-tune',
-        title: '主机侧的旋钮与端口账',
-        hint: '把内核栈调到头，再算一次接入网的端口与收敛比 —— 两件事都是后面高性能网络的前提。',
-        lessons: ['kernel-stack', 'ethernet-plan'],
+        id: 'eth-theory',
+        title: '原理：再拆开协议栈',
+        hint: '前面敲过的那些计数器，来自内核里的哪一段 —— 从 send() 到网线，逐层讲清楚。',
+        lessons: ['packet-journey', 'tcp-behavior', 'kernel-stack'],
       },
     ],
     lessons: [
@@ -589,44 +578,32 @@ export const tracks: Track[] = [
     level: 'HPC',
     title: '高性能网络',
     subtitle: '机内互联、RDMA 与网络库',
-    goal: 'AI 训练与高性能存储的主战场。先看机内：PCIe 决定网卡能不能跑满、NVLink 决定 GPU 之间有多快；再看机间：RDMA 为什么快、无损以太网靠什么撑住；最后是上层网络库与整套计算网的规划账。',
+    goal: 'AI 训练与高性能存储的主战场。先弄清这套体系是什么：RDMA 为什么快、IB 与 RoCE 各自是一套什么东西、整张网大致长什么样；然后动手把一条链路配通、跑出线速、用 NCCL 验收，并把需求算成一张采购表；最后再往下拆机内互联与卸载路径 —— PCIe、NVLink、GPUDirect 这些，是撞到具体瓶颈时才真正用得上的原理。',
     hint: 'AI 训练与高性能存储的主战场：为什么要绕开内核，以及怎么把一条链路打通到 NCCL。',
     groups: [
       {
-        id: 'hpc-bypass',
-        title: '为什么要绕开内核',
-        hint: 'RDMA 省掉了内核路径上的哪几步；机内的 PCIe 与 NVLink 决定网卡能不能跑满。',
-        lessons: ['why-rdma', 'pcie-topology', 'nvlink'],
+        id: 'hpc-concept',
+        title: '概念：这套体系是什么',
+        hint: 'RDMA 为什么快、IB 与 RoCE 各是一套什么东西、整张网大致长什么样。',
+        lessons: ['why-rdma', 'infiniband', 'roce', 'topology-rail'],
       },
       {
-        id: 'hpc-rdma',
-        title: 'IB 与无损以太网',
-        hint: '两套体系各讲一遍，再补上 RoCE 绕不开的那套主机侧选路配置 —— 不配它就会走错卡。',
-        lessons: ['infiniband', 'roce', 'policy-routing'],
-      },
-      {
-        id: 'hpc-handson',
-        title: '打通并验收一条链路',
-        hint: '先在两台裸机之间跑出线速，再看拓扑怎么接才不浪费带宽。',
-        lessons: ['perftest', 'topology-rail'],
-      },
-      {
-        id: 'hpc-lib',
-        title: '上层网络库',
-        hint: 'NCCL 与 MPI 才是真正搬数据的那一层，busbw 是整条链路的体检报告。',
-        lessons: ['nccl', 'mpi', 'quest-slow-allreduce'],
-      },
-      {
-        id: 'hpc-offload',
-        title: 'GPU、存储与卸载',
-        hint: '把 RDMA 往上接：显存直通、远端盘、卸载到卡上，以及自己接管数据路径。',
-        lessons: ['gpudirect', 'nvme-of', 'dpu', 'dpdk'],
+        id: 'hpc-practice',
+        title: '实践：打通并验收一条链路',
+        hint: '先把多网卡的选路配对，再在两台裸机之间跑出线速，最后用 NCCL 给整个集群体检。',
+        lessons: ['policy-routing', 'perftest', 'nccl', 'quest-slow-allreduce'],
       },
       {
         id: 'hpc-plan',
-        title: '规划与选型',
-        hint: '前面所有的账在这里汇总成一张能拿去采购的表。',
-        lessons: ['requirements', 'fabric-plan', 'ib-vs-roce'],
+        title: '实践：选型与规划',
+        hint: '把模糊需求问成数字，选定方案，再算成一张能拿去采购的表。',
+        lessons: ['requirements', 'ib-vs-roce', 'fabric-plan'],
+      },
+      {
+        id: 'hpc-theory',
+        title: '原理：再往下拆一层',
+        hint: '跑通之后回头看机内互联与卸载路径 —— 遇到具体瓶颈时才真正用得上。',
+        lessons: ['pcie-topology', 'nvlink', 'gpudirect', 'mpi', 'nvme-of', 'dpu', 'dpdk'],
       },
     ],
     lessons: [
@@ -1050,36 +1027,36 @@ export const tracks: Track[] = [
     level: 'K8S',
     title: 'K8s 网络',
     subtitle: '容器网络与高性能网络接入',
-    goal: '容器网络看起来像魔法，拆开只有几层封装。这一段从四条铁律推到 Service、Ingress 与 NetworkPolicy，再把高性能网络接进集群：给 Pod 划地盘、插第二张网卡、把 RDMA 交给它。整条路的收尾也在这里 —— 把前面全部的排查手法沉淀成看板、告警与值班流程。',
+    goal: '容器网络看起来像魔法，拆开只有几层封装。这一段先从四条铁律推出 CNI、Service、LoadBalancer、Ingress 与策略各管一段；再动手把高性能网络接进集群：给 Pod 划地盘、插第二张网卡、把 RDMA 交给它；然后才回头手搓一个容器网络、看 Service 规则与 eBPF 在内核里怎么落地。整条路的收尾也在这里 —— 把前面全部的排查手法沉淀成看板、告警与值班流程。',
     hint: '容器网络看起来像魔法，拆开只有几层封装。把物理网与 RDMA 接进集群，最后收尾到值班。',
     groups: [
       {
-        id: 'k8s-dataplane',
-        title: '网络模型与数据平面',
-        hint: '先手搓一个容器网络，它就不再是魔法；然后看 CNI 有哪几种实现。',
-        lessons: ['k8s-model', 'netns-veth', 'cni', 'ebpf-xdp'],
+        id: 'k8s-concept',
+        title: '概念：先建立模型',
+        hint: '四条铁律推出 CNI、Service、LoadBalancer、Ingress 与策略各管一段 —— 先把分工认清。',
+        lessons: ['k8s-model', 'cni', 'service', 'metallb', 'ingress-egress', 'dns-policy'],
       },
       {
-        id: 'k8s-service',
-        title: 'Service 与南北流量',
-        hint: '一个不存在的 IP 是怎么工作的，以及流量怎么从集群外进来。',
-        lessons: ['service', 'kube-proxy-ebpf', 'metallb', 'ingress-egress', 'dns-policy'],
+        id: 'k8s-practice',
+        title: '实践：划地盘，把网卡插进去',
+        hint: '地址规划是一次性决定、长期后悔的事；然后把物理网与 RDMA 直通给 Pod，最后闯一关。',
+        lessons: [
+          'ip-plan',
+          'sriov-macvlan',
+          'secondary-cni',
+          'k8s-rdma',
+          'quest-pod-unreachable',
+        ],
       },
       {
-        id: 'k8s-hpc',
-        title: '划地盘，把网卡插进去',
-        hint: '地址规划是一次性决定、长期后悔的事；然后把物理网直通给 Pod。',
-        lessons: ['ip-plan', 'sriov-macvlan', 'secondary-cni', 'k8s-rdma'],
-      },
-      {
-        id: 'k8s-quest',
-        title: '排障',
-        hint: 'Pod 之间不通，按层收敛。',
-        lessons: ['quest-pod-unreachable'],
+        id: 'k8s-theory',
+        title: '原理：再拆开数据平面',
+        hint: '手搓一个容器网络，再看 Service 规则与 eBPF 在内核里到底怎么落地。',
+        lessons: ['netns-veth', 'kube-proxy-ebpf', 'ebpf-xdp'],
       },
       {
         id: 'k8s-ops',
-        title: '长期值班',
+        title: '收尾：长期值班',
         hint: '整条路走完了，把一次性的排查沉淀成看板、告警和别人能照着执行的流程。',
         lessons: ['observability', 'oncall'],
       },
@@ -1478,44 +1455,46 @@ export const PREREQ: Record<string, string[]> = {
   'access/ssh': ['gfw/proxy-basics'],
   'access/vpn': ['access/ssh'],
 
-  // 以太网：地图 → 地基 → 路径 → 行为与调优 → 排障 → 端口账
+  // 以太网：概念（地图与口径）→ 实践（工具、排障、端口账）→ 原理（协议栈内部）
   'ethernet/metrics-units': ['ethernet/first-look'],
   'ethernet/switching-routing': ['ethernet/first-look'],
-  'ethernet/packet-journey': ['ethernet/switching-routing'],
-  'ethernet/tcp-behavior': ['ethernet/packet-journey', 'ethernet/metrics-units'],
-  'ethernet/kernel-stack': ['ethernet/packet-journey'],
-  'ethernet/toolbox': ['ethernet/packet-journey'],
+  'ethernet/toolbox': ['ethernet/first-look', 'ethernet/switching-routing'],
   'ethernet/quest-slow-host': ['ethernet/toolbox'],
   'ethernet/ethernet-plan': ['ethernet/metrics-units'],
+  'ethernet/packet-journey': ['ethernet/switching-routing', 'ethernet/toolbox'],
+  'ethernet/tcp-behavior': ['ethernet/packet-journey', 'ethernet/metrics-units'],
+  'ethernet/kernel-stack': ['ethernet/packet-journey'],
   'k8s/observability': ['ethernet/toolbox', 'k8s/cni'],
 
-  // 高性能网络：机内 → 原理 → 主机侧选路 → 动手 → 网络库 → 卸载 → 规划
-  'hpc/pcie-topology': ['ethernet/metrics-units'],
-  'hpc/why-rdma': ['ethernet/packet-journey', 'ethernet/kernel-stack'],
+  // 高性能网络：概念（RDMA / IB / RoCE / 拓扑）→ 实践（选路、打通、验收、规划）→ 原理（机内互联与卸载）
   'hpc/roce': ['hpc/why-rdma', 'ethernet/tcp-behavior'],
   'hpc/policy-routing': ['hpc/roce', 'ethernet/switching-routing'],
+  'hpc/why-rdma': ['ethernet/packet-journey', 'ethernet/kernel-stack'],
   'hpc/perftest': ['hpc/roce', 'hpc/policy-routing'],
-  'hpc/nccl': ['hpc/topology-rail', 'hpc/nvlink'],
-  'hpc/mpi': ['hpc/nccl'],
-  'hpc/quest-slow-allreduce': ['hpc/nccl', 'hpc/pcie-topology'],
+  'hpc/nccl': ['hpc/topology-rail', 'hpc/perftest'],
+  'hpc/quest-slow-allreduce': ['hpc/nccl'],
+  'hpc/ib-vs-roce': ['hpc/infiniband', 'hpc/roce'],
+  'hpc/fabric-plan': ['hpc/topology-rail', 'hpc/requirements'],
+  'hpc/pcie-topology': ['ethernet/metrics-units', 'hpc/perftest'],
+  'hpc/nvlink': ['hpc/pcie-topology'],
   'hpc/gpudirect': ['hpc/pcie-topology', 'hpc/why-rdma'],
+  'hpc/mpi': ['hpc/nccl'],
   'hpc/nvme-of': ['hpc/why-rdma'],
   'hpc/dpu': ['hpc/roce'],
   'hpc/dpdk': ['ethernet/kernel-stack'],
-  'hpc/fabric-plan': ['hpc/topology-rail', 'hpc/nvlink'],
-  'hpc/ib-vs-roce': ['hpc/infiniband', 'hpc/roce'],
 
-  // K8s：模型 → 数据平面 → Service → 地址与高性能接入
+  // K8s：概念（模型与四段分工）→ 实践（地址、次级网卡、RDMA、排障）→ 原理（数据平面）
   'k8s/cni': ['k8s/k8s-model', 'ethernet/switching-routing'],
-  'k8s/ebpf-xdp': ['k8s/cni', 'ethernet/kernel-stack'],
   'k8s/service': ['k8s/k8s-model'],
-  'k8s/kube-proxy-ebpf': ['k8s/service'],
   'k8s/metallb': ['k8s/service', 'ethernet/switching-routing'],
   'k8s/ingress-egress': ['k8s/service', 'k8s/metallb'],
   'k8s/ip-plan': ['k8s/k8s-model'],
   'k8s/sriov-macvlan': ['k8s/cni'],
   'k8s/k8s-rdma': ['hpc/perftest', 'k8s/secondary-cni'],
   'k8s/quest-pod-unreachable': ['k8s/cni', 'k8s/service', 'k8s/dns-policy'],
+  'k8s/netns-veth': ['k8s/cni'],
+  'k8s/kube-proxy-ebpf': ['k8s/service'],
+  'k8s/ebpf-xdp': ['k8s/cni', 'ethernet/kernel-stack'],
 }
 
 /* ---------- 难度标记 ---------- */
@@ -1537,12 +1516,10 @@ export const DEPTH: Record<string, LessonDepth> = {
   'k8s/k8s-model': 'intro',
   'k8s/kube-proxy-ebpf': 'deep',
   'k8s/ebpf-xdp': 'deep',
+  // infiniband / roce / topology-rail / nccl 内容不轻，但它们是这一段的概念与实践主线，
+  // 标成「深入」会和「可以先跳过」的语义打架，所以留空。
   'hpc/pcie-topology': 'deep',
   'hpc/nvlink': 'deep',
-  'hpc/infiniband': 'deep',
-  'hpc/roce': 'deep',
-  'hpc/topology-rail': 'deep',
-  'hpc/nccl': 'deep',
   'hpc/mpi': 'deep',
   'hpc/dpdk': 'deep',
   'hpc/gpudirect': 'deep',
@@ -1587,8 +1564,10 @@ export const PATH_META = {
   tagline: '从查得到资料，到给整个集群值班。',
   intro:
     '这是一条网络工程师的成长路线。50 节课排成一条线：先解决「查得到一手资料」这件事，' +
-    '再学会连上跳板机后面的集群，然后从一个包在协议栈里的每一跳讲起，' +
-    '一路走到 RDMA、GPU 集群与容器网络，最后能替业务算出端口数与线缆数，也扛得住值班。' +
+    '再学会连上跳板机后面的集群，然后是以太网、RDMA 与 GPU 集群、容器网络，' +
+    '最后能替业务算出端口数与线缆数，也扛得住值班。' +
+    '每一段都按同一种节奏推进 —— 先概念、再实践，最后才拆原理：' +
+    '先知道这是什么，然后动手把命令敲一遍，撞到瓶颈时再回头看内核和硬件里发生了什么。' +
     '没有分岔，也不用挑，从第一节往下走就行。',
 }
 
