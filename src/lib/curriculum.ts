@@ -128,14 +128,26 @@ export const tracks: Track[] = [
       {
         id: 'gfw-concept',
         title: '概念：先诊断，再决定',
-        hint: '「打不开」有四种完全不同的原因，代理也有两种。分错类，后面全是白费力气。',
-        lessons: ['restricted-network', 'proxy-basics'],
+        hint: '「打不开」有四种完全不同的原因，三种不需要隧道。分错类，后面全是白费力气。',
+        lessons: ['restricted-network'],
       },
       {
         id: 'gfw-practice',
         title: '实践：搭一条自己的线',
-        hint: '先有一条稳的出口，再谈分流规则 —— 顺序反了两个变量会搅在一起，最后拿闯关验收。',
-        lessons: ['vps-anytls', 'clash-rules', 'quest-proxy-broken'],
+        hint: '先有一条稳的出口，再谈分流规则 —— 顺序反了，两个变量会搅在一起。',
+        lessons: ['vps-anytls', 'clash-rules'],
+      },
+      {
+        id: 'gfw-theory',
+        title: '原理：代理到底怎么工作',
+        hint: '线搭通了再回头看：配置里那些 http:// 与 socks5h:// 各自意味着什么。',
+        lessons: ['proxy-basics'],
+      },
+      {
+        id: 'gfw-quest',
+        title: '收尾：排障闯关',
+        hint: '昨天还好、今天不通，从哪一层查起。',
+        lessons: ['quest-proxy-broken'],
       },
     ],
     lessons: [
@@ -165,7 +177,7 @@ export const tracks: Track[] = [
       {
         id: 'proxy-basics',
         title: 'HTTP 代理与 SOCKS5：两种代理差在哪',
-        summary: '一个懂 HTTP，一个只搬字节。搞清这点，配置里那些 http:// 与 socks5h:// 就不再靠猜。',
+        summary: '线已经通了，回头看配置里抄过的那些 http:// 与 socks5h://：一个懂 HTTP，一个只搬字节。',
         kind: 'concept',
         status: 'ready',
         minutes: 30,
@@ -1445,11 +1457,11 @@ export const tracks: Track[] = [
  * 只记「跳过会看不懂」的强依赖，同组相邻的自然顺序不重复登记。
  */
 export const PREREQ: Record<string, string[]> = {
-  // 科学上网：只依赖组内顺序，不依赖任何 L0 知识 —— 它排在整条路径最前面
-  'gfw/proxy-basics': ['gfw/restricted-network'],
-  'gfw/vps-anytls': ['gfw/proxy-basics'],
-  'gfw/clash-rules': ['gfw/proxy-basics', 'gfw/vps-anytls'],
-  'gfw/quest-proxy-broken': ['gfw/vps-anytls', 'gfw/clash-rules'],
+  // 科学上网：只依赖组内顺序，不依赖任何网络基础 —— 它排在整条路径最前面
+  'gfw/vps-anytls': ['gfw/restricted-network'],
+  'gfw/clash-rules': ['gfw/vps-anytls'],
+  'gfw/proxy-basics': ['gfw/clash-rules'],
+  'gfw/quest-proxy-broken': ['gfw/clash-rules', 'gfw/proxy-basics'],
 
   // 访问集群：SSH 要先懂 SOCKS5，VPN 只要会看隧道两端
   'access/ssh': ['gfw/proxy-basics'],

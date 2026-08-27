@@ -9,13 +9,13 @@
 
 | 步 | 分类 | 节数 | 内容 |
 | --- | --- | --- | --- |
-| 1 | **GFW** 科学上网 | 5 | 症状分类与诊断、HTTP/SOCKS5 代理、VPS 线路与 anytls 服务端、Mihomo 分流规则与旁路由、隧道排障闯关 |
+| 1 | **GFW** 科学上网 | 5 | 症状分类与诊断、VPS 线路与 anytls 服务端、Mihomo 分流规则与旁路由、HTTP/SOCKS5 代理原理、隧道排障闯关 |
 | 2 | **SSH** 访问集群 | 2 | SSH 端口转发与配置固化（`-L`/`-R`/`-D`、ProxyJump、ControlMaster）、WireGuard / Tailscale / Pritunl 三选一 |
 | 3 | **ETH** 以太网与协议栈 | 9 | 一次 curl 的全过程、带宽/PPS/延迟三指标、二三层转发、观测工具箱与闯关、Spine-Leaf 端口账、报文收发路径、TCP 行为、内核栈调优 |
 | 4 | **HPC** 高性能网络 | 18 | RDMA 原理、InfiniBand、RoCEv2 与无损以太网、Rail 拓扑、**策略路由**、perftest、NCCL 与闯关、需求拆解与计算网规划选型、PCIe 与 NVLink、GPUDirect、MPI、NVMe-oF、DPU、DPDK |
 | 5 | **K8S** K8s 网络 | 16 | K8s 网络模型、CNI 数据平面、Service、MetalLB、Ingress、DNS/策略、地址规划、SR-IOV/次级 CNI、K8s RDMA、Pod 不通闯关、netns/veth 手搓、kube-proxy、eBPF/XDP、可观测性与值班手册 |
 
-共 5 个分类、**15 个小组**、**50 节课**（约 27 小时），**50 节全部有正文**。
+共 5 个分类、**17 个小组**、**50 节课**（约 27 小时），**50 节全部有正文**。
 动手环节 14 个：8 个实验 + 4 个命令行闯关 + 2 个规划计算器。
 
 ## 一条完整学习路径
@@ -41,12 +41,14 @@
 | 段 | 讲什么 | 例子 |
 | --- | --- | --- |
 | **概念** | 这是什么、有哪几种、各管一段什么 | 二层与三层、RoCEv2 与无损以太网、K8s 四条铁律 |
-| **实践** | 动手把命令敲一遍、接一台真出问题的机器、算一次账 | 观测工具箱、perftest 与 NCCL、给 Pod 插第二张网卡 |
-| **原理** | 内核和硬件里到底怎么实现的 | 一个包的旅程、内核栈调优、PCIe/NVLink、kube-proxy、eBPF/XDP |
+| **实践** | 动手把命令敲一遍、接一台真出问题的机器、算一次账 | 搭 anytls 出口与 Mihomo 分流、观测工具箱、perftest 与 NCCL |
+| **原理** | 内核和硬件里到底怎么实现的 | HTTP 代理与 SOCKS5、一个包的旅程、内核栈调优、PCIe/NVLink、kube-proxy |
 
 这条规则最直接的后果是**深挖类课程一律往后压**：以太网的报文收发路径与内核栈调优挪到工具箱和闯关之后，
 高性能网络的 PCIe / NVLink / GPUDirect / DPDK 全部排到打通链路并验收之后，
 K8s 的 netns 手搓、kube-proxy 三代实现、eBPF/XDP 也让位给「先把网卡插进 Pod」。
+科学上网那段同理：**HTTP 代理与 SOCKS5 的区别排到 Mihomo 配置之后** ——
+先照着把线搭通、把分流配好，再回头看配置里抄过的 `socks5` 与 `socks5h` 差在哪。
 它们不是入门必需品，是撞到具体瓶颈时才回来读的东西。
 
 唯一的例外是 **SSH 访问集群**：那一段的概念课（VPN 组网选型）反而比实践课（SSH 端口转发）更进阶，
